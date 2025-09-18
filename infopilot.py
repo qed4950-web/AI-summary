@@ -4,10 +4,6 @@ import argparse
 
 # 모듈 임포트
 from filefinder import FileFinder
-from pipeline import run_step2, TrainConfig
-from lnp_chat import LNPChat # 새로운 LNP Chat 클래스를 임포트
-
-
 def cmd_scan(args):
     finder = FileFinder(
         exts=FileFinder.DEFAULT_EXTS,
@@ -20,6 +16,7 @@ def cmd_scan(args):
         estimate_total_dirs=False,
         startup_banner=True,
     )
+    print("🔍 지원 확장자:", ", ".join(sorted(finder.exts)))
     files = finder.find(run_async=False)
     out = Path(args.out)
     FileFinder.to_csv(files, out)
@@ -27,6 +24,7 @@ def cmd_scan(args):
 
 
 def cmd_train(args):
+    from pipeline import run_step2, TrainConfig
     import csv
     rows = []
     with open(args.scan_csv, "r", encoding="utf-8", newline="") as f:
@@ -52,6 +50,7 @@ def cmd_train(args):
 
 def cmd_chat(args):
     """대화형 검색 모드 (LNPChat 사용)"""
+    from lnp_chat import LNPChat # 새로운 LNP Chat 클래스를 임포트
     # LNPChat 클래스 인스턴스 생성 및 준비
     chat_session = LNPChat(
         model_path=Path(args.model),
@@ -90,7 +89,10 @@ def main():
     sp = ap.add_subparsers(dest="cmd", required=True)
 
     # scan
-    ap_scan = sp.add_parser("scan", help="드라이브 스캔하여 파일 목록 수집")
+    ap_scan = sp.add_parser(
+        "scan",
+        help="드라이브 스캔하여 파일 목록 수집 (기본: HWP, DOC/DOCX, XLSX/XLS, PDF, PPT/PPTX, CSV)"
+    )
     ap_scan.add_argument("--out", default="./data/found_files.csv")
     ap_scan.set_defaults(func=cmd_scan)
 
