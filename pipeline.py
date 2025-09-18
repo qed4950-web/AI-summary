@@ -4,6 +4,8 @@ from pathlib import Path
 from dataclasses import dataclass
 from typing import Optional, Dict, Any, List, Tuple
 
+from encoding_utils import detect_file_encodings
+
 # ---- 선택 의존성(있으면 사용) ----
 try:
     import pandas as pd
@@ -22,13 +24,28 @@ try:
 except Exception:
     pptx = None
 try:
+    import pdfplumber
+except Exception:
+    pdfplumber = None
+try:
     from pdfminer.high_level import extract_text as pdfminer_extract_text
 except Exception:
     pdfminer_extract_text = None
 try:
+    import PyPDF2
+except Exception:
+    PyPDF2 = None
+try:
     import textract
 except Exception:
     textract = None
+try:
+    import importlib
+    hwp5_dataio = importlib.import_module("hwp5.dataio")  # type: ignore
+    hwp5_txt = importlib.import_module("hwp5.hwp5txt")  # type: ignore
+except Exception:
+    hwp5_dataio = None
+    hwp5_txt = None
 try:
     import win32com.client
 except Exception:
@@ -137,6 +154,30 @@ class BaseExtractor:
 class HwpExtractor(BaseExtractor):
     exts=(".hwp",)
     def extract(self, p:Path)->Dict[str,Any]:
+        if hwp5_dataio and hwp5_txt:
+            try:
+                HWP5File = getattr(hwp5_dataio, "HWP5File", None)
+                TxtExtractor = getattr(hwp5_txt, "HWP5Txt", None) or getattr(hwp5_txt, "HWP5TextExtractor", None)
+                if HWP5File and TxtExtractor:
+                    with p.open("rb") as fh:
+                        doc = HWP5File(fh)  # type: ignore
+                        extractor = TxtExtractor(doc)  # type: ignore
+                        text = ""
+                        if hasattr(extractor, "text") and callable(getattr(extractor, "text")):
+                            text = extractor.text()
+                        elif hasattr(extractor, "to_text") and callable(getattr(extractor, "to_text")):
+                            text = extractor.to_text()
+                        elif hasattr(extractor, "get_text") and callable(getattr(extractor, "get_text")):
+                            text = extractor.get_text()
+                        elif hasattr(extractor, "extract_text") and callable(getattr(extractor, "extract_text")):
+                            text = extractor.extract_text()
+                        if isinstance(text, (list, tuple)):
+                            text = "\n".join(map(str, text))
+                        text = str(text)
+                        if text.strip():
+                            return {"ok":True,"text":TextCleaner.clean(text),"meta":{"engine":"pyhwp"}}
+            except Exception:
+                pass
         if textract:
             try:
                 t = textract.process(str(p)).decode("utf-8","ignore")
@@ -175,9 +216,31 @@ class ExcelLikeExtractor(BaseExtractor):
             return {"ok":False,"text":"","meta":{"error":"pandas required"}}
         try:
             if p.suffix.lower()==".csv":
-                df=pd.read_csv(p, nrows=200, encoding="utf-8", engine="python")
+                df = None
+                last_error: Optional[Exception] = None
+                encoding_used = None
+                for enc in detect_file_encodings(p):
+                    try:
+                        df = pd.read_csv(p, nrows=200, encoding=enc, engine="python")
+                        encoding_used = enc
+                        break
+                    except UnicodeDecodeError as e:
+                        last_error = e
+                        continue
+                    except Exception as e:
+                        last_error = e
+                        break
+                if df is None:
+                    raise last_error or UnicodeDecodeError("utf-8", b"", 0, 1, "encoding detection failed")
                 txt=self._df_to_text(df)
-                return {"ok":True,"text":txt,"meta":{"engine":"pandas","columns":df.columns.tolist(), "rows_preview":min(200,len(df))}}
+                meta = {
+                    "engine":"pandas",
+                    "columns":df.columns.tolist(),
+                    "rows_preview":min(200,len(df)),
+                }
+                if encoding_used:
+                    meta["encoding"] = encoding_used
+                return {"ok":True,"text":txt,"meta":meta}
             eng = "openpyxl" if p.suffix.lower() in (".xlsx",".xlsm",".xltx") else ("xlrd" if p.suffix.lower()==".xls" else "pyxlsb")
             sheets = pd.read_excel(p, sheet_name=None, nrows=200, engine=eng)
             parts=[]
@@ -197,9 +260,49 @@ class ExcelLikeExtractor(BaseExtractor):
             rows.append(" • "+" | ".join(map(lambda x: str(x), row.tolist())))
         return TextCleaner.clean(f"{cols}\n"+"\n".join(rows))
 
+class TextFileExtractor(BaseExtractor):
+    exts=(".txt",)
+    def extract(self, p:Path)->Dict[str,Any]:
+        last_error: Optional[Exception] = None
+        for enc in detect_file_encodings(p):
+            try:
+                text = p.read_text(encoding=enc)
+                return {"ok":True,"text":TextCleaner.clean(text),"meta":{"engine":"text","encoding":enc}}
+            except UnicodeDecodeError as e:
+                last_error = e
+                continue
+            except Exception as e:
+                last_error = e
+                break
+        err = repr(last_error) if last_error else "unknown"
+        return {"ok":False,"text":"","meta":{"error":f"txt read failed: {err}"}}
+
 class PdfExtractor(BaseExtractor):
     exts=(".pdf",)
     def extract(self, p:Path)->Dict[str,Any]:
+        if pdfplumber:
+            try:
+                with pdfplumber.open(str(p)) as pdf:
+                    texts = [page.extract_text() or "" for page in pdf.pages]
+                text = "\n".join(filter(None, texts))
+                if text.strip():
+                    return {"ok":True,"text":TextCleaner.clean(text),"meta":{"engine":"pdfplumber","pages":len(texts)}}
+            except Exception:
+                pass
+        if PyPDF2:
+            try:
+                reader = PyPDF2.PdfReader(str(p))
+                texts = []
+                for page in reader.pages:
+                    try:
+                        texts.append(page.extract_text() or "")
+                    except Exception:
+                        texts.append("")
+                text = "\n".join(filter(None, texts))
+                if text.strip():
+                    return {"ok":True,"text":TextCleaner.clean(text),"meta":{"engine":"PyPDF2","pages":len(texts)}}
+            except Exception:
+                pass
         if pdfminer_extract_text:
             try:
                 t=pdfminer_extract_text(str(p))
@@ -235,7 +338,14 @@ class PptExtractor(BaseExtractor):
             except Exception: pass
         return {"ok":False,"text":"","meta":{"error":"PPT/PPTX extract failed"}}
 
-EXTRACTORS=[HwpExtractor(), DocDocxExtractor(), ExcelLikeExtractor(), PdfExtractor(), PptExtractor()]
+EXTRACTORS=[
+    HwpExtractor(),
+    DocDocxExtractor(),
+    ExcelLikeExtractor(),
+    TextFileExtractor(),
+    PdfExtractor(),
+    PptExtractor(),
+]
 EXT_MAP={e:ex for ex in EXTRACTORS for e in ex.exts}
 
 
@@ -244,7 +354,14 @@ EXT_MAP={e:ex for ex in EXTRACTORS for e in ex.exts}
 # =========================
 @dataclass
 class ExtractRecord:
-    path:str; ext:str; ok:bool; text:str; meta:Dict[str,Any]; size:Optional[int]=None; mtime:Optional[float]=None
+    path:str
+    ext:str
+    ok:bool
+    text:str
+    meta:Dict[str,Any]
+    size:Optional[int]=None
+    mtime:Optional[float]=None
+    content:str=""
 
 class CorpusBuilder:
     def __init__(self, max_text_chars:int=200_000, progress:bool=True, translate:bool=False):
@@ -292,7 +409,12 @@ class CorpusBuilder:
             return ExtractRecord(str(p), ext, False, "", {"error":"no extractor"}, row.get("size"), row.get("mtime"))
         try:
             out=ex.extract(p)
-            original_text=(out.get("text","") or "")[:self.max_text_chars]
+            original_full = out.get("text", "") or ""
+            original_text=original_full[:self.max_text_chars]
+            preview = original_text[:500]
+            if len(original_text) > 500:
+                preview = preview + "…"
+            content = f"{str(p)}\n{preview}" if preview else str(p)
 
             text_for_model = original_text
             if self.translator and original_text.strip():
@@ -308,9 +430,18 @@ class CorpusBuilder:
                     else:
                         print(msg)
 
-            return ExtractRecord(str(p), ext, bool(out.get("ok",False)), text_for_model, out.get("meta",{}), row.get("size"), row.get("mtime"))
+            return ExtractRecord(
+                str(p),
+                ext,
+                bool(out.get("ok",False)),
+                text_for_model,
+                out.get("meta",{}),
+                row.get("size"),
+                row.get("mtime"),
+                content,
+            )
         except Exception as e:
-            return ExtractRecord(str(p), ext, False, "", {"error":f"extract crash: {e}"}, row.get("size"), row.get("mtime"))
+            return ExtractRecord(str(p), ext, False, "", {"error":f"extract crash: {e}"}, row.get("size"), row.get("mtime"), str(p))
 
     @staticmethod
     def save(df, out_path:Path):
@@ -323,10 +454,10 @@ class CorpusBuilder:
                 return
             except Exception as e:
                 csv_path = out_path.with_suffix(".csv")
-                df.to_csv(csv_path, index=False, encoding="utf-8")
+                df.to_csv(csv_path, index=False, encoding="utf-8-sig")
                 print(f"⚠️ Parquet 엔진 없음 → CSV로 저장: {csv_path}\n   상세: {e}")
                 return
-        df.to_csv(out_path, index=False, encoding="utf-8")
+        df.to_csv(out_path, index=False, encoding="utf-8-sig")
         print(f"✅ CSV 저장: {out_path}")
 
 

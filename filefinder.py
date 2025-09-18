@@ -43,7 +43,7 @@ class FileFinder:
         ".xlsx", ".xls", ".xlsm", ".xlsb", ".xltx",
         ".pdf",
         ".ppt", ".pptx",
-        ".csv",
+        ".csv", ".txt",
     }
     WINDOWS_SKIP_DIRS = {
         r"\$Recycle.Bin",
@@ -51,6 +51,7 @@ class FileFinder:
         r"\Windows\WinSxS\Temp",
         r"\Windows\Temp",
     }
+    DEFAULT_EXCLUDE_TOKENS = {".venv", "site-packages", "appdata"}
 
     def __init__(
         self,
@@ -63,6 +64,8 @@ class FileFinder:
         progress_update_secs: float = 0.5,
         estimate_total_dirs: bool = False,
         startup_banner: bool = True,
+        include_paths: Optional[Iterable[Path]] = None,
+        exclude_tokens: Optional[Iterable[str]] = None,
     ):
         self.exts = {e.lower() if e.startswith(".") else f".{e.lower()}" for e in (exts or self.DEFAULT_EXTS)}
         self.scan_all_drives = scan_all_drives
@@ -73,6 +76,7 @@ class FileFinder:
         self.progress_update_secs = progress_update_secs
         self.estimate_total_dirs = estimate_total_dirs
         self.startup_banner = startup_banner
+        self.manual_roots = [Path(p).resolve() for p in (include_paths or [])]
 
         self._lock = threading.Lock()
         self._dirs_scanned = 0
@@ -82,6 +86,10 @@ class FileFinder:
         self._stop_progress = threading.Event()
         self._total_dirs_estimate = None
         self._current_root = ""
+        tokens = set(t.lower() for t in self.DEFAULT_EXCLUDE_TOKENS)
+        if exclude_tokens:
+            tokens.update(t.lower() for t in exclude_tokens)
+        self._exclude_tokens = tokens
 
     # ---------- roots ----------
     def _windows_drives(self) -> List[Path]:
@@ -105,6 +113,8 @@ class FileFinder:
                 roots.extend([c for c in p.iterdir() if c.is_dir()])
         return roots
     def get_roots(self) -> List[Path]:
+        if self.manual_roots:
+            return self.manual_roots
         system = platform.system().lower()
         if system.startswith("win"):
             if self.start_from_current_drive_only:
@@ -123,6 +133,11 @@ class FileFinder:
             for skip in self.WINDOWS_SKIP_DIRS:
                 if skip.lower() in path_str.lower():
                     return True
+        lowered = str(path).lower()
+        name = path.name.lower()
+        for token in self._exclude_tokens:
+            if token in lowered or token == name:
+                return True
         return False
     def _depth_from_root(self, root: Path, current: Path) -> int:
         try:
@@ -278,7 +293,7 @@ class FileFinder:
             spinner = StartupSpinner(prefix="🔎 초기화", interval=0.1)
             spinner.start()
         try:
-            roots = roots or self.preflight()
+            roots = roots or self.manual_roots or self.preflight()
         finally:
             if spinner:
                 spinner.stop()
@@ -335,7 +350,7 @@ class FileFinder:
     def to_csv(rows: List[Dict], out_path: Path) -> None:
         import csv
         out_path.parent.mkdir(parents=True, exist_ok=True)
-        with out_path.open("w", newline="", encoding="utf-8") as f:
+        with out_path.open("w", newline="", encoding="utf-8-sig") as f:
             w = csv.DictWriter(f, fieldnames=["path", "size", "mtime", "ext", "drive"])
             w.writeheader()
             for r in rows:

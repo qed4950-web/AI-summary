@@ -1,0 +1,13 @@
+numpy
+pandas
+scikit-learn
+joblib
+tqdm
+sentence-transformers
+faiss-cpu
+googletrans==4.0.0-rc1
+charset-normalizer
+pdfplumber
+PyPDF2
+python-docx
+python-pptx
