@@ -3,21 +3,28 @@ from pathlib import Path
 import argparse
 
 # 모듈 임포트
+from encoding_utils import detect_file_encodings
 from filefinder import FileFinder
 def cmd_scan(args):
+    include_paths = [Path(p).expanduser().resolve() for p in args.path]
+    for p in include_paths:
+        if not p.exists():
+            raise FileNotFoundError(f"지정된 경로를 찾을 수 없습니다: {p}")
     finder = FileFinder(
         exts=FileFinder.DEFAULT_EXTS,
-        scan_all_drives=True,
-        start_from_current_drive_only=False,
+        scan_all_drives=False,
+        start_from_current_drive_only=True,
         follow_symlinks=False,
         max_depth=None,
         show_progress=True,
         progress_update_secs=0.5,
         estimate_total_dirs=False,
         startup_banner=True,
+        include_paths=include_paths,
+        exclude_tokens=args.exclude,
     )
     print("🔍 지원 확장자:", ", ".join(sorted(finder.exts)))
-    files = finder.find(run_async=False)
+    files = finder.find(roots=include_paths, run_async=False)
     out = Path(args.out)
     FileFinder.to_csv(files, out)
     print(f"📦 스캔 결과 저장: {out}")
@@ -27,11 +34,31 @@ def cmd_train(args):
     from pipeline import run_step2, TrainConfig
     import csv
     rows = []
-    with open(args.scan_csv, "r", encoding="utf-8", newline="") as f:
-        for r in csv.DictReader(f):
-            r["size"] = int(r.get("size") or 0)
-            r["mtime"] = float(r.get("mtime") or 0.0)
-            rows.append(r)
+    scan_path = Path(args.scan_csv)
+    last_error = None
+    used_encoding = None
+    for enc in detect_file_encodings(scan_path):
+        try:
+            with scan_path.open("r", encoding=enc, newline="") as f:
+                for r in csv.DictReader(f):
+                    r["size"] = int(r.get("size") or 0)
+                    r["mtime"] = float(r.get("mtime") or 0.0)
+                    rows.append(r)
+            used_encoding = enc
+            break
+        except UnicodeDecodeError as e:
+            last_error = e
+            rows.clear()
+            continue
+        except FileNotFoundError:
+            raise
+        except Exception as e:
+            last_error = e
+            rows.clear()
+            continue
+    if used_encoding is None:
+        raise last_error or UnicodeDecodeError("utf-8", b"", 0, 1, "scan csv encoding detection failed")
+    print(f"🗂️ 스캔 CSV 인코딩: {used_encoding}")
 
     cfg = TrainConfig(
         max_features=args.max_features,
@@ -91,7 +118,19 @@ def main():
     # scan
     ap_scan = sp.add_parser(
         "scan",
-        help="드라이브 스캔하여 파일 목록 수집 (기본: HWP, DOC/DOCX, XLSX/XLS, PDF, PPT/PPTX, CSV)"
+        help="드라이브 스캔하여 파일 목록 수집 (기본: HWP, DOC/DOCX, XLSX/XLS, PDF, PPT/PPTX, CSV, TXT)"
+    )
+    ap_scan.add_argument(
+        "--path",
+        required=True,
+        nargs="+",
+        help="스캔할 루트 폴더 경로 (여러 개 지정 가능)",
+    )
+    ap_scan.add_argument(
+        "--exclude",
+        action="append",
+        default=[],
+        help="스캔에서 제외할 디렉터리 이름/패턴 (여러 번 사용 가능)",
     )
     ap_scan.add_argument("--out", default="./data/found_files.csv")
     ap_scan.set_defaults(func=cmd_scan)

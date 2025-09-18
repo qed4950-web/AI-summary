@@ -181,7 +181,15 @@ class Retriever:
 
         print(f"🧠 문서 임베딩 생성… (docs={len(work):,})")
         Z = self.encoder.encode_docs(work["text"].tolist())
-        self.index.build(Z, work["path"].tolist(), work["ext"].tolist(), work["text"].tolist())
+        if "content" in work.columns:
+            preview_source = work["content"].fillna("").astype(str).tolist()
+        else:
+            preview_source = work["text"].fillna("").astype(str).tolist()
+        text_fallback = work["text"].fillna("").astype(str).tolist()
+        previews = []
+        for preview, fallback in zip(preview_source, text_fallback):
+            previews.append(preview or fallback)
+        self.index.build(Z, work["path"].tolist(), work["ext"].tolist(), previews)
         paths = self.index.save(self.cache_dir)
         print(f"💾 인덱스 저장: {paths.emb_npy}, {paths.meta_json}")
         self._ready = True
