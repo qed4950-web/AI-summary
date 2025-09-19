@@ -1,8 +1,8 @@
 # pipeline.py  (Step2: 추출 + 학습)
-import os, re, sys, time, threading, platform, asyncio
+import os, re, sys, time, threading, platform, asyncio, csv
 from pathlib import Path
-from dataclasses import dataclass
-from typing import Optional, Dict, Any, List, Tuple
+from dataclasses import dataclass, field
+from typing import Optional, Dict, Any, List, Tuple, Iterable
 
 from encoding_utils import detect_file_encodings
 
@@ -46,10 +46,6 @@ try:
 except Exception:
     hwp5_dataio = None
     hwp5_txt = None
-try:
-    import win32com.client
-except Exception:
-    win32com = None
 try:
     import joblib
 except Exception:
@@ -146,207 +142,266 @@ TOKEN_PATTERN = r'(?u)(?:[가-힣]{1,}|[A-Za-z0-9]{2,})'
 # =========================
 # Extractors
 # =========================
-class BaseExtractor:
-    exts: Tuple[str,...] = ()
-    def can_handle(self, p:Path)->bool: return p.suffix.lower() in self.exts
-    def extract(self, p:Path)->Dict[str,Any]: raise NotImplementedError
+import traceback
+from collections import defaultdict
 
-class HwpExtractor(BaseExtractor):
-    exts=(".hwp",)
-    def extract(self, p:Path)->Dict[str,Any]:
-        if hwp5_dataio and hwp5_txt:
-            try:
-                HWP5File = getattr(hwp5_dataio, "HWP5File", None)
-                TxtExtractor = getattr(hwp5_txt, "HWP5Txt", None) or getattr(hwp5_txt, "HWP5TextExtractor", None)
-                if HWP5File and TxtExtractor:
-                    with p.open("rb") as fh:
-                        doc = HWP5File(fh)  # type: ignore
-                        extractor = TxtExtractor(doc)  # type: ignore
-                        text = ""
-                        if hasattr(extractor, "text") and callable(getattr(extractor, "text")):
-                            text = extractor.text()
-                        elif hasattr(extractor, "to_text") and callable(getattr(extractor, "to_text")):
-                            text = extractor.to_text()
-                        elif hasattr(extractor, "get_text") and callable(getattr(extractor, "get_text")):
-                            text = extractor.get_text()
-                        elif hasattr(extractor, "extract_text") and callable(getattr(extractor, "extract_text")):
-                            text = extractor.extract_text()
-                        if isinstance(text, (list, tuple)):
-                            text = "\n".join(map(str, text))
-                        text = str(text)
-                        if text.strip():
-                            return {"ok":True,"text":TextCleaner.clean(text),"meta":{"engine":"pyhwp"}}
-            except Exception:
-                pass
-        if textract:
-            try:
-                t = textract.process(str(p)).decode("utf-8","ignore")
-                return {"ok":True,"text":TextCleaner.clean(t),"meta":{"engine":"textract"}}
-            except Exception: pass
-        if platform.system().lower().startswith("win") and win32com:
-            try:
-                return {"ok":True,"text":"","meta":{"engine":"win32com-hwp"}}
-            except Exception: pass
-        return {"ok":False,"text":"","meta":{"error":"HWP extract failed"}}
 
-class DocDocxExtractor(BaseExtractor):
-    exts=(".doc",".docx")
-    def extract(self, p:Path)->Dict[str,Any]:
-        if p.suffix.lower()==".docx" and docx:
-            try:
-                d=docx.Document(str(p))
-                t="\n".join(par.text for par in d.paragraphs)
-                return {"ok":True,"text":TextCleaner.clean(t),"meta":{"engine":"python-docx","paras":len(d.paragraphs)}}
-            except Exception: pass
-        if textract:
-            try:
-                t=textract.process(str(p)).decode("utf-8","ignore")
-                return {"ok":True,"text":TextCleaner.clean(t),"meta":{"engine":"textract"}}
-            except Exception: pass
-        if platform.system().lower().startswith("win") and win32com:
-            try:
-                return {"ok":True,"text":"","meta":{"engine":"win32com-word"}}
-            except Exception: pass
-        return {"ok":False,"text":"","meta":{"error":"DOC/DOCX extract failed"}}
+class MissingDependencyError(RuntimeError):
+    """Raised when an optional extractor dependency is unavailable."""
 
-class ExcelLikeExtractor(BaseExtractor):
-    exts=(".xlsx",".xls",".xlsm",".xlsb",".xltx",".csv")
-    def extract(self, p:Path)->Dict[str,Any]:
-        if pd is None:
-            return {"ok":False,"text":"","meta":{"error":"pandas required"}}
-        try:
-            if p.suffix.lower()==".csv":
-                df = None
-                last_error: Optional[Exception] = None
-                encoding_used = None
-                for enc in detect_file_encodings(p):
-                    try:
-                        df = pd.read_csv(p, nrows=200, encoding=enc, engine="python")
-                        encoding_used = enc
-                        break
-                    except UnicodeDecodeError as e:
-                        last_error = e
-                        continue
-                    except Exception as e:
-                        last_error = e
-                        break
-                if df is None:
-                    raise last_error or UnicodeDecodeError("utf-8", b"", 0, 1, "encoding detection failed")
-                txt=self._df_to_text(df)
-                meta = {
-                    "engine":"pandas",
-                    "columns":df.columns.tolist(),
-                    "rows_preview":min(200,len(df)),
-                }
-                if encoding_used:
-                    meta["encoding"] = encoding_used
-                return {"ok":True,"text":txt,"meta":meta}
-            eng = "openpyxl" if p.suffix.lower() in (".xlsx",".xlsm",".xltx") else ("xlrd" if p.suffix.lower()==".xls" else "pyxlsb")
-            sheets = pd.read_excel(p, sheet_name=None, nrows=200, engine=eng)
-            parts=[]
-            for s,df_sheet in sheets.items():
-                parts.append(f"[Sheet:{s}]")
-                parts.append(" | ".join(map(str, df_sheet.columns.tolist())))
-                for _,row in df_sheet.head(50).iterrows():
-                    parts.append(" • "+" | ".join(map(lambda x: str(x), row.tolist())))
-            return {"ok":True,"text":TextCleaner.clean("\n".join(parts)),"meta":{"engine":"pandas","sheets":list(sheets.keys())}}
-        except Exception as e:
-            return {"ok":False,"text":"","meta":{"error":f"excel/csv read failed: {e}"}}
-    @staticmethod
-    def _df_to_text(df)->str:
-        cols=" | ".join(map(str, df.columns.tolist()))
-        rows=[]
-        for _,row in df.head(50).iterrows():
-            rows.append(" • "+" | ".join(map(lambda x: str(x), row.tolist())))
-        return TextCleaner.clean(f"{cols}\n"+"\n".join(rows))
 
-class TextFileExtractor(BaseExtractor):
-    exts=(".txt",)
-    def extract(self, p:Path)->Dict[str,Any]:
-        last_error: Optional[Exception] = None
-        for enc in detect_file_encodings(p):
+@dataclass
+class ExtractionAttempt:
+    engine: str
+    ok: bool
+    text: str = ""
+    meta: Dict[str, Any] = field(default_factory=dict)
+    error: str = ""
+    traceback: str = ""
+
+
+@dataclass
+class ExtractionResult:
+    ok: bool
+    text: str
+    meta: Dict[str, Any]
+    attempts: List[ExtractionAttempt]
+
+
+class ExtractorRegistry:
+    def __init__(self):
+        self._map: Dict[str, List[Tuple[str, Any]]] = defaultdict(list)
+
+    def register(self, extensions: Iterable[str], name: str, func):
+        for ext in extensions:
+            self._map[ext.lower()].append((name, func))
+
+    def extract(self, path: Path) -> ExtractionResult:
+        ext = path.suffix.lower()
+        handlers = self._map.get(ext, [])
+        attempts: List[ExtractionAttempt] = []
+        if not handlers:
+            attempts.append(ExtractionAttempt("unhandled", False, error="no extractor registered"))
+            return ExtractionResult(False, "", {"error": "no extractor registered"}, attempts)
+
+        for name, func in handlers:
             try:
-                text = p.read_text(encoding=enc)
-                return {"ok":True,"text":TextCleaner.clean(text),"meta":{"engine":"text","encoding":enc}}
-            except UnicodeDecodeError as e:
-                last_error = e
-                continue
+                text, meta = func(path)
+                if isinstance(text, bytes):
+                    text = text.decode("utf-8", "ignore")
+                if not isinstance(text, str):
+                    text = str(text or "")
+                text = TextCleaner.clean(text)
+                meta = dict(meta or {})
+                meta.setdefault("engine", name)
+                if text:
+                    attempt = ExtractionAttempt(name, True, text, meta)
+                    attempts.append(attempt)
+                    return ExtractionResult(True, text, meta, attempts)
+                attempt = ExtractionAttempt(name, False, "", meta, error="empty text")
+                attempts.append(attempt)
+            except MissingDependencyError as e:
+                attempts.append(ExtractionAttempt(name, False, "", {"engine": name}, error=str(e)))
             except Exception as e:
-                last_error = e
-                break
-        err = repr(last_error) if last_error else "unknown"
-        return {"ok":False,"text":"","meta":{"error":f"txt read failed: {err}"}}
+                tb = traceback.format_exc(limit=3)
+                attempts.append(ExtractionAttempt(name, False, "", {"engine": name}, error=str(e), traceback=tb))
 
-class PdfExtractor(BaseExtractor):
-    exts=(".pdf",)
-    def extract(self, p:Path)->Dict[str,Any]:
-        if pdfplumber:
-            try:
-                with pdfplumber.open(str(p)) as pdf:
-                    texts = [page.extract_text() or "" for page in pdf.pages]
-                text = "\n".join(filter(None, texts))
-                if text.strip():
-                    return {"ok":True,"text":TextCleaner.clean(text),"meta":{"engine":"pdfplumber","pages":len(texts)}}
-            except Exception:
-                pass
-        if PyPDF2:
-            try:
-                reader = PyPDF2.PdfReader(str(p))
-                texts = []
-                for page in reader.pages:
-                    try:
-                        texts.append(page.extract_text() or "")
-                    except Exception:
-                        texts.append("")
-                text = "\n".join(filter(None, texts))
-                if text.strip():
-                    return {"ok":True,"text":TextCleaner.clean(text),"meta":{"engine":"PyPDF2","pages":len(texts)}}
-            except Exception:
-                pass
-        if pdfminer_extract_text:
-            try:
-                t=pdfminer_extract_text(str(p))
-                return {"ok":True,"text":TextCleaner.clean(t),"meta":{"engine":"pdfminer"}}
-            except Exception: pass
-        if textract:
-            try:
-                t=textract.process(str(p)).decode("utf-8","ignore")
-                return {"ok":True,"text":TextCleaner.clean(t),"meta":{"engine":"textract"}}
-            except Exception: pass
-        return {"ok":False,"text":"","meta":{"error":"PDF extract failed"}}
+        last_error = attempts[-1].error if attempts else "unknown"
+        return ExtractionResult(False, "", {"error": last_error}, attempts)
 
-class PptExtractor(BaseExtractor):
-    exts=(".ppt",".pptx")
-    def extract(self, p:Path)->Dict[str,Any]:
-        if p.suffix.lower()==".pptx" and pptx:
-            try:
-                pres=pptx.Presentation(str(p))
-                texts=[]
-                for i,slide in enumerate(pres.slides,1):
-                    parts=[]
-                    for sh in slide.shapes:
-                        if hasattr(sh,"text") and (sh.text or "").strip():
-                            parts.append(sh.text)
-                    if parts:
-                        texts.append(f"[Slide {i}] "+" ".join(parts))
-                return {"ok":True,"text":TextCleaner.clean("\n".join(texts)),"meta":{"engine":"python-pptx","slides":len(pres.slides)}}
-            except Exception: pass
-        if textract:
-            try:
-                t=textract.process(str(p)).decode("utf-8","ignore")
-                return {"ok":True,"text":TextCleaner.clean(t),"meta":{"engine":"textract"}}
-            except Exception: pass
-        return {"ok":False,"text":"","meta":{"error":"PPT/PPTX extract failed"}}
 
-EXTRACTORS=[
-    HwpExtractor(),
-    DocDocxExtractor(),
-    ExcelLikeExtractor(),
-    TextFileExtractor(),
-    PdfExtractor(),
-    PptExtractor(),
-]
-EXT_MAP={e:ex for ex in EXTRACTORS for e in ex.exts}
+EXTRACTOR_REGISTRY = ExtractorRegistry()
+
+
+def _require_dependency(module_obj, friendly: str) -> None:
+    if module_obj is None:
+        raise MissingDependencyError(f"필요 모듈 '{friendly}'이(가) 설치되어 있지 않습니다.")
+
+
+def _require_excel_engine(engine: str) -> None:
+    import importlib
+
+    candidates = {
+        "openpyxl": ["openpyxl"],
+        "xlrd": ["xlrd2", "xlrd"],
+        "pyxlsb": ["pyxlsb"],
+    }
+    modules = candidates.get(engine, [engine])
+    for mod in modules:
+        try:
+            importlib.import_module(mod)
+            return
+        except ModuleNotFoundError:
+            continue
+    friendly = "/".join(modules)
+    raise MissingDependencyError(f"엑셀 엔진 '{engine}' 사용을 위한 모듈({friendly})이 설치되어 있지 않습니다.")
+
+
+def _df_to_text(df) -> str:
+    cols = " | ".join(map(str, df.columns.tolist()))
+    rows: List[str] = []
+    for _, row in df.head(50).iterrows():
+        rows.append(" • " + " | ".join(map(lambda x: str(x), row.tolist())))
+    return TextCleaner.clean(f"{cols}\n" + "\n".join(rows))
+
+
+def _extract_csv(path: Path) -> Tuple[str, Dict[str, Any]]:
+    _require_dependency(pd, "pandas")
+    last_error: Optional[Exception] = None
+    encoding_used: Optional[str] = None
+    df = None
+    for enc in detect_file_encodings(path):
+        try:
+            df = pd.read_csv(path, nrows=200, encoding=enc, engine="python", dtype=str, na_filter=False)
+            encoding_used = enc
+            break
+        except UnicodeDecodeError as e:
+            last_error = e
+            continue
+        except Exception as e:
+            last_error = e
+            break
+    if df is None:
+        raise last_error or UnicodeDecodeError("utf-8", b"", 0, 1, "encoding detection failed")
+    text = _df_to_text(df.fillna(""))
+    meta: Dict[str, Any] = {
+        "engine": "pandas",
+        "columns": df.columns.tolist(),
+        "rows_preview": min(200, len(df)),
+    }
+    if encoding_used:
+        meta["encoding"] = encoding_used
+    return text, meta
+
+
+def _extract_excel(path: Path, engine: str) -> Tuple[str, Dict[str, Any]]:
+    _require_dependency(pd, "pandas")
+    _require_excel_engine(engine)
+    sheets = pd.read_excel(path, sheet_name=None, nrows=200, engine=engine, dtype=str)
+    parts: List[str] = []
+    for name, df_sheet in sheets.items():
+        df_sheet = df_sheet.fillna("")
+        parts.append(f"[Sheet:{name}]")
+        parts.append(" | ".join(map(str, df_sheet.columns.tolist())))
+        for _, row in df_sheet.head(50).iterrows():
+            parts.append(" • " + " | ".join(map(lambda x: str(x), row.tolist())))
+    text = TextCleaner.clean("\n".join(parts))
+    return text, {"engine": "pandas", "sheets": list(sheets.keys()), "excel_engine": engine}
+
+
+def _extract_text_file(path: Path) -> Tuple[str, Dict[str, Any]]:
+    last_error: Optional[Exception] = None
+    for enc in detect_file_encodings(path):
+        try:
+            text = path.read_text(encoding=enc)
+            return text, {"engine": "text", "encoding": enc}
+        except UnicodeDecodeError as e:
+            last_error = e
+            continue
+        except Exception as e:
+            last_error = e
+            break
+    raise last_error or UnicodeDecodeError("utf-8", b"", 0, 1, "text encoding detection failed")
+
+
+def _extract_pdf_plumber(path: Path) -> Tuple[str, Dict[str, Any]]:
+    _require_dependency(pdfplumber, "pdfplumber")
+    with pdfplumber.open(str(path)) as pdf:
+        texts = [page.extract_text() or "" for page in pdf.pages]
+    text = "\n".join(t for t in texts if t)
+    return text, {"engine": "pdfplumber", "pages": len(texts)}
+
+
+def _extract_pdf_pypdf2(path: Path) -> Tuple[str, Dict[str, Any]]:
+    _require_dependency(PyPDF2, "PyPDF2")
+    reader = PyPDF2.PdfReader(str(path))
+    texts: List[str] = []
+    for page in reader.pages:
+        try:
+            chunk = page.extract_text() or ""
+        except Exception:
+            chunk = ""
+        if chunk:
+            texts.append(chunk)
+    text = "\n".join(texts)
+    return text, {"engine": "PyPDF2", "pages": len(reader.pages)}
+
+
+def _extract_pdf_pdfminer(path: Path) -> Tuple[str, Dict[str, Any]]:
+    _require_dependency(pdfminer_extract_text, "pdfminer.six")
+    text = pdfminer_extract_text(str(path))
+    return text, {"engine": "pdfminer"}
+
+
+def _extract_textract(path: Path) -> Tuple[str, Dict[str, Any]]:
+    _require_dependency(textract, "textract")
+    data = textract.process(str(path))
+    return data.decode("utf-8", "ignore"), {"engine": "textract"}
+
+
+def _extract_docx(path: Path) -> Tuple[str, Dict[str, Any]]:
+    _require_dependency(docx, "python-docx")
+    document = docx.Document(str(path))
+    text = "\n".join(par.text for par in document.paragraphs)
+    return text, {"engine": "python-docx", "paras": len(document.paragraphs)}
+
+
+def _extract_pptx(path: Path) -> Tuple[str, Dict[str, Any]]:
+    _require_dependency(pptx, "python-pptx")
+    presentation = pptx.Presentation(str(path))
+    texts: List[str] = []
+    for idx, slide in enumerate(presentation.slides, 1):
+        parts: List[str] = []
+        for shape in slide.shapes:
+            if hasattr(shape, "text"):
+                content = (shape.text or "").strip()
+                if content:
+                    parts.append(content)
+        if parts:
+            texts.append(f"[Slide {idx}] " + " ".join(parts))
+    return "\n".join(texts), {"engine": "python-pptx", "slides": len(presentation.slides)}
+
+
+def _extract_hwp(path: Path) -> Tuple[str, Dict[str, Any]]:
+    if not (hwp5_dataio and hwp5_txt):
+        raise MissingDependencyError("pyhwp 모듈이 필요합니다.")
+    HWP5File = getattr(hwp5_dataio, "HWP5File", None)
+    TxtExtractor = getattr(hwp5_txt, "HWP5Txt", None) or getattr(hwp5_txt, "HWP5TextExtractor", None)
+    if not (HWP5File and TxtExtractor):
+        raise MissingDependencyError("pyhwp 텍스트 추출기를 찾을 수 없습니다.")
+    with path.open("rb") as fh:
+        doc = HWP5File(fh)  # type: ignore
+        extractor = TxtExtractor(doc)  # type: ignore
+        if hasattr(extractor, "text") and callable(getattr(extractor, "text")):
+            text = extractor.text()
+        elif hasattr(extractor, "to_text") and callable(getattr(extractor, "to_text")):
+            text = extractor.to_text()
+        elif hasattr(extractor, "get_text") and callable(getattr(extractor, "get_text")):
+            text = extractor.get_text()
+        elif hasattr(extractor, "extract_text") and callable(getattr(extractor, "extract_text")):
+            text = extractor.extract_text()
+        else:
+            text = ""
+    if isinstance(text, (list, tuple)):
+        text = "\n".join(map(str, text))
+    return str(text), {"engine": "pyhwp"}
+
+
+EXTRACTOR_REGISTRY.register([".csv"], "csv-pandas", _extract_csv)
+EXTRACTOR_REGISTRY.register([".txt"], "text", _extract_text_file)
+EXTRACTOR_REGISTRY.register([".xlsx", ".xlsm", ".xltx"], "excel-openpyxl", lambda p: _extract_excel(p, "openpyxl"))
+EXTRACTOR_REGISTRY.register([".xls"], "excel-xlrd", lambda p: _extract_excel(p, "xlrd"))
+EXTRACTOR_REGISTRY.register([".xlsb"], "excel-pyxlsb", lambda p: _extract_excel(p, "pyxlsb"))
+EXTRACTOR_REGISTRY.register([".pdf"], "pdfplumber", _extract_pdf_plumber)
+EXTRACTOR_REGISTRY.register([".pdf"], "PyPDF2", _extract_pdf_pypdf2)
+EXTRACTOR_REGISTRY.register([".pdf"], "pdfminer", _extract_pdf_pdfminer)
+EXTRACTOR_REGISTRY.register([".pdf"], "textract", _extract_textract)
+EXTRACTOR_REGISTRY.register([".docx"], "python-docx", _extract_docx)
+EXTRACTOR_REGISTRY.register([".docx", ".doc"], "textract", _extract_textract)
+EXTRACTOR_REGISTRY.register([".pptx"], "python-pptx", _extract_pptx)
+EXTRACTOR_REGISTRY.register([".pptx", ".ppt"], "textract", _extract_textract)
+EXTRACTOR_REGISTRY.register([".hwp"], "pyhwp", _extract_hwp)
+EXTRACTOR_REGISTRY.register([".hwp"], "textract", _extract_textract)
 
 
 # =========================
@@ -372,11 +427,13 @@ class CorpusBuilder:
         if translate and not self.translator:
             print("⚠️ 경고: 'googletrans' 라이브러리를 찾을 수 없어 번역 기능이 비활성화됩니다.")
             print("   해결: pip install googletrans==4.0.0-rc1")
+        self.failures: List[Dict[str, Any]] = []
 
     def build(self, file_rows:List[Dict[str,Any]]):
         if pd is None: raise RuntimeError("pandas 필요. pip install pandas")
         total=len(file_rows)
         recs:List[ExtractRecord]=[]
+        self.failures.clear()
 
         iterator = file_rows
         if self.progress and tqdm:
@@ -390,58 +447,74 @@ class CorpusBuilder:
             recs.append(self._extract_one(row))
             if not (self.progress and tqdm):
                 prog.update(1)
-        
+
         if self.progress and tqdm:
             iterator.close()
         else:
             prog.close()
 
         df = pd.DataFrame([r.__dict__ for r in recs])
+        if not df.empty:
+            df["text"] = df["text"].fillna("").astype(str)
+            df["content"] = df["content"].fillna("").astype(str)
         ok = int(df["ok"].sum()) if len(df)>0 else 0
         fail = int((~df["ok"]).sum()) if len(df)>0 else 0
         print(f"✅ Extract 완료: ok={ok}, fail={fail}", flush=True)
         return df
 
     def _extract_one(self, row:Dict[str,Any])->ExtractRecord:
-        p=Path(row["path"]); ext=p.suffix.lower()
-        ex=EXT_MAP.get(ext)
-        if not ex:
-            return ExtractRecord(str(p), ext, False, "", {"error":"no extractor"}, row.get("size"), row.get("mtime"))
-        try:
-            out=ex.extract(p)
-            original_full = out.get("text", "") or ""
-            original_text=original_full[:self.max_text_chars]
-            preview = original_text[:500]
-            if len(original_text) > 500:
-                preview = preview + "…"
-            content = f"{str(p)}\n{preview}" if preview else str(p)
+        p=Path(row["path"])
+        ext=p.suffix.lower()
+        result = EXTRACTOR_REGISTRY.extract(p)
 
-            text_for_model = original_text
-            if self.translator and original_text.strip():
-                try:
-                    # 비동기 함수 실행을 위해 asyncio.run 사용
-                    translated = asyncio.run(self.translator.translate(original_text, dest='en'))
-                    text_for_model = translated.text
-                except Exception as e:
-                    # tqdm 사용 시 출력이 깨지는 것을 방지하기 위해 tqdm.write 사용
-                    msg = f"\n[경고] '{p.name}' 번역 실패. 원본 텍스트 사용. 오류: {e}"
-                    if tqdm and self.progress:
-                        tqdm.write(msg)
-                    else:
-                        print(msg)
-
+        if not result.ok:
+            attempt = result.attempts[-1] if result.attempts else None
+            self.failures.append({
+                "path": str(p),
+                "ext": ext,
+                "engine": attempt.engine if attempt else "",
+                "error": attempt.error if attempt else "no extractor",
+                "traceback": attempt.traceback if attempt else "",
+            })
             return ExtractRecord(
                 str(p),
                 ext,
-                bool(out.get("ok",False)),
-                text_for_model,
-                out.get("meta",{}),
+                False,
+                "",
+                result.meta,
                 row.get("size"),
                 row.get("mtime"),
-                content,
+                str(p),
             )
-        except Exception as e:
-            return ExtractRecord(str(p), ext, False, "", {"error":f"extract crash: {e}"}, row.get("size"), row.get("mtime"), str(p))
+
+        original_text = (result.text or "")[: self.max_text_chars]
+        preview = original_text[:500]
+        if len(original_text) > 500:
+            preview += "…"
+        content = f"{str(p)}\n{preview}" if preview else str(p)
+
+        text_for_model = original_text
+        if self.translator and original_text.strip():
+            try:
+                translated = asyncio.run(self.translator.translate(original_text, dest='en'))
+                text_for_model = translated.text or ""
+            except Exception as e:
+                msg = f"\n[경고] '{p.name}' 번역 실패. 원본 텍스트 사용. 오류: {e}"
+                if tqdm and self.progress:
+                    tqdm.write(msg)
+                else:
+                    print(msg)
+
+        return ExtractRecord(
+            str(p),
+            ext,
+            True,
+            text_for_model,
+            result.meta,
+            row.get("size"),
+            row.get("mtime"),
+            content,
+        )
 
     @staticmethod
     def save(df, out_path:Path):
@@ -459,6 +532,14 @@ class CorpusBuilder:
                 return
         df.to_csv(out_path, index=False, encoding="utf-8-sig")
         print(f"✅ CSV 저장: {out_path}")
+
+    def export_failures(self, out_path: Path):
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        with out_path.open("w", newline="", encoding="utf-8-sig") as f:
+            writer = csv.DictWriter(f, fieldnames=["path", "ext", "engine", "error", "traceback"])
+            writer.writeheader()
+            for row in self.failures:
+                writer.writerow(row)
 
 
 # =========================
@@ -540,6 +621,9 @@ def run_step2(file_rows:List[Dict[str,Any]],
     # 1) Extract & Translate
     cb=CorpusBuilder(max_text_chars=200_000, progress=True, translate=translate)
     df=cb.build(file_rows)
+    failures_path = out_corpus.parent / "extract_failures.csv"
+    cb.export_failures(failures_path)
+    print(f"🧾 추출 실패 로그: {failures_path} (rows={len(cb.failures)})", flush=True)
 
     # 2) 학습 데이터 필터
     if pd is None: raise RuntimeError("pandas 필요")
