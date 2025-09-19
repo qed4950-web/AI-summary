@@ -1,6 +1,6 @@
 # retriever.py  (Step3: 검색기)
 from __future__ import annotations
-import os, sys, json, time, importlib, types
+import os, sys, json, time, importlib, types, warnings
 from pathlib import Path
 from dataclasses import dataclass
 from typing import List, Dict, Any, Optional
@@ -16,6 +16,11 @@ try:
     import joblib
 except Exception:
     joblib = None
+
+try:
+    from sklearn.exceptions import InconsistentVersionWarning
+except Exception:
+    InconsistentVersionWarning = None  # type: ignore
 
 
 # =========================
@@ -54,25 +59,39 @@ class QueryEncoder:
             raise RuntimeError("joblib이 필요합니다. pip install joblib")
 
         try:
-            obj = joblib.load(model_path)
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                obj = joblib.load(model_path)
         except ModuleNotFoundError as e:
             if "TextCleaner" in str(e):
                 print("⚠ 레거시 모델 감지: TextCleaner → pipeline 별칭 주입 후 재시도")
                 _alias_legacy_modules()
-                obj = joblib.load(model_path)
+                with warnings.catch_warnings(record=True) as caught:
+                    warnings.simplefilter("always")
+                    obj = joblib.load(model_path)
             else:
                 raise
+
+        if 'caught' in locals():
+            for warning in caught:
+                if InconsistentVersionWarning and issubclass(warning.category, InconsistentVersionWarning):
+                    print("ℹ️ 모델 버전 경고: 저장된 모델과 현재 scikit-learn 버전이 다릅니다. 필요 시 'python infopilot.py train'으로 재학습하세요.")
+                else:
+                    warnings.showwarning(warning.message, warning.category, warning.filename, warning.lineno)
 
         self.pipeline = obj["pipeline"]
         self.tfidf = self.pipeline.named_steps["tfidf"]
         self.svd = self.pipeline.named_steps["svd"]
 
     def encode_docs(self, texts: List[str]) -> np.ndarray:
+        texts = [t if isinstance(t, str) else "" for t in texts]
         X = self.tfidf.transform(texts)
         Z = self.svd.transform(X)
         return Z.astype(np.float32, copy=False)
 
     def encode_query(self, query: str) -> np.ndarray:
+        if not isinstance(query, str):
+            query = str(query or "")
         Xq = self.tfidf.transform([query])
         Zq = self.svd.transform(Xq)
         return Zq.astype(np.float32, copy=False)
@@ -170,9 +189,28 @@ class Retriever:
             try:
                 df = pd.read_parquet(self.corpus_path)
             except Exception:
-                df = pd.read_csv(self.corpus_path.with_suffix(".csv"))
+                df = pd.read_csv(
+                    self.corpus_path.with_suffix(".csv"),
+                    dtype=str,
+                    na_filter=False,
+                    encoding="utf-8-sig",
+                )
         else:
-            df = pd.read_csv(self.corpus_path)
+            df = pd.read_csv(
+                self.corpus_path,
+                dtype=str,
+                na_filter=False,
+                encoding="utf-8-sig",
+            )
+
+        if "text" in df.columns:
+            df["text"] = df["text"].fillna("").astype(str)
+        if "content" in df.columns:
+            df["content"] = df["content"].fillna("").astype(str)
+        if "path" in df.columns:
+            df["path"] = df["path"].fillna("").astype(str)
+        if "ext" in df.columns:
+            df["ext"] = df["ext"].fillna("").astype(str)
 
         mask = df["text"].astype(str).str.len() > 0
         work = df[mask].copy()
