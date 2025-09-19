@@ -51,7 +51,16 @@ class FileFinder:
         r"\Windows\WinSxS\Temp",
         r"\Windows\Temp",
     }
-    DEFAULT_EXCLUDE_TOKENS = {".venv", "site-packages", "appdata"}
+    DEFAULT_EXCLUDE_TOKENS = {
+        ".venv",
+        "venv",
+        "site-packages",
+        "appdata",
+        "program files",
+        "node_modules",
+        "__pycache__",
+    }
+    DEFAULT_EXCLUDE_FILE_PATTERNS = {"~$", ".tmp"}
 
     def __init__(
         self,
@@ -90,6 +99,7 @@ class FileFinder:
         if exclude_tokens:
             tokens.update(t.lower() for t in exclude_tokens)
         self._exclude_tokens = tokens
+        self._normalized_roots = [self._normalize_path(p) for p in self.manual_roots]
 
     # ---------- roots ----------
     def _windows_drives(self) -> List[Path]:
@@ -127,6 +137,21 @@ class FileFinder:
             return self._linux_roots()
 
     # ---------- utils ----------
+    def _normalize_path(self, path: Path) -> Path:
+        try:
+            return path.resolve()
+        except Exception:
+            return path.absolute()
+
+    def _within_root(self, root: Path, candidate: Path) -> bool:
+        try:
+            candidate = self._normalize_path(candidate)
+            root = self._normalize_path(root)
+            candidate.relative_to(root)
+            return True
+        except Exception:
+            return False
+
     def _should_skip_dir(self, path: Path) -> bool:
         if platform.system().lower().startswith("win"):
             path_str = str(path)
@@ -137,6 +162,22 @@ class FileFinder:
         name = path.name.lower()
         for token in self._exclude_tokens:
             if token in lowered or token == name:
+                return True
+        return False
+
+    def _should_skip_file(self, path: Path) -> bool:
+        lowered = path.name.lower()
+        for pattern in self.DEFAULT_EXCLUDE_FILE_PATTERNS:
+            pat = pattern.lower()
+            if pat == "~$":
+                if lowered.startswith("~$"):
+                    return True
+                continue
+            if pat.startswith("*") and lowered.endswith(pat.lstrip("*")):
+                return True
+            if pat.endswith("*") and lowered.startswith(pat.rstrip("*")):
+                return True
+            if lowered.endswith(pat):
                 return True
         return False
     def _depth_from_root(self, root: Path, current: Path) -> int:
@@ -225,13 +266,16 @@ class FileFinder:
                                 try:
                                     if entry.is_symlink() and not self.follow_symlinks:
                                         continue
+                                    p = Path(entry.path)
+                                    if not self._within_root(root, p):
+                                        continue
                                     if entry.is_dir(follow_symlinks=self.follow_symlinks):
-                                        p = Path(entry.path)
                                         if self._should_skip_dir(p):
                                             continue
                                         if hasattr(entry, 'inode'):
                                             key = (entry.inode(), entry.stat(follow_symlinks=False).st_dev)
-                                            if key in visited_inodes: continue
+                                            if key in visited_inodes:
+                                                continue
                                             visited_inodes.add(key)
                                         total += 1
                                         if total % 500 == 0:
@@ -263,8 +307,10 @@ class FileFinder:
                         try:
                             if entry.is_symlink() and not self.follow_symlinks:
                                 continue
+                            p = Path(entry.path)
+                            if not self._within_root(root, p):
+                                continue
                             if entry.is_dir(follow_symlinks=self.follow_symlinks):
-                                p = Path(entry.path)
                                 if self._should_skip_dir(p):
                                     continue
                                 if hasattr(entry, 'inode'):
@@ -274,6 +320,8 @@ class FileFinder:
                                 stack.append(p)
                                 continue
                             if entry.is_file(follow_symlinks=self.follow_symlinks):
+                                if self._should_skip_file(p):
+                                    continue
                                 with self._lock:
                                     self._files_scanned += 1
                                 yield Path(entry.path)
@@ -298,6 +346,8 @@ class FileFinder:
             if spinner:
                 spinner.stop()
 
+        self._normalized_roots = [self._normalize_path(r) for r in roots]
+
         if self.estimate_total_dirs:
             self._total_dirs_estimate = self._estimate_total_dirs(roots)
         else:
@@ -311,9 +361,10 @@ class FileFinder:
         try:
             results: List[Dict] = []
             def _scan():
-                for root in roots:
+                for idx, root in enumerate(roots):
+                    normalized = self._normalized_roots[idx] if idx < len(self._normalized_roots) else self._normalize_path(root)
                     with self._lock:
-                        self._current_root = str(root)
+                        self._current_root = str(normalized)
                     for f in self._iter_files(root):
                         ext = f.suffix.lower()
                         if ext in self.exts:

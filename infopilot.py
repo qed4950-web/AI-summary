@@ -34,7 +34,9 @@ def cmd_train(args):
     from pipeline import run_step2, TrainConfig
     import csv
     rows = []
-    scan_path = Path(args.scan_csv)
+    scan_csv_path = getattr(args, "input", None) or args.scan_csv
+    model_path_override = getattr(args, "index", None)
+    scan_path = Path(scan_csv_path)
     last_error = None
     used_encoding = None
     for enc in detect_file_encodings(scan_path):
@@ -69,7 +71,7 @@ def cmd_train(args):
         max_df=args.max_df,
     )
     out_corpus = Path(args.corpus)
-    out_model = Path(args.model)
+    out_model = Path(model_path_override or args.model)
     # run_step2 호출 시 translate 플래그 전달
     df, tm = run_step2(rows, out_corpus=out_corpus, out_model=out_model, cfg=cfg, use_tqdm=True, translate=args.translate)
     print("✅ 학습 완료")
@@ -86,7 +88,7 @@ def cmd_chat(args):
         topk=args.topk,
         translate=args.translate # 번역 옵션 전달
     )
-    chat_session.ready(rebuild=False)
+    chat_session.ready(rebuild=getattr(args, "rebuild", False))
 
     print("\n💬 InfoPilot Chat 모드입니다. (종료하려면 'exit' 또는 '종료' 입력)")
     while True:
@@ -109,6 +111,40 @@ def cmd_chat(args):
             for s in result["suggestions"]:
                 print(f"   - {s}")
         print("-" * 80)
+
+
+def cmd_pipeline(args):
+    scan_args = argparse.Namespace(
+        path=args.path,
+        exclude=args.exclude,
+        out=args.scan_out,
+    )
+    cmd_scan(scan_args)
+
+    train_args = argparse.Namespace(
+        scan_csv=args.scan_out,
+        input=None,
+        corpus=args.corpus,
+        model=args.model,
+        index=None,
+        max_features=args.max_features,
+        n_components=args.n_components,
+        n_clusters=args.n_clusters,
+        min_df=args.min_df,
+        max_df=args.max_df,
+        translate=args.translate,
+    )
+    cmd_train(train_args)
+
+    chat_args = argparse.Namespace(
+        model=args.model,
+        corpus=args.corpus,
+        cache=args.cache,
+        topk=args.topk,
+        translate=args.translate,
+        rebuild=True,
+    )
+    cmd_chat(chat_args)
 
 
 def main():
@@ -138,8 +174,10 @@ def main():
     # train
     ap_train = sp.add_parser("train", help="코퍼스 생성 + 모델 학습 (기본: 번역 활성)")
     ap_train.add_argument("--scan_csv", default="./data/found_files.csv")
+    ap_train.add_argument("--input", help="scan CSV 경로 (구 --scan_csv 별칭)")
     ap_train.add_argument("--corpus", default="./data/corpus.parquet")
     ap_train.add_argument("--model", default="./data/topic_model.joblib")
+    ap_train.add_argument("--index", help="모델 파일 경로 (구 --model 별칭)")
     ap_train.add_argument("--max_features", type=int, default=150000)
     ap_train.add_argument("--n_components", type=int, default=128)
     ap_train.add_argument("--n_clusters", type=int, default=25)
@@ -155,9 +193,28 @@ def main():
     ap_chat.add_argument("--corpus", default="./data/corpus.parquet")
     ap_chat.add_argument("--cache", default="./index_cache")
     ap_chat.add_argument("--topk", type=int, default=5)
+    ap_chat.add_argument("--rebuild", action="store_true", help="기존 인덱스를 무시하고 재생성합니다.")
     ap_chat.add_argument("--no-translate", dest="translate", action="store_false", help="질문 번역 기능을 비활성화합니다.")
     ap_chat.set_defaults(translate=True)
     ap_chat.set_defaults(func=cmd_chat)
+
+    # pipeline
+    ap_pipeline = sp.add_parser("pipeline", help="scan→train→chat 원스텝 실행")
+    ap_pipeline.add_argument("--path", required=True, nargs="+", help="스캔할 루트 폴더 경로")
+    ap_pipeline.add_argument("--exclude", action="append", default=[], help="스캔에서 제외할 디렉터리/패턴")
+    ap_pipeline.add_argument("--scan-out", dest="scan_out", default="./data/found_files.csv")
+    ap_pipeline.add_argument("--corpus", default="./data/corpus.parquet")
+    ap_pipeline.add_argument("--model", default="./data/topic_model.joblib")
+    ap_pipeline.add_argument("--cache", default="./index_cache")
+    ap_pipeline.add_argument("--topk", type=int, default=5)
+    ap_pipeline.add_argument("--max_features", type=int, default=150000)
+    ap_pipeline.add_argument("--n_components", type=int, default=128)
+    ap_pipeline.add_argument("--n_clusters", type=int, default=25)
+    ap_pipeline.add_argument("--min_df", type=int, default=2)
+    ap_pipeline.add_argument("--max_df", type=float, default=0.85)
+    ap_pipeline.add_argument("--no-translate", dest="translate", action="store_false", help="번역 기능을 비활성화합니다.")
+    ap_pipeline.set_defaults(translate=True)
+    ap_pipeline.set_defaults(func=cmd_pipeline)
 
     args = ap.parse_args()
     args.func(args)
