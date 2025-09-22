@@ -2,14 +2,14 @@
 from __future__ import annotations
 
 import argparse
+import itertools
 import math
 import queue
 import threading
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Set, Tuple
 
-import csv
 import csv
 csv.field_size_limit(10**7)  # 10MB까지 허용
 
@@ -49,7 +49,7 @@ from pipeline import (
     remove_from_corpus,
     CorpusBuilder,
 )
-from lnp_chat import LNPChat # 새로운 LNP Chat 클래스를 임포트
+from lnp_chat import LNPChat  # 새로운 LNP Chat 클래스를 임포트
 from retriever import VectorIndex, MODEL_TEXT_COLUMN, _split_tokens
 
 
@@ -189,15 +189,17 @@ def _resolve_scan_csv(path: Path) -> Path:
     raise FileNotFoundError(f"스캔 CSV를 찾을 수 없습니다: {path}")
 
 
-def _load_scan_rows(scan_csv: Path) -> List[Dict[str, Any]]:
-    rows: List[Dict[str, Any]] = []
+def _iter_scan_rows(scan_csv: Path) -> Iterator[Dict[str, Any]]:
     with scan_csv.open("r", encoding="utf-8", newline="") as f:
         reader = csv.DictReader(f)
         for idx, raw in enumerate(reader, start=2):
             normalized = _normalize_scan_row(raw, context=f"{scan_csv}:{idx}")
             if normalized:
-                rows.append(normalized)
-    return rows
+                yield normalized
+
+
+def _load_scan_rows(scan_csv: Path) -> Iterator[Dict[str, Any]]:
+    return _iter_scan_rows(scan_csv)
 
 
 def _sync_scan_csv(
@@ -205,35 +207,51 @@ def _sync_scan_csv(
     rows_to_add: List[Dict[str, Any]],
     paths_to_remove: Set[str],
 ) -> None:
+    if not rows_to_add and not paths_to_remove:
+        return
+
+    def _normalize_path(raw: Any) -> str:
+        return str(raw or "").strip()
+
     fieldnames = ["path", "size", "mtime", "ctime", "ext", "drive", "owner"]
-    existing: Dict[str, Dict[str, Any]] = {}
-
-    if scan_csv.exists():
-        with scan_csv.open("r", encoding="utf-8", newline="") as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                path_key = str(row.get("path", "")).strip()
-                if not path_key:
-                    continue
-                existing[path_key] = {k: row.get(k) for k in fieldnames}
-
-    for raw_path in paths_to_remove:
-        key = str(raw_path).strip()
-        existing.pop(key, None)
-
+    additions: Dict[str, Dict[str, Any]] = {}
     for row in rows_to_add:
-        key = str(row.get("path", "")).strip()
-        if not key:
+        path_key = _normalize_path(row.get("path"))
+        if not path_key:
             continue
-        normalized_row = {k: row.get(k) for k in fieldnames}
-        existing[key] = {**existing.get(key, {}), **normalized_row}
+        additions[path_key] = {name: row.get(name) for name in fieldnames}
+
+    removals = {_normalize_path(path) for path in paths_to_remove if _normalize_path(path)}
+    removals.difference_update(additions.keys())
 
     scan_csv.parent.mkdir(parents=True, exist_ok=True)
-    with scan_csv.open("w", encoding="utf-8", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
+
+    if not scan_csv.exists():
+        with scan_csv.open("w", encoding="utf-8", newline="") as dst:
+            writer = csv.DictWriter(dst, fieldnames=fieldnames)
+            writer.writeheader()
+            for record in additions.values():
+                writer.writerow(record)
+        return
+
+    temp_path = scan_csv.with_suffix(scan_csv.suffix + ".tmp")
+    with scan_csv.open("r", encoding="utf-8", newline="") as src, temp_path.open(
+        "w", encoding="utf-8", newline=""
+    ) as dst:
+        reader = csv.DictReader(src)
+        writer = csv.DictWriter(dst, fieldnames=fieldnames)
         writer.writeheader()
-        for record in existing.values():
+
+        for row in reader:
+            path_key = _normalize_path(row.get("path"))
+            if not path_key or path_key in removals or path_key in additions:
+                continue
+            writer.writerow({name: row.get(name) for name in fieldnames})
+
+        for record in additions.values():
             writer.writerow(record)
+
+    temp_path.replace(scan_csv)
 
 
 def _load_sentence_encoder(model_path: Path) -> Tuple[Optional[SentenceTransformer], int, str]:
@@ -443,6 +461,19 @@ def _watch_loop(
     pending_remove: Set[str] = set()
     last_event = 0.0
 
+    def _log_throughput(add_count: int, remove_count: int, elapsed: float) -> None:
+        total = add_count + remove_count
+        if total <= 0:
+            return
+        rate = total / elapsed if elapsed > 0 else 0.0
+        print(
+            (
+                "⚙️ watcher: processed add={add} remove={rem} in {secs:.2f}s "
+                "(~{rate:.1f}/s)"
+            ).format(add=add_count, rem=remove_count, secs=elapsed, rate=rate),
+            flush=True,
+        )
+
     while not stop_event.is_set():
         try:
             event_type, path = event_queue.get(timeout=0.5)
@@ -464,14 +495,20 @@ def _watch_loop(
             pending_add.clear()
             pending_remove.clear()
             try:
+                t0 = time.time()
                 pipeline_ctx.process(to_add, to_remove)
+                _log_throughput(len(to_add), len(to_remove), time.time() - t0)
             except Exception as exc:
                 print(f"⚠️ 증분 파이프라인 처리 중 오류: {exc}")
 
     # Flush remaining events
     if pending_add or pending_remove:
         try:
-            pipeline_ctx.process(set(pending_add), set(pending_remove))
+            to_add = set(pending_add)
+            to_remove = set(pending_remove)
+            t0 = time.time()
+            pipeline_ctx.process(to_add, to_remove)
+            _log_throughput(len(to_add), len(to_remove), time.time() - t0)
         except Exception as exc:
             print(f"⚠️ 증분 파이프라인 종료 처리 중 오류: {exc}")
 
@@ -490,11 +527,14 @@ def _build_train_config(args) -> TrainConfig:
     )
 
 
-def _maybe_limit_rows(rows: List[Dict[str, Any]], limit: int) -> List[Dict[str, Any]]:
-    if limit and len(rows) > limit:
-        print(f"⚡ 테스트 모드: 상위 {limit}개 파일만 사용합니다.")
-        return rows[:limit]
-    return rows
+def _maybe_limit_rows(rows: Iterable[Dict[str, Any]], limit: int) -> List[Dict[str, Any]]:
+    iterator = iter(rows)
+    if limit and limit > 0:
+        limited = list(itertools.islice(iterator, limit))
+        if next(iterator, None) is not None:
+            print(f"⚡ 테스트 모드: 상위 {limit}개 파일만 사용합니다.")
+        return limited
+    return list(iterator)
 
 
 def _default_train_config() -> TrainConfig:
@@ -561,7 +601,7 @@ def _ensure_chat_artifacts(
         )
 
     print("⚠️ 스캔 결과가 모델보다 최신입니다. 자동으로 train 단계를 실행합니다.")
-    rows = _load_scan_rows(resolved_scan)
+    rows = list(_load_scan_rows(resolved_scan))
     if not rows:
         raise ValueError("자동 학습을 위한 유효한 행이 없습니다. 스캔 결과를 확인해주세요.")
 
@@ -580,8 +620,8 @@ def _ensure_chat_artifacts(
 
 def cmd_train(args):
     scan_csv = _resolve_scan_csv(Path(args.scan_csv))
-    rows = _load_scan_rows(scan_csv)
-    rows = _maybe_limit_rows(rows, args.limit_files)
+    row_iter = _load_scan_rows(scan_csv)
+    rows = _maybe_limit_rows(row_iter, args.limit_files)
 
     if not rows:
         raise ValueError("유효한 학습 대상 행이 없습니다. 스캔 CSV를 확인해주세요.")
@@ -596,9 +636,8 @@ def cmd_train(args):
 def cmd_pipeline(args):
     out = Path(args.out)
     roots = _parse_roots(args.roots)
-    _run_scan(out, roots)
-    rows = _load_scan_rows(out)
-    rows = _maybe_limit_rows(rows, args.limit_files)
+    scan_rows = _run_scan(out, roots)
+    rows = _maybe_limit_rows(scan_rows, args.limit_files)
 
     if not rows:
         raise ValueError("유효한 학습 대상 행이 없습니다. 스캔 결과를 확인해주세요.")

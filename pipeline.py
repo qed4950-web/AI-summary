@@ -1,9 +1,14 @@
 # pipeline.py  (Step2: 추출 + 학습)
 import importlib
-import math
-import os, re, sys, time, threading, platform
-from datetime import datetime
 import io
+import math
+import os
+import platform
+import re
+import sys
+import threading
+import time
+from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from dataclasses import dataclass
@@ -101,18 +106,23 @@ class Spinner:
         self._stop = threading.Event()
         self._t = None
         self._i = 0
-    def start(self):
-        if self._t: return
-        def _run():
+    def start(self) -> None:
+        if self._t:
+            return
+
+        def _run() -> None:
             while not self._stop.wait(self.interval):
                 frame = self.FRAMES[self._i % len(self.FRAMES)]
                 self._i += 1
                 sys.stdout.write(f"\r{self.prefix} {frame} ")
                 sys.stdout.flush()
+
         self._t = threading.Thread(target=_run, daemon=True)
         self._t.start()
-    def stop(self, clear=True):
-        if not self._t: return
+
+    def stop(self, clear=True) -> None:
+        if not self._t:
+            return
         self._stop.set()
         self._t.join()
         if clear:
@@ -120,13 +130,14 @@ class Spinner:
             sys.stdout.flush()
 
 class ProgressLine:
-    def __init__(self, total:int, label:str, update_every:int=10):
+    def __init__(self, total: int, label: str, update_every: int = 10):
         self.total = max(1, total)
         self.label = label
         self.update_every = max(1, update_every)
         self.start = time.time()
         self.n = 0
-    def update(self, k:int=1):
+
+    def update(self, k: int = 1):
         self.n += k
         if (self.n % self.update_every) != 0 and self.n < self.total:
             return
@@ -139,15 +150,22 @@ class ProgressLine:
             f"{rate:,.1f}/s  elapsed={self._fmt(elapsed)}  ETA={self._fmt(remain)}   "
         )
         sys.stdout.flush()
-    def close(self):
+
+    def close(self) -> None:
         self.n = self.total
         self.update(0)
-        sys.stdout.write("\n"); sys.stdout.flush()
+        sys.stdout.write("\n")
+        sys.stdout.flush()
+
     @staticmethod
-    def _fmt(s: float)->str:
-        if s==float("inf"): return "∞"
-        m, sec = divmod(int(s), 60); h, m = divmod(m, 60)
-        return f"{h:d}:{m:02d}:{sec:02d}" if h else f"{m:02d}:{sec:02d}"
+    def _fmt(s: float) -> str:
+        if s == float("inf"):
+            return "∞"
+        m, sec = divmod(int(s), 60)
+        h, m = divmod(m, 60)
+        if h:
+            return f"{h:d}:{m:02d}:{sec:02d}"
+        return f"{m:02d}:{sec:02d}"
 
 
 # =========================
@@ -155,11 +173,13 @@ class ProgressLine:
 # =========================
 class TextCleaner:
     _multi = re.compile(r"\s+")
+
     @classmethod
-    def clean(cls, s:str)->str:
-        if not s: return ""
+    def clean(cls, s: str) -> str:
+        if not s:
+            return ""
         s = "".join(ch if ch.isprintable() or ch in "\t\n\r" else " " for ch in s)
-        s = s.replace("\x00"," ")
+        s = s.replace("\x00", " ")
         return cls._multi.sub(" ", s).strip()
 
 TOKEN_PATTERN = r'(?u)(?:[가-힣]{1,}|[A-Za-z0-9]{2,})'
@@ -567,9 +587,13 @@ def _resolve_kmeans_n_init() -> Union[str, int]:
 # Extractors
 # =========================
 class BaseExtractor:
-    exts: Tuple[str,...] = ()
-    def can_handle(self, p:Path)->bool: return p.suffix.lower() in self.exts
-    def extract(self, p:Path)->Dict[str,Any]: raise NotImplementedError
+    exts: Tuple[str, ...] = ()
+
+    def can_handle(self, path: Path) -> bool:
+        return path.suffix.lower() in self.exts
+
+    def extract(self, path: Path) -> Dict[str, Any]:
+        raise NotImplementedError
 
 class HwpExtractor(BaseExtractor):
     exts = (".hwp",)
@@ -938,37 +962,38 @@ class CorpusBuilder:
         print(f"✅ Extract 완료: ok={ok}, fail={fail}", flush=True)
         return df
 
-    def _extract_one(self, row:Dict[str,Any])->ExtractRecord:
-        p=Path(row["path"]); ext=p.suffix.lower()
-        ex=EXT_MAP.get(ext)
+    def _extract_one(self, row: Dict[str, Any]) -> ExtractRecord:
+        path = Path(row["path"])
+        ext = path.suffix.lower()
+        ex = EXT_MAP.get(ext)
         if not ex:
             return ExtractRecord(
-                str(p),
+                str(path),
                 ext,
                 False,
                 "",
                 "",
-                {"error":"no extractor"},
+                {"error": "no extractor"},
                 row.get("size"),
                 row.get("mtime"),
                 row.get("ctime"),
                 row.get("owner"),
             )
         try:
-            out=ex.extract(p)
-            original_text=(out.get("text","") or "")[:self.max_text_chars]
+            out = ex.extract(path)
+            original_text = (out.get("text", "") or "")[:self.max_text_chars]
 
             text_for_model = original_text
             if self.translator and original_text.strip():
-                text_for_model = self._translate_text(original_text, context=p.name)
+                text_for_model = self._translate_text(original_text, context=path.name)
 
             return ExtractRecord(
-                str(p),
+                str(path),
                 ext,
-                bool(out.get("ok",False)),
+                bool(out.get("ok", False)),
                 text_for_model,
                 original_text,
-                out.get("meta",{}),
+                out.get("meta", {}),
                 row.get("size"),
                 row.get("mtime"),
                 row.get("ctime"),
@@ -976,12 +1001,12 @@ class CorpusBuilder:
             )
         except Exception as e:
             return ExtractRecord(
-                str(p),
+                str(path),
                 ext,
                 False,
                 "",
                 "",
-                {"error":f"extract crash: {e}"},
+                {"error": f"extract crash: {e}"},
                 row.get("size"),
                 row.get("mtime"),
                 row.get("ctime"),

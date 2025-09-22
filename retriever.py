@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
 import os
 import re
@@ -72,7 +73,27 @@ MODEL_TEXT_COLUMN = "text_model"
 MODEL_TYPE_SENTENCE_TRANSFORMER = "sentence-transformer"
 DEFAULT_EMBED_MODEL = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 MAX_BM25_TOKENS = 8000
+MAX_PREVIEW_CHARS = 180
+DEFAULT_MMR_LAMBDA = 0.7
+RRF_DEFAULT_K = 60
+_SESSION_HISTORY_LIMIT = 50
+_SESSION_PREF_DECAY = 0.85
+_SESSION_CLICK_WEIGHT = 0.35
+_SESSION_PIN_WEIGHT = 0.6
+_SESSION_LIKE_WEIGHT = 0.45
+_SESSION_DISLIKE_WEIGHT = -0.5
+_SESSION_EXT_PREF_SCALE = 0.05
+_SESSION_OWNER_PREF_SCALE = 0.04
 _META_SPLIT_RE = re.compile(r"[^0-9A-Za-z가-힣]+")
+
+
+logger = logging.getLogger(__name__)
+if not logger.handlers:
+    logger.addHandler(logging.NullHandler())
+
+
+def _clamp(value: float, lower: float, upper: float) -> float:
+    return max(lower, min(upper, value))
 
 
 @lru_cache(maxsize=4096)
@@ -86,6 +107,15 @@ def _split_tokens(source: Any) -> List[str]:
     if not source:
         return []
     return list(_split_tokens_cached(str(source)))
+
+
+def _mask_path(path: str) -> str:
+    if not path:
+        return ""
+    try:
+        return Path(path).name
+    except Exception:
+        return "<invalid-path>"
 
 
 def _normalize_ext(ext: str) -> str:
@@ -276,6 +306,101 @@ def _iter_query_units(lowered: str) -> Set[str]:
     return units
 
 
+def _token_contains(unit: str, keyword: str) -> bool:
+    if not unit or not keyword:
+        return False
+    unit_clean = str(unit).strip().lower()
+    keyword_clean = str(keyword).strip().lower()
+    if not unit_clean or not keyword_clean:
+        return False
+    if unit_clean == keyword_clean:
+        return True
+    unit_tokens = set(_split_tokens(unit_clean))
+    if keyword_clean in unit_tokens:
+        return True
+    keyword_tokens = _split_tokens(keyword_clean)
+    if keyword_tokens and all(tok in unit_tokens for tok in keyword_tokens):
+        return True
+    return False
+
+
+@dataclass
+class SessionState:
+    history: List[str] = field(default_factory=list)
+    clicked_doc_ids: Set[int] = field(default_factory=set)
+    preferred_exts: Dict[str, float] = field(default_factory=dict)
+    owner_priors: Dict[str, float] = field(default_factory=dict)
+
+    def add_query(self, query: str) -> None:
+        if not query:
+            return
+        self.history.append(query)
+        if len(self.history) > _SESSION_HISTORY_LIMIT:
+            del self.history[: len(self.history) - _SESSION_HISTORY_LIMIT]
+
+    def record_click(
+        self,
+        *,
+        doc_id: Optional[int] = None,
+        ext: Optional[str] = None,
+        owner: Optional[str] = None,
+    ) -> None:
+        if doc_id is not None:
+            self.clicked_doc_ids.add(int(doc_id))
+        self._apply_preference(ext=ext, owner=owner, delta=_SESSION_CLICK_WEIGHT)
+
+    def record_pin(
+        self,
+        *,
+        doc_id: Optional[int] = None,
+        ext: Optional[str] = None,
+        owner: Optional[str] = None,
+    ) -> None:
+        if doc_id is not None:
+            self.clicked_doc_ids.add(int(doc_id))
+        self._apply_preference(ext=ext, owner=owner, delta=_SESSION_PIN_WEIGHT)
+
+    def record_like(
+        self,
+        *,
+        ext: Optional[str] = None,
+        owner: Optional[str] = None,
+    ) -> None:
+        self._apply_preference(ext=ext, owner=owner, delta=_SESSION_LIKE_WEIGHT)
+
+    def record_dislike(
+        self,
+        *,
+        ext: Optional[str] = None,
+        owner: Optional[str] = None,
+    ) -> None:
+        self._apply_preference(ext=ext, owner=owner, delta=_SESSION_DISLIKE_WEIGHT)
+
+    def _apply_preference(
+        self,
+        *,
+        ext: Optional[str],
+        owner: Optional[str],
+        delta: float,
+    ) -> None:
+        if ext:
+            normalized_ext = _normalize_ext(ext)
+            if normalized_ext:
+                self._update_pref(self.preferred_exts, normalized_ext, delta)
+        if owner:
+            normalized_owner = _normalize_owner(owner)
+            if normalized_owner:
+                self._update_pref(self.owner_priors, normalized_owner, delta)
+
+    def _update_pref(self, store: Dict[str, float], key: str, delta: float) -> None:
+        current = store.get(key, 0.0) * _SESSION_PREF_DECAY
+        updated = _clamp(current + delta, -1.0, 1.0)
+        if abs(updated) < 1e-4:
+            store.pop(key, None)
+        else:
+            store[key] = updated
+
+
 def _extract_query_exts(query: str, *, available_exts: Set[str]) -> Set[str]:
     if not query or not available_exts:
         return set()
@@ -299,6 +424,16 @@ def _extract_query_exts(query: str, *, available_exts: Set[str]) -> Set[str]:
         return requested
 
     for unit in units:
+        for ext, keywords in _EXT_SYNONYMS.items():
+            norm_ext = _normalize_ext(ext)
+            if norm_ext not in available_exts:
+                continue
+            if any(_token_contains(unit, keyword) for keyword in keywords):
+                requested.add(norm_ext)
+    if requested:
+        return requested
+
+    for unit in units:
         mapped = _DOMAIN_KEYWORD_MAP.get(unit)
         if mapped:
             requested.update(mapped & available_exts)
@@ -307,7 +442,7 @@ def _extract_query_exts(query: str, *, available_exts: Set[str]) -> Set[str]:
         return requested
 
     for keyword, hinted_exts in _DOMAIN_EXT_HINTS.items():
-        if keyword in lowered:
+        if any(_token_contains(unit, keyword) for unit in units):
             for ext in hinted_exts:
                 norm = _normalize_ext(ext)
                 if norm in available_exts:
@@ -351,6 +486,219 @@ def _prioritize_ext_hits(
         ordered.extend(other_hits[:remaining_slots])
 
     return ordered[:top_k]
+
+
+def _minmax_scale(values: Sequence[float]) -> List[float]:
+    data = [float(v) for v in values if v is not None]
+    if not data:
+        return []
+    vmin = min(data)
+    vmax = max(data)
+    if math.isclose(vmax, vmin, abs_tol=1e-12):
+        return [0.5] * len(values)
+    span = vmax - vmin
+    return [((float(v) - vmin) / span) if v is not None else 0.0 for v in values]
+
+
+def _dynamic_oversample(
+    top_k: int,
+    *,
+    has_ext_pref: bool,
+    filters_active: bool,
+    corpus_size: int,
+) -> int:
+    capped_top_k = max(1, int(top_k))
+    base = 2
+    if has_ext_pref:
+        base += 2
+    if filters_active:
+        base = max(base, 6)
+    if capped_top_k <= 3:
+        base = max(base, 4)
+
+    # hard upper bound so that oversample * top_k stays reasonably small
+    upper_by_limit = max(1, min(10, 200 // capped_top_k))
+
+    if corpus_size > 0:
+        max_batches = max(1, (corpus_size + capped_top_k - 1) // capped_top_k)
+        upper_by_limit = min(upper_by_limit, max_batches)
+
+    oversample = min(base, upper_by_limit)
+    return max(1, oversample)
+
+
+def _classify_query(
+    query: str,
+    *,
+    metadata_filters: "MetadataFilters",
+    requested_exts: Set[str],
+) -> str:
+    tokens = _split_tokens((query or "").lower())
+    if metadata_filters.is_active() or requested_exts:
+        return "narrow"
+    if len(tokens) <= 3:
+        return "narrow"
+    if len(tokens) >= 10:
+        return "broad"
+    return "broad"
+
+
+def _dynamic_search_params(
+    query: str,
+    top_k: int,
+    *,
+    metadata_filters: "MetadataFilters",
+    requested_exts: Set[str],
+) -> Dict[str, int]:
+    classification = _classify_query(
+        query,
+        metadata_filters=metadata_filters,
+        requested_exts=requested_exts,
+    )
+    base_top_k = max(1, int(top_k))
+    if classification == "narrow":
+        oversample = min(6, max(2, base_top_k))
+        rerank_depth = max(base_top_k * 2, 40)
+        fusion_depth = max(base_top_k * 2, base_top_k + 10)
+    else:
+        oversample = min(10, max(3, base_top_k * 2))
+        rerank_depth = max(base_top_k * 3, 120)
+        fusion_depth = max(base_top_k * 3, base_top_k + 20)
+    return {
+        "oversample": max(1, oversample),
+        "rerank_depth": max(base_top_k, rerank_depth),
+        "fusion_depth": max(base_top_k, fusion_depth),
+    }
+
+
+def _compute_extension_bonus(
+    ext: Optional[str],
+    desired_exts: Set[str],
+    session: Optional[SessionState],
+) -> Tuple[float, float, float]:
+    normalized = _normalize_ext(ext)
+    desired_bonus = _EXTENSION_MATCH_BONUS if normalized and normalized in desired_exts else 0.0
+    session_bonus = 0.0
+    if session is not None and normalized:
+        preference = session.preferred_exts.get(normalized, 0.0)
+        if preference:
+            session_bonus = preference * _SESSION_EXT_PREF_SCALE
+    return desired_bonus + session_bonus, desired_bonus, session_bonus
+
+
+def _compute_owner_bonus(owner: Optional[str], session: Optional[SessionState]) -> float:
+    if session is None or not owner:
+        return 0.0
+    normalized = _normalize_owner(str(owner))
+    if not normalized:
+        return 0.0
+    preference = session.owner_priors.get(normalized, 0.0)
+    if not preference:
+        return 0.0
+    return preference * _SESSION_OWNER_PREF_SCALE
+
+
+def _should_expand_query(
+    query: str,
+    *,
+    metadata_filters: "MetadataFilters",
+    requested_exts: Set[str],
+) -> bool:
+    tokens = _split_tokens((query or "").lower())
+    if len(tokens) > 6:
+        return False
+    if metadata_filters.is_active():
+        return False
+    if any(_looks_like_extension(tok) for tok in tokens):
+        return False
+    lowered = (query or "").lower()
+    if any(keyword in lowered for keyword in ("확장자", "extension", "file type")):
+        return False
+    return True
+
+
+def _rrf(rank_lists: Sequence[List[Dict[str, Any]]], *, k: int = RRF_DEFAULT_K) -> List[Dict[str, Any]]:
+    if not rank_lists:
+        return []
+    cumulative: Dict[Tuple[Any, Any], float] = {}
+    keeper: Dict[Tuple[Any, Any], Dict[str, Any]] = {}
+    for rlist in rank_lists:
+        for rank, hit in enumerate(rlist, start=1):
+            key = (hit.get("doc_id"), hit.get("path"))
+            if key not in keeper:
+                keeper[key] = hit
+            cumulative[key] = cumulative.get(key, 0.0) + 1.0 / (k + rank)
+    ordered = sorted(cumulative.items(), key=lambda item: item[1], reverse=True)
+    return [keeper[key] for key, _ in ordered]
+
+
+def _mmr(
+    index: "VectorIndex",
+    candidates: List[Dict[str, Any]],
+    qvec: Optional[np.ndarray],
+    top_k: int,
+    *,
+    lambda_: float = DEFAULT_MMR_LAMBDA,
+) -> List[Dict[str, Any]]:
+    if not candidates or top_k <= 0:
+        return []
+
+    if qvec is None:
+        return candidates[:top_k]
+
+    valid_hits: List[Dict[str, Any]] = []
+    doc_vectors: List[np.ndarray] = []
+    for hit in candidates:
+        doc_id = hit.get("doc_id")
+        if doc_id is None:
+            continue
+        vec = index.embeddings.get(int(doc_id)) if hasattr(index, "embeddings") else None
+        if vec is None:
+            continue
+        valid_hits.append(hit)
+        doc_vectors.append(vec)
+
+    if not valid_hits:
+        return candidates[:top_k]
+
+    D = np.vstack(doc_vectors).astype(np.float32, copy=False)
+    q = VectorIndex._normalize_vector(np.asarray(qvec, dtype=np.float32))
+    sim_to_query = (D @ q.reshape(-1, 1)).ravel()
+
+    selected_indices: List[int] = []
+    chosen_hits: List[Dict[str, Any]] = []
+    remaining = set(range(len(valid_hits)))
+
+    while remaining and len(chosen_hits) < min(top_k, len(valid_hits)):
+        if not selected_indices:
+            best = int(max(remaining, key=lambda idx: sim_to_query[idx]))
+            selected_indices.append(best)
+            remaining.discard(best)
+            chosen_hits.append(valid_hits[best])
+            continue
+
+        selected_matrix = D[selected_indices]
+        inter = D @ selected_matrix.T
+        max_inter = inter.max(axis=1)
+        mmr_scores = lambda_ * sim_to_query - (1.0 - lambda_) * max_inter
+        for idx in selected_indices:
+            mmr_scores[idx] = -1e9
+        best = int(max(remaining, key=lambda idx: mmr_scores[idx]))
+        selected_indices.append(best)
+        remaining.discard(best)
+        chosen_hits.append(valid_hits[best])
+
+    if len(chosen_hits) < top_k:
+        # fill with remaining candidates preserving order
+        seen = {id(hit) for hit in chosen_hits}
+        for hit in valid_hits:
+            if len(chosen_hits) >= top_k:
+                break
+            if id(hit) in seen:
+                continue
+            chosen_hits.append(hit)
+
+    return chosen_hits[:top_k]
 
 
 def _summarize_metadata_filters(filters: MetadataFilters) -> List[str]:
@@ -427,16 +775,30 @@ def _annotate_hits(
             breakdown["rerank"] = round(rerank_score, 4)
             reasons.append(f"Cross-Encoder 점수 {breakdown['rerank']:.2f}")
 
-        total_score = _safe_float(hit.get("score"))
+        total_score = _safe_float(hit.get("combined_score", hit.get("score")))
         if total_score is not None:
             breakdown["final"] = round(total_score, 4)
 
         ext = _normalize_ext(hit.get("ext"))
-        if ext in desired_exts:
-            breakdown["extension_bonus"] = _EXTENSION_MATCH_BONUS
+        desired_ext_bonus = _safe_float(hit.get("desired_extension_bonus")) or 0.0
+        session_ext_bonus = _safe_float(hit.get("session_ext_bonus")) or 0.0
+        session_owner_bonus = _safe_float(hit.get("session_owner_bonus")) or 0.0
+
+        breakdown["extension_bonus"] = round(desired_ext_bonus, 4) if desired_ext_bonus else 0.0
+        if desired_ext_bonus > 0 and ext:
             reasons.append(f"요청 확장자 {ext} 우선")
-        else:
-            breakdown["extension_bonus"] = 0.0
+        if session_ext_bonus:
+            breakdown["session_ext"] = round(session_ext_bonus, 4)
+            if session_ext_bonus > 0:
+                reasons.append("세션 선호 확장자 가중치")
+            else:
+                reasons.append("세션 비선호 확장자 페널티")
+        if session_owner_bonus:
+            breakdown["session_owner"] = round(session_owner_bonus, 4)
+            if session_owner_bonus > 0:
+                reasons.append("세션 선호 작성자 가중치")
+            else:
+                reasons.append("세션 비선호 작성자 페널티")
 
         metadata_reasons = metadata_summary if metadata_summary else []
 
@@ -837,6 +1199,7 @@ def _rerank_hits(
     *,
     desired_exts: Set[str],
     top_k: int,
+    session: Optional[SessionState] = None,
 ) -> List[Dict[str, Any]]:
     if not hits:
         return []
@@ -878,11 +1241,23 @@ def _rerank_hits(
             if use_lexical_overlap:
                 base_score += float(lexical_score) * _LEXICAL_WEIGHT
 
-        ext = _normalize_ext(hit.get("ext"))
-        ext_bonus = _EXTENSION_MATCH_BONUS if ext in desired_exts else 0.0
-        final_score = float(base_score) + ext_bonus
+        ext_raw = hit.get("ext")
+        ext_norm = _normalize_ext(ext_raw)
+        total_ext_bonus, desired_ext_bonus, session_ext_bonus = _compute_extension_bonus(
+            ext_norm,
+            desired_exts,
+            session,
+        )
+        owner_bonus = _compute_owner_bonus(hit.get("owner"), session)
+        final_score = float(base_score) + total_ext_bonus + owner_bonus
         hit["score"] = final_score
-        hit["similarity"] = final_score
+        if "vector_similarity" in hit:
+            hit["similarity"] = float(hit.get("vector_similarity", 0.0))
+        else:
+            hit["similarity"] = final_score
+        hit["desired_extension_bonus"] = float(desired_ext_bonus)
+        hit["session_ext_bonus"] = float(session_ext_bonus)
+        hit["session_owner_bonus"] = float(owner_bonus)
         scored_hits.append(hit)
 
     scored_hits.sort(key=lambda item: item.get("score", item.get("similarity", 0.0)), reverse=True)
@@ -893,7 +1268,7 @@ def _compose_rerank_document(hit: Dict[str, Any]) -> str:
     sections: List[str] = []
     path = str(hit.get("path") or "").strip()
     if path:
-        sections.append(f"파일 경로: {path}")
+        sections.append(f"파일 경로: {_mask_path(path)}")
     ext = str(hit.get("ext") or "").strip()
     if ext:
         sections.append(f"확장자: {ext}")
@@ -928,6 +1303,9 @@ class CrossEncoderReranker:
         self.model_name = model_name
         self.device = device or None
         self.batch_size = max(1, int(batch_size) if batch_size else 1)
+        self._early_stop_threshold: float = 0.05
+        self._early_stop_window: int = max(1, self.batch_size)
+        self._early_stop_patience: int = 2
 
         load_kwargs: Dict[str, Any] = {}
         if self.device:
@@ -937,7 +1315,7 @@ class CrossEncoderReranker:
         self.model = CrossEncoder(model_name, **load_kwargs)
         dt = time.time() - t0
         device_label = self.device or getattr(self.model, "device", "cpu")
-        print(f"✨ 재랭킹 모델 로드 완료: {model_name} (device={device_label}, {dt:.1f}s)")
+        logger.info("reranker loaded: model=%s device=%s dt=%.1fs", model_name, device_label, dt)
 
     def rerank(
         self,
@@ -945,6 +1323,7 @@ class CrossEncoderReranker:
         hits: List[Dict[str, Any]],
         *,
         desired_exts: Optional[Set[str]] = None,
+        session: Optional[SessionState] = None,
     ) -> List[Dict[str, Any]]:
         if not hits:
             return []
@@ -956,44 +1335,120 @@ class CrossEncoderReranker:
             pairs.append([query, doc_text])
             prepared_hits.append(dict(hit))
 
+        collected: List[float] = []
         try:
-            scores = self.model.predict(
+            for batch_scores in self._predict_iter(pairs):
+                collected.extend(batch_scores)
+        except Exception as exc:  # pragma: no cover - defensive path
+            logger.warning("rerank inference failed, fallback to previous scores: %s", exc)
+            return hits
+
+        if not collected:
+            return hits
+
+        ext_preferences = desired_exts or set()
+        rerank_raw = [float(s) for s in collected[: len(prepared_hits)]]
+        vector_components = [float(h.get("vector_similarity", 0.0)) for h in prepared_hits]
+        lexical_components = [float(h.get("lexical_score", 0.0)) for h in prepared_hits]
+
+        rerank_scaled = _minmax_scale(rerank_raw)
+        vector_scaled = _minmax_scale(vector_components)
+        lexical_scaled = _minmax_scale(lexical_components)
+
+        alpha, beta, gamma = 0.60, 0.25, 0.15
+        combined_hits: List[Dict[str, Any]] = []
+
+        for idx, hit in enumerate(prepared_hits):
+            rerank_score = rerank_raw[idx] if idx < len(rerank_raw) else 0.0
+            rerank_component = rerank_scaled[idx] if idx < len(rerank_scaled) else 0.0
+            vector_component = vector_scaled[idx] if idx < len(vector_scaled) else 0.0
+            lexical_component = lexical_scaled[idx] if idx < len(lexical_scaled) else 0.0
+
+            ext_bonus = 0.0
+            ext = _normalize_ext(hit.get("ext"))
+            total_ext_bonus, desired_ext_bonus, session_ext_bonus = _compute_extension_bonus(
+                ext,
+                ext_preferences,
+                session,
+            )
+            owner_bonus = _compute_owner_bonus(hit.get("owner"), session)
+
+            combined = (
+                (alpha * rerank_component)
+                + (beta * vector_component)
+                + (gamma * lexical_component)
+                + total_ext_bonus
+                + owner_bonus
+            )
+
+            original_vector = float(hit.get("vector_similarity", hit.get("similarity", 0.0)))
+            hit["vector_similarity"] = original_vector
+            hit.setdefault("pre_rerank_score", float(hit.get("score", 0.0)))
+            hit["rerank_score"] = float(rerank_score)
+            hit["combined_score"] = float(combined)
+            hit["score"] = float(combined)
+            hit["similarity"] = original_vector
+            hit["desired_extension_bonus"] = float(desired_ext_bonus)
+            hit["session_ext_bonus"] = float(session_ext_bonus)
+            hit["session_owner_bonus"] = float(owner_bonus)
+            if total_ext_bonus:
+                hit["rerank_ext_bonus"] = total_ext_bonus
+            match_reasons = hit.get("match_reasons")
+            if match_reasons is not None and session_ext_bonus:
+                label = "세션 선호 확장자 가중치" if session_ext_bonus > 0 else "세션 비선호 확장자 페널티"
+                if label not in match_reasons:
+                    match_reasons.append(label)
+            if match_reasons is not None and owner_bonus:
+                owner_label = "세션 선호 작성자 가중치" if owner_bonus > 0 else "세션 비선호 작성자 페널티"
+                if owner_label not in match_reasons:
+                    match_reasons.append(owner_label)
+            combined_hits.append(hit)
+
+        combined_hits.sort(key=lambda item: item.get("score", 0.0), reverse=True)
+        return combined_hits
+
+    def _predict_iter(self, pairs: List[List[str]]) -> Iterable[np.ndarray]:
+        total = len(pairs)
+        if total <= self.batch_size:
+            yield self.model.predict(
                 pairs,
                 batch_size=self.batch_size,
                 convert_to_numpy=True,
                 show_progress_bar=False,
             )
-        except Exception as exc:  # pragma: no cover - defensive path
-            print(f"⚠️ 재랭킹 예측 중 오류가 발생해 기본 점수를 사용합니다: {exc}")
-            return hits
+            return
 
-        ext_preferences = desired_exts or set()
-        scored: List[Dict[str, Any]] = []
-        iterable_scores: Sequence[float]
-        if hasattr(scores, "tolist"):
-            iterable_scores = scores.tolist()
-        else:
-            iterable_scores = scores
-
-        for hit, score in zip(prepared_hits, iterable_scores):
-            base_similarity = float(hit.get("similarity", hit.get("vector_similarity", 0.0)))
-            if "vector_similarity" not in hit:
-                hit["vector_similarity"] = base_similarity
-            final_score = float(score)
-            ext_bonus = 0.0
-            ext = _normalize_ext(hit.get("ext"))
-            if ext and ext in ext_preferences:
-                ext_bonus = _EXTENSION_MATCH_BONUS
-                final_score += ext_bonus
-            hit["rerank_score"] = float(score)
-            hit["similarity"] = final_score
-            hit["score"] = final_score
-            if ext_bonus:
-                hit["rerank_ext_bonus"] = ext_bonus
-            scored.append(hit)
-
-        scored.sort(key=lambda item: item.get("score", 0.0), reverse=True)
-        return scored
+        start = 0
+        window_scores: List[float] = []
+        patience_hits = 0
+        while start < total:
+            end = min(total, start + self.batch_size)
+            batch = pairs[start:end]
+            batch_scores = self.model.predict(
+                batch,
+                batch_size=self.batch_size,
+                convert_to_numpy=True,
+                show_progress_bar=False,
+            )
+            yield batch_scores
+            window_scores.extend(float(s) for s in batch_scores)
+            if len(window_scores) >= self._early_stop_window:
+                recent = window_scores[-self._early_stop_window :]
+                avg = sum(recent) / len(recent)
+                if avg < self._early_stop_threshold:
+                    patience_hits += 1
+                    if patience_hits >= self._early_stop_patience:
+                        logger.info(
+                            "reranker early stop: avg=%.4f window=%d processed=%d/%d",
+                            avg,
+                            self._early_stop_window,
+                            end,
+                            total,
+                        )
+                        break
+                else:
+                    patience_hits = 0
+            start = end
 
 
 try:
@@ -1041,7 +1496,7 @@ class QueryEncoder:
             obj = joblib.load(model_path)
         except ModuleNotFoundError as e:
             if "TextCleaner" in str(e):
-                print("⚠ 레거시 모델 감지: TextCleaner → pipeline 별칭 주입 후 재시도")
+                logger.warning("legacy model detected; injecting TextCleaner alias and retrying")
                 _alias_legacy_modules()
                 obj = joblib.load(model_path)
             else:
@@ -1060,7 +1515,7 @@ class QueryEncoder:
                     "sentence-transformers 라이브러리가 필요합니다. pip install sentence-transformers"
                 )
             model_name = obj.get("model_name") or DEFAULT_EMBED_MODEL
-            print(f"🔌 Sentence-BERT 로드: {model_name}", flush=True)
+            logger.info("Sentence-BERT loaded: %s", model_name)
             self.embedder = SentenceTransformer(model_name)
             detected_dim = obj.get("embedding_dim")
             if detected_dim:
@@ -1151,6 +1606,7 @@ class VectorIndex:
         self.mtimes: List[Optional[float]] = []
         self.ctimes: List[Optional[float]] = []
         self.owners: List[Optional[str]] = []
+        self.drives: List[Optional[str]] = []
         self.chunk_ids: List[Optional[int]] = []
         self.chunk_counts: List[Optional[int]] = []
         self.chunk_tokens: List[Optional[int]] = []
@@ -1158,12 +1614,18 @@ class VectorIndex:
         self.Z: Optional[np.ndarray] = None
         self.faiss_index = None
         self.lexical_index: Optional[BM25Okapi] = None
+        self.ann_index = None
 
         self._matrix_dirty = True
         self._faiss_dirty = True
         self._lexical_dirty = True
+        self._ann_dirty = True
 
         self.lexical_weight = 0.0
+        self.ann_threshold = 50000
+        self.ann_m = 32
+        self.ann_ef_construction = 80
+        self.ann_ef_search = 64
 
     @staticmethod
     def _normalize_rows(matrix: np.ndarray) -> np.ndarray:
@@ -1184,7 +1646,7 @@ class VectorIndex:
             return os.path.normcase(str(path))
 
     @staticmethod
-    def _truncate_preview(text: str, limit: int = 180) -> str:
+    def _truncate_preview(text: str, limit: int = MAX_PREVIEW_CHARS) -> str:
         src = (text or "").strip()
         return src if len(src) <= limit else f"{src[:limit]}…"
 
@@ -1223,6 +1685,7 @@ class VectorIndex:
         self.mtimes = []
         self.ctimes = []
         self.owners = []
+        self.drives = []
         self.chunk_ids = []
         self.chunk_counts = []
         self.chunk_tokens = []
@@ -1235,6 +1698,7 @@ class VectorIndex:
             self.mtimes.append(entry.get("mtime"))
             self.ctimes.append(entry.get("ctime"))
             self.owners.append(entry.get("owner"))
+            self.drives.append(entry.get("drive"))
             self.chunk_ids.append(entry.get("chunk_id"))
             self.chunk_counts.append(entry.get("chunk_count"))
             self.chunk_tokens.append(entry.get("chunk_tokens"))
@@ -1244,6 +1708,9 @@ class VectorIndex:
 
     def _mark_lexical_dirty(self) -> None:
         self._lexical_dirty = True
+
+    def _mark_ann_dirty(self) -> None:
+        self._ann_dirty = True
 
     def _ensure_matrix(self) -> None:
         if not self._matrix_dirty:
@@ -1302,7 +1769,9 @@ class VectorIndex:
         self._lexical_dirty = False
 
     def _tokenize_entry(self, entry: Dict[str, Any]) -> List[str]:
-        corpus = " ".join(str(entry.get(field, "")) for field in ("preview", "path", "ext", "owner"))
+        corpus = " ".join(
+            str(entry.get(field, "")) for field in ("preview", "path", "ext", "owner", "drive")
+        )
         return [tok for tok in _split_tokens(corpus.lower()) if tok]
 
     def build(
@@ -1317,6 +1786,7 @@ class VectorIndex:
         mtimes: Optional[List[Optional[float]]] = None,
         ctimes: Optional[List[Optional[float]]] = None,
         owners: Optional[List[Optional[str]]] = None,
+        drives: Optional[List[Optional[str]]] = None,
         doc_ids: Optional[List[int]] = None,
         extra_meta: Optional[List[Dict[str, Any]]] = None,
     ) -> None:
@@ -1351,6 +1821,7 @@ class VectorIndex:
         mtime_list = _meta_list(mtimes, 0.0)
         ctime_list = _meta_list(ctimes, 0.0)
         owner_list = _meta_list(owners, "")
+        drive_list = _meta_list(drives, "")
 
         for idx, doc_id in enumerate(self.doc_ids):
             entry = {
@@ -1361,6 +1832,7 @@ class VectorIndex:
                 "mtime": mtime_list[idx],
                 "ctime": ctime_list[idx],
                 "owner": owner_list[idx],
+                "drive": drive_list[idx],
             }
             if extra_meta and idx < len(extra_meta):
                 for key, value in extra_meta[idx].items():
@@ -1375,6 +1847,7 @@ class VectorIndex:
         self._matrix_dirty = True
         self._mark_faiss_dirty()
         self._mark_lexical_dirty()
+        self._mark_ann_dirty()
         self._ensure_matrix()
         self._ensure_faiss_index()
         self._ensure_lexical_index()
@@ -1387,7 +1860,7 @@ class VectorIndex:
 
         self._ensure_matrix()
         if self.Z is not None:
-            np.save(emb_path, self.Z.astype(np.float32, copy=False))
+            np.save(emb_path, self.Z.astype(np.float32, copy=False), allow_pickle=False)
         else:
             emb_path = None
 
@@ -1406,6 +1879,7 @@ class VectorIndex:
                     "mtimes": self.mtimes,
                     "ctimes": self.ctimes,
                     "owners": self.owners,
+                    "drives": self.drives,
                     "tokens": tokens_payload,
                     "chunk_id": chunk_id_payload,
                     "chunk_count": chunk_count_payload,
@@ -1445,6 +1919,7 @@ class VectorIndex:
         mtimes = meta.get("mtimes", [0.0] * len(paths))
         ctimes = meta.get("ctimes", [0.0] * len(paths))
         owners = meta.get("owners", [""] * len(paths))
+        drives = meta.get("drives", [""] * len(paths))
         tokens_payload = meta.get("tokens", [[] for _ in doc_ids])
         chunk_id_payload = meta.get("chunk_id", [None for _ in doc_ids])
         chunk_count_payload = meta.get("chunk_count", [None for _ in doc_ids])
@@ -1465,6 +1940,7 @@ class VectorIndex:
                 "mtime": mtimes[idx] if idx < len(mtimes) else 0.0,
                 "ctime": ctimes[idx] if idx < len(ctimes) else 0.0,
                 "owner": owners[idx] if idx < len(owners) else "",
+                "drive": drives[idx] if idx < len(drives) else "",
             }
             def _coerce_optional_int(raw: Any) -> Optional[int]:
                 if raw in (None, "", "null"):
@@ -1526,6 +2002,43 @@ class VectorIndex:
 
         self._mark_lexical_dirty()
         self._ensure_lexical_index()
+        self._mark_ann_dirty()
+
+    def configure_ann(
+        self,
+        *,
+        threshold: Optional[int] = None,
+        ef_search: Optional[int] = None,
+        ef_construction: Optional[int] = None,
+        m: Optional[int] = None,
+    ) -> None:
+        rebuild = False
+        if threshold is not None:
+            new_threshold = max(0, int(threshold))
+            if new_threshold != self.ann_threshold:
+                self.ann_threshold = new_threshold
+                rebuild = True
+        if ef_construction is not None:
+            new_ef_construction = max(16, int(ef_construction))
+            if new_ef_construction != self.ann_ef_construction:
+                self.ann_ef_construction = new_ef_construction
+                rebuild = True
+        if m is not None:
+            new_m = max(8, int(m))
+            if new_m != self.ann_m:
+                self.ann_m = new_m
+                rebuild = True
+        if rebuild:
+            self._mark_ann_dirty()
+        if ef_search is not None:
+            new_ef_search = max(8, int(ef_search))
+            if new_ef_search != self.ann_ef_search:
+                self.ann_ef_search = new_ef_search
+                if self.ann_index is not None:
+                    try:
+                        self.ann_index.hnsw.efSearch = self.ann_ef_search
+                    except Exception:
+                        pass
 
     def search(
         self,
@@ -1591,6 +2104,7 @@ class VectorIndex:
                 "mtime": entry.get("mtime"),
                 "ctime": entry.get("ctime"),
                 "owner": entry.get("owner"),
+                "drive": entry.get("drive"),
                 "chunk_id": entry.get("chunk_id"),
                 "chunk_count": entry.get("chunk_count"),
                 "chunk_tokens": entry.get("chunk_tokens"),
@@ -1599,7 +2113,8 @@ class VectorIndex:
                 "lexical_score": lexical_component,
                 "lexical_raw": lexical_raw,
                 "score": hybrid_score,
-                "similarity": hybrid_score,
+                "hybrid_score": hybrid_score,
+                "similarity": vector_component,
             }
             results.append(hit)
 
@@ -1622,6 +2137,10 @@ class VectorIndex:
     def _vector_scores(self, qvec: np.ndarray, fetch: int) -> Tuple[Dict[int, float], List[int]]:
         scores: Dict[int, float] = {}
         order: List[int] = []
+        if self._should_use_ann():
+            scores, order = self._ann_scores(qvec, fetch)
+            if scores:
+                return scores, order
         self._ensure_faiss_index()
         if self.faiss_index is not None and faiss is not None:
             query = qvec.reshape(1, -1).astype(np.float32, copy=False)
@@ -1649,6 +2168,76 @@ class VectorIndex:
             doc_id = self.doc_ids[pos]
             scores[doc_id] = float(sims[pos])
             order.append(doc_id)
+        return scores, order
+
+    def _should_use_ann(self) -> bool:
+        if faiss is None:
+            return False
+        if len(self.doc_ids) < max(1, self.ann_threshold):
+            return False
+        self._ensure_ann_index()
+        return self.ann_index is not None
+
+    def _ensure_ann_index(self) -> None:
+        if not self._ann_dirty:
+            return
+        if faiss is None or not self.doc_ids:
+            self.ann_index = None
+            self._ann_dirty = False
+            return
+        if len(self.doc_ids) < max(1, self.ann_threshold):
+            self.ann_index = None
+            self._ann_dirty = False
+            return
+        self._ensure_matrix()
+        if self.Z is None or self.Z.size == 0:
+            self.ann_index = None
+            self._ann_dirty = False
+            return
+        dim = self.Z.shape[1]
+        try:
+            index = faiss.IndexHNSWFlat(dim, max(8, int(self.ann_m)))
+        except Exception:
+            self.ann_index = None
+            self._ann_dirty = False
+            return
+        index.hnsw.efConstruction = max(16, int(self.ann_ef_construction))
+        index.hnsw.efSearch = max(8, int(self.ann_ef_search))
+        ids = np.asarray(self.doc_ids, dtype=np.int64)
+        index.add_with_ids(self.Z, ids)
+        self.ann_index = index
+        self._ann_dirty = False
+
+    def _ann_scores(self, qvec: np.ndarray, fetch: int) -> Tuple[Dict[int, float], List[int]]:
+        self._ensure_ann_index()
+        if self.ann_index is None:
+            return {}, []
+        k = min(len(self.doc_ids), max(fetch, self.ann_ef_search))
+        if k <= 0:
+            return {}, []
+        query = qvec.reshape(1, -1).astype(np.float32, copy=False)
+        try:
+            if hasattr(self.ann_index, "hnsw"):
+                self.ann_index.hnsw.efSearch = max(self.ann_ef_search, fetch)
+            distances, ids = self.ann_index.search(query, k)
+        except Exception:
+            return {}, []
+        scores: Dict[int, float] = {}
+        order: List[int] = []
+        if ids.size == 0:
+            return scores, order
+        for doc_id in ids[0]:
+            if doc_id < 0:
+                continue
+            doc_id_int = int(doc_id)
+            vec = self.embeddings.get(doc_id_int)
+            if vec is None:
+                continue
+            raw = float(np.dot(vec, qvec))
+            scores[doc_id_int] = raw
+            order.append(doc_id_int)
+            if len(order) >= fetch:
+                break
         return scores, order
 
     def _lexical_scores(self, query_tokens: Optional[List[str]], fetch: int) -> Dict[int, float]:
@@ -2018,10 +2607,19 @@ class Retriever:
             return None
         return self.index_manager.get_index(wait=False)
 
-    def search(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
+    def search(
+        self,
+        query: str,
+        top_k: int = 5,
+        *,
+        session: Optional[SessionState] = None,
+    ) -> List[Dict[str, Any]]:
         index = self._ensure_index()
         if index is None:
             return []
+
+        if session is not None:
+            session.add_query(query)
 
         available_exts: Set[str] = set()
         for ext in getattr(index, "exts", []):
@@ -2030,30 +2628,66 @@ class Retriever:
                 available_exts.add(normalized)
         requested_exts = _extract_query_exts(query, available_exts=available_exts)
         metadata_filters = _extract_metadata_filters(query)
+        corpus_size = len(getattr(index, "doc_ids", [])) if hasattr(index, "doc_ids") else 0
 
-        oversample = 4 if requested_exts else 2
-        if metadata_filters.is_active():
-            oversample = max(oversample, 8)
+        search_params = _dynamic_search_params(
+            query,
+            top_k,
+            metadata_filters=metadata_filters,
+            requested_exts=requested_exts,
+        )
 
-        vector_query = _expand_query_text(query)
+        oversample = max(
+            search_params["oversample"],
+            _dynamic_oversample(
+                top_k,
+                has_ext_pref=bool(requested_exts),
+                filters_active=metadata_filters.is_active(),
+                corpus_size=corpus_size,
+            ),
+        )
+
+        should_expand = _should_expand_query(
+            query,
+            metadata_filters=metadata_filters,
+            requested_exts=requested_exts,
+        )
+        vector_query = _expand_query_text(query) if should_expand else query
         query_lower = (query or "").lower()
         raw_query_tokens_set: Set[str] = {tok for tok in _split_tokens(query_lower) if tok}
         expanded_query_tokens_set: Set[str] = {
             tok for tok in _split_tokens(vector_query.lower()) if tok
         }
         q = self.encoder.encode_query(vector_query)
+        q_vector: Optional[np.ndarray]
+        try:
+            q_array = np.asarray(q, dtype=np.float32)
+            if q_array.ndim == 0:
+                q_vector = q_array.reshape(1)
+            else:
+                q_vector = q_array.reshape(-1)
+        except Exception:
+            q_vector = None
         query_tokens: Optional[List[str]] = None
         if getattr(self, "base_lexical_weight", 0.0) > 0.0:
             query_tokens = list(expanded_query_tokens_set)
-        use_rerank = bool(getattr(self, "use_rerank", False))
-        rerank_depth = int(getattr(self, "rerank_depth", 0) or 0)
-        search_top_k = max(top_k, 1)
+        configured_rerank_depth = int(getattr(self, "rerank_depth", 0) or 0)
+        effective_rerank_depth = max(search_params["rerank_depth"], configured_rerank_depth)
+        use_rerank = bool(getattr(self, "use_rerank", False) and effective_rerank_depth > 0)
+        fusion_depth = search_params["fusion_depth"]
+        search_top_k = max(top_k, 1, effective_rerank_depth if use_rerank else top_k)
         search_oversample = oversample
-        if use_rerank and rerank_depth:
-            search_top_k = max(search_top_k, rerank_depth)
+        if use_rerank:
+            search_top_k = max(search_top_k, effective_rerank_depth)
             search_oversample = max(1, min(oversample, 2))
         adaptive_lex_weight = self._dynamic_lexical_weight(query_tokens)
         self._last_lexical_weight = adaptive_lex_weight
+        if hasattr(index, "configure_ann"):
+            ann_ef = max(32, search_top_k * max(1, search_oversample))
+            try:
+                index.configure_ann(ef_search=ann_ef)
+            except Exception:
+                pass
         raw_hits = index.search(
             q,
             top_k=search_top_k,
@@ -2067,8 +2701,8 @@ class Retriever:
             return []
 
         lexical_limit = max(top_k, 1)
-        if use_rerank and rerank_depth:
-            lexical_limit = max(lexical_limit, min(rerank_depth, len(filtered_hits)))
+        if use_rerank and effective_rerank_depth:
+            lexical_limit = max(lexical_limit, min(effective_rerank_depth, len(filtered_hits)))
 
         lexical_ranking = _rerank_hits(
             query,
@@ -2076,10 +2710,13 @@ class Retriever:
             filtered_hits,
             desired_exts=requested_exts,
             top_k=lexical_limit,
+            session=session,
         )
 
         if not use_rerank:
-            final_hits = lexical_ranking[:top_k]
+            mmr_limit = max(top_k, min(len(lexical_ranking), fusion_depth))
+            mmr_candidates = lexical_ranking[:mmr_limit]
+            final_hits = _mmr(index, mmr_candidates, q_vector, top_k)
             return _annotate_hits(
                 final_hits,
                 desired_exts=requested_exts,
@@ -2091,7 +2728,9 @@ class Retriever:
 
         reranker = self._ensure_reranker()
         if reranker is None:
-            final_hits = lexical_ranking[:top_k]
+            mmr_limit = max(top_k, min(len(lexical_ranking), fusion_depth))
+            mmr_candidates = lexical_ranking[:mmr_limit]
+            final_hits = _mmr(index, mmr_candidates, q_vector, top_k)
             return _annotate_hits(
                 final_hits,
                 desired_exts=requested_exts,
@@ -2101,7 +2740,12 @@ class Retriever:
                 lexical_weight=adaptive_lex_weight,
             )
 
-        reranked = reranker.rerank(query, lexical_ranking, desired_exts=requested_exts)
+        reranked = reranker.rerank(
+            query,
+            lexical_ranking,
+            desired_exts=requested_exts,
+            session=session,
+        )
         if self.rerank_min_score is not None:
             filtered: List[Dict[str, Any]] = []
             threshold = self.rerank_min_score
@@ -2120,7 +2764,18 @@ class Retriever:
             else:
                 return []
 
-        final_hits = reranked[:top_k]
+        rank_sources: List[List[Dict[str, Any]]] = []
+        if lexical_ranking:
+            rank_sources.append(lexical_ranking[:fusion_depth])
+        if reranked:
+            rank_sources.append(reranked[:fusion_depth])
+        fused_candidates = _rrf(rank_sources) if rank_sources else []
+
+        if not fused_candidates:
+            fused_candidates = reranked[:fusion_depth]
+        mmr_pool_size = max(top_k * 2, fusion_depth)
+        mmr_candidates = fused_candidates[:mmr_pool_size]
+        final_hits = _mmr(index, mmr_candidates, q_vector, top_k)
         return _annotate_hits(
             final_hits,
             desired_exts=requested_exts,
@@ -2143,7 +2798,7 @@ class Retriever:
                 batch_size=self.rerank_batch_size,
             )
         except Exception as exc:
-            print(f"⚠️ 재랭킹 모델 로드 실패로 벡터 점수만 사용합니다: {exc}")
+            logger.warning("reranker load failed; disabling rerank: %s", exc)
             self.use_rerank = False
             self._reranker = None
         return getattr(self, "_reranker", None)
@@ -2177,14 +2832,14 @@ class Retriever:
                 use_mmap=True,
             )
         except Exception as exc:
-            print(f"⚠️ 인덱스 로드 실패로 재생성을 시도합니다: {exc}")
+            logger.warning("index load failed; rebuild scheduled: %s", exc)
             return None
 
         if not self._index_matches_model(index):
-            print("⚠️ 모델 차수와 인덱스 차수가 달라 재생성을 진행합니다.")
+            logger.warning("index dimension mismatch detected; triggering rebuild")
             return None
 
-        print(f"✅ 인덱스 로드: {self.cache_dir}")
+        logger.info("index loaded: cache=%s", _mask_path(str(self.cache_dir)))
         self._cache_signature = self._compute_cache_signature()
         return index
 
@@ -2203,7 +2858,7 @@ class Retriever:
         if work.empty:
             raise RuntimeError("유효 텍스트 문서가 없습니다.")
 
-        print(f"🧠 문서 임베딩 생성… (docs={len(work):,})")
+        logger.info("encoding documents for index build: docs=%d", len(work))
         Z = self.encoder.encode_docs(work[MODEL_TEXT_COLUMN].tolist())
 
         preview_source = work.get("preview")
@@ -2237,15 +2892,17 @@ class Retriever:
                         limited_tokens.append(tokens[:keep])
                     token_lists = limited_tokens
                     if truncated:
-                        print(
-                            f"✂️ BM25 토큰 상한 적용: {truncated:,}건이 {MAX_BM25_TOKENS:,} 토큰으로 절단되었습니다.",
-                            flush=True,
+                        logger.info(
+                            "bm25 tokens truncated: removed=%d limit=%d",
+                            truncated,
+                            MAX_BM25_TOKENS,
                         )
 
         size_list = work["size"].fillna(0).astype(int).tolist() if "size" in work.columns else [0] * len(work)
         mtime_list = work["mtime"].fillna(0.0).astype(float).tolist() if "mtime" in work.columns else [0.0] * len(work)
         ctime_list = work["ctime"].fillna(0.0).astype(float).tolist() if "ctime" in work.columns else [0.0] * len(work)
         owner_list = work["owner"].fillna("").astype(str).tolist() if "owner" in work.columns else [""] * len(work)
+        drive_list = work["drive"].fillna("").astype(str).tolist() if "drive" in work.columns else [""] * len(work)
 
         extra_meta: Optional[List[Dict[str, Any]]] = None
         chunk_columns = [col for col in ("chunk_id", "chunk_count", "chunk_tokens") if col in work.columns]
@@ -2278,6 +2935,7 @@ class Retriever:
             mtimes=mtime_list,
             ctimes=ctime_list,
             owners=owner_list,
+            drives=drive_list,
             extra_meta=extra_meta,
         )
         paths = index.save(self.cache_dir)
@@ -2286,7 +2944,10 @@ class Retriever:
             saved_files.append(str(paths.emb_npy))
         if paths.faiss_index:
             saved_files.append(str(paths.faiss_index))
-        print(f"💾 인덱스 저장: {', '.join(saved_files)}")
+        logger.info(
+            "index saved: %s",
+            ", ".join(_mask_path(path) for path in saved_files),
+        )
 
         fresh = VectorIndex()
         fresh.load(
@@ -2299,7 +2960,7 @@ class Retriever:
         return fresh
 
     def _load_corpus(self):
-        print("📥 코퍼스 로드…")
+        logger.info("loading corpus: path=%s", _mask_path(str(self.corpus_path)))
         if self.corpus_path.suffix.lower() == ".parquet":
             engine_kwargs = {}
             engine_label = PARQUET_ENGINE or "auto"
@@ -2308,9 +2969,10 @@ class Retriever:
             try:
                 return pd.read_parquet(self.corpus_path, **engine_kwargs)
             except Exception as exc:
-                print(
-                    f"⚠️ Parquet 로드 실패(engine={engine_label}): {exc} → CSV로 재시도",
-                    flush=True,
+                logger.warning(
+                    "parquet load failed (engine=%s); retrying via CSV: %s",
+                    engine_label,
+                    exc,
                 )
                 return pd.read_csv(self.corpus_path.with_suffix(".csv"))
         return pd.read_csv(self.corpus_path)
@@ -2366,7 +3028,7 @@ class Retriever:
             if loaded is None:
                 self.index_manager.schedule_rebuild(priority=True)
         except Exception as exc:
-            print(f"⚠️ 캐시 변경 후 인덱스 갱신 실패: {exc}")
+            logger.warning("index refresh after cache change failed: %s", exc)
 
     @staticmethod
     def format_results(query: str, results: List[Dict[str, Any]]) -> str:
@@ -2374,8 +3036,20 @@ class Retriever:
             return f"“{query}”와 유사한 문서를 찾지 못했습니다."
         lines = [f"‘{query}’와 유사한 문서 Top {len(results)}:"]
         for i, r in enumerate(results, 1):
-            similarity_label = _similarity_to_percent(r.get("similarity", r.get("vector_similarity")))
-            lines.append(f"{i}. {r['path']} [{r['ext']}]  유사도={similarity_label}")
+            vector_similarity = r.get("vector_similarity", r.get("similarity"))
+            similarity_label = _similarity_to_percent(vector_similarity)
+            final_score = r.get("combined_score", r.get("score", 0.0))
+            try:
+                final_score = float(final_score)
+            except (TypeError, ValueError):
+                final_score = 0.0
+            path_raw = str(r.get("path", "") or "")
+            name = _mask_path(path_raw) or path_raw or "<unknown>"
+            ext_label = str(r.get("ext", "") or "")
+            ext_display = f" [{ext_label}]" if ext_label else ""
+            lines.append(
+                f"{i}. {name}{ext_display}  유사도={similarity_label}  종합점수={final_score:.3f}"
+            )
             meta_bits: List[str] = []
             mod_date = _format_human_time(r.get("mtime") or r.get("ctime"))
             if mod_date:
@@ -2386,6 +3060,9 @@ class Retriever:
             owner = str(r.get("owner") or "").strip()
             if owner:
                 meta_bits.append(f"작성자 {owner}")
+            drive_label = str(r.get("drive") or "").strip()
+            if drive_label:
+                meta_bits.append(f"드라이브 {drive_label}")
             if meta_bits:
                 lines.append("   메타: " + ", ".join(meta_bits))
             if r.get("preview"):
