@@ -100,7 +100,8 @@ Remove-Item .venv -Recurse -Force
    ```
 
 ## 테스트 및 검증
-- 모든 플랫폼에서 `pytest -q`로 회귀 테스트를 수행하세요.
+- 모든 플랫폼에서 `pytest -q`로 스모크 + 풀 테스트를 한 번에 수행하세요.
+- 빠른 확인만 필요하면 `pytest -q -m smoke`, 전체 회귀만 재실행하려면 `pytest -q -m full`을 사용할 수 있습니다.
 - `tests/conftest.py`가 런타임에 필요한 `JOBLIB_MULTIPROCESSING=0`과 임시 폴더 설정을 제공하므로 추가 환경 변수 설정이 필요 없습니다.
 - 데이터 파이프라인 변경 시 `scan → train`을 재실행한 뒤 캐시 무결성을 확인하고, `chat`에서 결과를 수동 검증하세요.
 

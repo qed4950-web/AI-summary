@@ -151,6 +151,7 @@ def test_semantic_query_expansion_hits_expected_extensions():
     assert "matched_synonyms" in hits[0]
 
 
+@pytest.mark.full
 @pytest.mark.parametrize(
     "query, expected_exts",
     [
@@ -204,6 +205,7 @@ def test_metadata_filters_recognise_relative_year():
     assert hits and hits[0]["path"] == "docx_doc"
 
 
+@pytest.mark.full
 def test_refresh_if_cache_changed_handles_missing_signature():
     retr = _make_stub_retriever()
     if hasattr(retr, "_cache_signature"):
@@ -212,6 +214,7 @@ def test_refresh_if_cache_changed_handles_missing_signature():
     assert hasattr(retr, "_cache_signature")
 
 
+@pytest.mark.full
 def test_prioritize_ext_hits_pushes_desired_extensions_forward():
     hits = [
         {"path": "doc_high", "ext": ".docx", "score": 0.99},
@@ -225,6 +228,7 @@ def test_prioritize_ext_hits_pushes_desired_extensions_forward():
     assert any(hit["ext"] == ".docx" for hit in prioritized)
 
 
+@pytest.mark.full
 def test_similarity_to_percent_clamps_range():
     assert _similarity_to_percent(0.873) == "87.3%"
     assert _similarity_to_percent(1.4) == "100.0%"
@@ -232,10 +236,12 @@ def test_similarity_to_percent_clamps_range():
     assert _similarity_to_percent("oops") == "-"
 
 
+@pytest.mark.full
 def test_pick_rerank_device_prefers_explicit_value():
     assert _pick_rerank_device("cuda:1") == "cuda:1"
 
 
+@pytest.mark.full
 def test_pick_rerank_device_uses_cuda_when_available():
     original_torch = retriever.torch
 
@@ -252,6 +258,7 @@ def test_pick_rerank_device_uses_cuda_when_available():
         retriever.torch = original_torch
 
 
+@pytest.mark.full
 def test_pick_rerank_device_falls_back_to_cpu():
     original_torch = retriever.torch
 

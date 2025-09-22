@@ -1,8 +1,11 @@
 import threading
 
+import pytest
+
 from retriever import CacheSignatureMonitor
 
 
+@pytest.mark.full
 def test_cache_signature_monitor_triggers_after_stable_change():
     signatures = [
         (1.0, 1.0, 1.0),
@@ -33,6 +36,7 @@ def test_cache_signature_monitor_triggers_after_stable_change():
     assert observed == [((1.0, 1.0, 1.0), (2.0, 2.0, 2.0))]
 
 
+@pytest.mark.full
 def test_cache_signature_monitor_start_stop_background_thread():
     values = [
         (1.0, 1.0, 1.0),
