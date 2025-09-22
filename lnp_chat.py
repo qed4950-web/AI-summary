@@ -33,17 +33,22 @@ class Spinner:
         self._stop = threading.Event()
         self._t = None
         self._i = 0
-    def start(self):
-        if self._t: return
-        def _run():
+    def start(self) -> None:
+        if self._t:
+            return
+
+        def _run() -> None:
             while not self._stop.wait(self.interval):
                 frame = self.FRAMES[self._i % len(self.FRAMES)]
                 self._i += 1
                 print(f"\r{self.prefix} {frame} ", end="", flush=True)
+
         self._t = threading.Thread(target=_run, daemon=True)
         self._t.start()
-    def stop(self, clear=True):
-        if not self._t: return
+
+    def stop(self, clear=True) -> None:
+        if not self._t:
+            return
         self._stop.set()
         self._t.join()
         if clear:
@@ -64,7 +69,7 @@ class LNPChat:
     corpus_path: Path
     cache_dir: Path = Path("./index_cache")
     topk: int = 5
-    translate: bool = False # 기본은 다국어 Sentence-BERT로 번역 없이 처리
+    translate: bool = False  # 기본은 다국어 Sentence-BERT로 번역 없이 처리
     rerank: bool = True
     rerank_model: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
     rerank_depth: int = 80
@@ -350,7 +355,8 @@ class LNPChat:
             base.append("다른 표현으로 같은 의미의 질의를 시도")
             base.append("문서 유형(엑셀/한글/PDF 등)을 지정해서 검색")
         seen, out = set(), []
-        for s in base:
-            if s not in seen:
-                out.append(s); seen.add(s)
+        for suggestion in base:
+            if suggestion not in seen:
+                out.append(suggestion)
+                seen.add(suggestion)
         return out[:3]

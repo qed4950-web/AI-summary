@@ -45,6 +45,8 @@ except ModuleNotFoundError:  # pytest 미설치 환경 대비
 
 from retriever import (
     Retriever,
+    SessionState,
+    VectorIndex,
     _metadata_text,
     _similarity_to_percent,
     _pick_rerank_device,
@@ -83,13 +85,13 @@ def _make_stub_retriever() -> Retriever:
             year = 365 * 24 * 3600
             self._hits = [
                 {"path": "xlsx_doc", "ext": ".xlsx", "similarity": 0.99, "preview": "", "mtime": now - (0.1 * year), "size": 5_000},
-                {"path": "pdf_doc_one", "ext": ".pdf", "similarity": 0.95, "preview": "", "mtime": now - (0.2 * year), "size": 20_000},
-                {"path": "pdf_doc_two", "ext": ".pdf", "similarity": 0.94, "preview": "", "mtime": now - (1.1 * year), "size": 18_000},
-                {"path": "xlsm_budget", "ext": ".xlsm", "similarity": 0.93, "preview": "", "mtime": now - (2.0 * year), "size": 35_000},
-                {"path": "docx_doc", "ext": ".docx", "similarity": 0.92, "preview": "", "mtime": now - (3.1 * year), "size": 12_000},
-                {"path": "pptx_deck", "ext": ".pptx", "similarity": 0.91, "preview": "", "mtime": now - (4.5 * year), "size": 8_000},
-                {"path": "doc_report", "ext": ".doc", "similarity": 0.90, "preview": "", "mtime": now - (5.0 * year), "size": 16_000},
-                {"path": "hwp_contract", "ext": ".hwp", "similarity": 0.89, "preview": "", "mtime": now - (6.0 * year), "size": 14_000},
+                {"path": "pdf_doc_one", "ext": ".pdf", "similarity": 0.95, "preview": "", "mtime": now - (0.2 * year), "size": 20_000, "owner": "alice"},
+                {"path": "pdf_doc_two", "ext": ".pdf", "similarity": 0.94, "preview": "", "mtime": now - (1.1 * year), "size": 18_000, "owner": "bob"},
+                {"path": "xlsm_budget", "ext": ".xlsm", "similarity": 0.93, "preview": "", "mtime": now - (2.0 * year), "size": 35_000, "owner": "finance"},
+                {"path": "docx_doc", "ext": ".docx", "similarity": 0.92, "preview": "", "mtime": now - (3.1 * year), "size": 12_000, "owner": "alice"},
+                {"path": "pptx_deck", "ext": ".pptx", "similarity": 0.91, "preview": "", "mtime": now - (4.5 * year), "size": 8_000, "owner": "design"},
+                {"path": "doc_report", "ext": ".doc", "similarity": 0.90, "preview": "", "mtime": now - (5.0 * year), "size": 16_000, "owner": "legal"},
+                {"path": "hwp_contract", "ext": ".hwp", "similarity": 0.89, "preview": "", "mtime": now - (6.0 * year), "size": 14_000, "owner": "legal"},
             ]
 
         def search(self, _qvec, top_k: int, oversample: int = 1, **_ignored):
@@ -205,6 +207,28 @@ def test_metadata_filters_recognise_relative_year():
     assert hits and hits[0]["path"] == "docx_doc"
 
 
+@pytest.mark.smoke
+def test_session_extension_preference_increases_bonus():
+    retr = _make_stub_retriever()
+    session = SessionState()
+    session.preferred_exts[".docx"] = 1.0
+    hits = retr.search("파일 어떤것있어", top_k=5, session=session)
+    docx_hit = next(hit for hit in hits if hit["ext"] == ".docx")
+    assert docx_hit["score_breakdown"].get("session_ext", 0.0) > 0
+    assert any("세션 선호 확장자" in reason for reason in docx_hit.get("match_reasons", []))
+
+
+@pytest.mark.smoke
+def test_session_owner_preference_increases_bonus():
+    retr = _make_stub_retriever()
+    session = SessionState()
+    session.owner_priors["alice"] = 1.0
+    hits = retr.search("파일 어떤것있어", top_k=5, session=session)
+    owner_hit = next(hit for hit in hits if hit.get("owner") == "alice")
+    assert owner_hit["score_breakdown"].get("session_owner", 0.0) > 0
+    assert any("세션 선호 작성자" in reason for reason in owner_hit.get("match_reasons", []))
+
+
 @pytest.mark.full
 def test_refresh_if_cache_changed_handles_missing_signature():
     retr = _make_stub_retriever()
@@ -273,3 +297,32 @@ def test_pick_rerank_device_falls_back_to_cpu():
         assert _pick_rerank_device(None) == "cpu"
     finally:
         retriever.torch = original_torch
+
+
+@pytest.mark.full
+def test_vector_index_ann_search_roundtrip():
+    if retriever.faiss is None:
+        pytest.skip("FAISS not available")
+    import numpy as np
+
+    index = VectorIndex()
+    embeddings = np.eye(10, dtype=np.float32)
+    paths = [f"doc_{i}" for i in range(10)]
+    exts = [".txt"] * 10
+    previews = ["preview"] * 10
+    index.configure_ann(threshold=5, m=16, ef_construction=40)
+    index.build(
+        embeddings,
+        paths,
+        exts,
+        previews,
+        sizes=[0] * 10,
+        mtimes=[0.0] * 10,
+        ctimes=[0.0] * 10,
+        owners=["tester"] * 10,
+    )
+    index.configure_ann(ef_search=12)
+    query = embeddings[0]
+    hits = index.search(query, top_k=3)
+    assert hits
+    assert hits[0]["path"] == "doc_0"

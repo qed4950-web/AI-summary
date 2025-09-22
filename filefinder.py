@@ -23,19 +23,23 @@ class StartupSpinner:
         self._t = None
         self._i = 0
 
-    def start(self):
-        if self._t: return
-        def _run():
+    def start(self) -> None:
+        if self._t:
+            return
+
+        def _run() -> None:
             while not self._stop.wait(self.interval):
                 frame = self.FRAMES[self._i % len(self.FRAMES)]
                 self._i += 1
                 sys.stdout.write(f"\r{self.prefix} {frame} ")
                 sys.stdout.flush()
+
         self._t = threading.Thread(target=_run, daemon=True)
         self._t.start()
 
-    def stop(self, clear_line: bool = True):
-        if not self._t: return
+    def stop(self, clear_line: bool = True) -> None:
+        if not self._t:
+            return
         self._stop.set()
         self._t.join()
         if clear_line:
@@ -235,9 +239,13 @@ class FileFinder:
 
     @staticmethod
     def _fmt_secs(s: float) -> str:
-        if s == float('inf'): return "∞"
-        m, sec = divmod(int(s), 60); h, m = divmod(m, 60)
-        return f"{h:d}:{m:02d}:{sec:02d}" if h else f"{m:02d}:{sec:02d}"
+        if s == float("inf"):
+            return "∞"
+        m, sec = divmod(int(s), 60)
+        h, m = divmod(m, 60)
+        if h:
+            return f"{h:d}:{m:02d}:{sec:02d}"
+        return f"{m:02d}:{sec:02d}"
 
     def _estimate_total_dirs(self, roots: List[Path]) -> int:
         total = 0
@@ -265,7 +273,8 @@ class FileFinder:
                                             continue
                                         if hasattr(entry, 'inode'):
                                             key = (entry.inode(), entry.stat(follow_symlinks=False).st_dev)
-                                            if key in visited_inodes: continue
+                                            if key in visited_inodes:
+                                                continue
                                             visited_inodes.add(key)
                                         total += 1
                                         if total % 500 == 0:
@@ -303,7 +312,8 @@ class FileFinder:
                                     continue
                                 if hasattr(entry, 'inode'):
                                     key = (entry.inode(), entry.stat(follow_symlinks=False).st_dev)
-                                    if key in visited_inodes: continue
+                                    if key in visited_inodes:
+                                        continue
                                     visited_inodes.add(key)
                                 stack.append(p)
                                 continue
@@ -368,15 +378,17 @@ class FileFinder:
                             except (FileNotFoundError, PermissionError, OSError):
                                 continue
             if run_async:
-                t = threading.Thread(target=_scan, daemon=True)
-                t.start(); t.join()
+                worker = threading.Thread(target=_scan, daemon=True)
+                worker.start()
+                worker.join()
             else:
                 _scan()
             results.sort(key=lambda x: x["mtime"], reverse=True)
             return results
         finally:
             self._stop_progress.set()
-            if progress_thread: progress_thread.join()
+            if progress_thread:
+                progress_thread.join()
 
     @staticmethod
     def human_time(epoch_sec: float) -> str:
