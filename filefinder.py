@@ -5,7 +5,12 @@ import platform
 import time
 import threading
 from pathlib import Path
-from typing import Iterable, List, Dict, Optional
+from typing import Iterable, List, Dict, Optional, Any
+
+try:
+    import pwd  # POSIX only; optional
+except ImportError:  # pragma: no cover - platform specific
+    pwd = None
 
 class StartupSpinner:
     """아주 이른 단계부터 '살아있음'을 보여주는 콘솔 스피너."""
@@ -43,7 +48,7 @@ class FileFinder:
         ".xlsx", ".xls", ".xlsm", ".xlsb", ".xltx",
         ".pdf",
         ".ppt", ".pptx",
-        ".csv", ".txt",
+        ".csv",
     }
     WINDOWS_SKIP_DIRS = {
         r"\$Recycle.Bin",
@@ -51,16 +56,29 @@ class FileFinder:
         r"\Windows\WinSxS\Temp",
         r"\Windows\Temp",
     }
-    DEFAULT_EXCLUDE_TOKENS = {
-        ".venv",
-        "venv",
-        "site-packages",
-        "appdata",
-        "program files",
-        "node_modules",
+    COMMON_SKIP_DIRS = {
         "__pycache__",
+        ".pytest_cache",
+        ".mypy_cache",
+        ".git",
+        ".svn",
+        ".hg",
+        ".idea",
+        ".vscode",
+        "node_modules",
+        "bower_components",
+        "vendor",
+        "venv",
+        ".venv",
+        "env",
+        ".env",
+        "dist",
+        "build",
+        "tmp",
+        "temp",
+        ".cache",
+        "logs",
     }
-    DEFAULT_EXCLUDE_FILE_PATTERNS = {"~$", ".tmp"}
 
     def __init__(
         self,
@@ -73,19 +91,27 @@ class FileFinder:
         progress_update_secs: float = 0.5,
         estimate_total_dirs: bool = False,
         startup_banner: bool = True,
-        include_paths: Optional[Iterable[Path]] = None,
-        exclude_tokens: Optional[Iterable[str]] = None,
+        skip_dir_names: Optional[Iterable[str]] = None,
+        skip_hidden: bool = True,
     ):
         self.exts = {e.lower() if e.startswith(".") else f".{e.lower()}" for e in (exts or self.DEFAULT_EXTS)}
         self.scan_all_drives = scan_all_drives
         self.start_from_current_drive_only = start_from_current_drive_only
         self.follow_symlinks = follow_symlinks
+        if platform.system().lower().startswith("win") and self.follow_symlinks:
+            # 윈도우는 샌드박스/권한 제한으로 symlink 추적이 불필요하므로 강제로 비활성화
+            self.follow_symlinks = False
+            print("ℹ️ Windows 환경에서는 symlink 추적을 비활성화했습니다.", flush=True)
         self.max_depth = max_depth
         self.show_progress = show_progress
         self.progress_update_secs = progress_update_secs
         self.estimate_total_dirs = estimate_total_dirs
         self.startup_banner = startup_banner
-        self.manual_roots = [Path(p).resolve() for p in (include_paths or [])]
+        combined_skips = set(self.COMMON_SKIP_DIRS)
+        if skip_dir_names:
+            combined_skips.update(skip_dir_names)
+        self.skip_hidden = skip_hidden
+        self._skip_dir_names = {name.strip().lower() for name in combined_skips if name}
 
         self._lock = threading.Lock()
         self._dirs_scanned = 0
@@ -95,11 +121,6 @@ class FileFinder:
         self._stop_progress = threading.Event()
         self._total_dirs_estimate = None
         self._current_root = ""
-        tokens = set(t.lower() for t in self.DEFAULT_EXCLUDE_TOKENS)
-        if exclude_tokens:
-            tokens.update(t.lower() for t in exclude_tokens)
-        self._exclude_tokens = tokens
-        self._normalized_roots = [self._normalize_path(p) for p in self.manual_roots]
 
     # ---------- roots ----------
     def _windows_drives(self) -> List[Path]:
@@ -123,8 +144,6 @@ class FileFinder:
                 roots.extend([c for c in p.iterdir() if c.is_dir()])
         return roots
     def get_roots(self) -> List[Path]:
-        if self.manual_roots:
-            return self.manual_roots
         system = platform.system().lower()
         if system.startswith("win"):
             if self.start_from_current_drive_only:
@@ -137,47 +156,21 @@ class FileFinder:
             return self._linux_roots()
 
     # ---------- utils ----------
-    def _normalize_path(self, path: Path) -> Path:
-        try:
-            return path.resolve()
-        except Exception:
-            return path.absolute()
-
-    def _within_root(self, root: Path, candidate: Path) -> bool:
-        try:
-            candidate = self._normalize_path(candidate)
-            root = self._normalize_path(root)
-            candidate.relative_to(root)
-            return True
-        except Exception:
-            return False
-
     def _should_skip_dir(self, path: Path) -> bool:
         if platform.system().lower().startswith("win"):
             path_str = str(path)
             for skip in self.WINDOWS_SKIP_DIRS:
                 if skip.lower() in path_str.lower():
                     return True
-        lowered = str(path).lower()
-        name = path.name.lower()
-        for token in self._exclude_tokens:
-            if token in lowered or token == name:
+        try:
+            name = path.name
+        except Exception:
+            name = ""
+        if name:
+            normalized = name.strip().lower()
+            if normalized in self._skip_dir_names:
                 return True
-        return False
-
-    def _should_skip_file(self, path: Path) -> bool:
-        lowered = path.name.lower()
-        for pattern in self.DEFAULT_EXCLUDE_FILE_PATTERNS:
-            pat = pattern.lower()
-            if pat == "~$":
-                if lowered.startswith("~$"):
-                    return True
-                continue
-            if pat.startswith("*") and lowered.endswith(pat.lstrip("*")):
-                return True
-            if pat.endswith("*") and lowered.startswith(pat.rstrip("*")):
-                return True
-            if lowered.endswith(pat):
+            if self.skip_hidden and name.startswith('.') and path.parent != path:
                 return True
         return False
     def _depth_from_root(self, root: Path, current: Path) -> int:
@@ -266,16 +259,13 @@ class FileFinder:
                                 try:
                                     if entry.is_symlink() and not self.follow_symlinks:
                                         continue
-                                    p = Path(entry.path)
-                                    if not self._within_root(root, p):
-                                        continue
                                     if entry.is_dir(follow_symlinks=self.follow_symlinks):
+                                        p = Path(entry.path)
                                         if self._should_skip_dir(p):
                                             continue
                                         if hasattr(entry, 'inode'):
                                             key = (entry.inode(), entry.stat(follow_symlinks=False).st_dev)
-                                            if key in visited_inodes:
-                                                continue
+                                            if key in visited_inodes: continue
                                             visited_inodes.add(key)
                                         total += 1
                                         if total % 500 == 0:
@@ -307,10 +297,8 @@ class FileFinder:
                         try:
                             if entry.is_symlink() and not self.follow_symlinks:
                                 continue
-                            p = Path(entry.path)
-                            if not self._within_root(root, p):
-                                continue
                             if entry.is_dir(follow_symlinks=self.follow_symlinks):
+                                p = Path(entry.path)
                                 if self._should_skip_dir(p):
                                     continue
                                 if hasattr(entry, 'inode'):
@@ -320,8 +308,6 @@ class FileFinder:
                                 stack.append(p)
                                 continue
                             if entry.is_file(follow_symlinks=self.follow_symlinks):
-                                if self._should_skip_file(p):
-                                    continue
                                 with self._lock:
                                     self._files_scanned += 1
                                 yield Path(entry.path)
@@ -341,12 +327,10 @@ class FileFinder:
             spinner = StartupSpinner(prefix="🔎 초기화", interval=0.1)
             spinner.start()
         try:
-            roots = roots or self.manual_roots or self.preflight()
+            roots = roots or self.preflight()
         finally:
             if spinner:
                 spinner.stop()
-
-        self._normalized_roots = [self._normalize_path(r) for r in roots]
 
         if self.estimate_total_dirs:
             self._total_dirs_estimate = self._estimate_total_dirs(roots)
@@ -361,21 +345,23 @@ class FileFinder:
         try:
             results: List[Dict] = []
             def _scan():
-                for idx, root in enumerate(roots):
-                    normalized = self._normalized_roots[idx] if idx < len(self._normalized_roots) else self._normalize_path(root)
+                for root in roots:
                     with self._lock:
-                        self._current_root = str(normalized)
+                        self._current_root = str(root)
                     for f in self._iter_files(root):
                         ext = f.suffix.lower()
                         if ext in self.exts:
                             try:
                                 st = f.stat()
+                                owner = self._resolve_owner(st)
                                 results.append({
                                     "path": str(f),
                                     "size": st.st_size,
                                     "mtime": st.st_mtime,
+                                    "ctime": st.st_ctime,
                                     "ext": ext,
                                     "drive": f.anchor,
+                                    "owner": owner,
                                 })
                                 with self._lock:
                                     self._matched += 1
@@ -401,8 +387,53 @@ class FileFinder:
     def to_csv(rows: List[Dict], out_path: Path) -> None:
         import csv
         out_path.parent.mkdir(parents=True, exist_ok=True)
-        with out_path.open("w", newline="", encoding="utf-8-sig") as f:
-            w = csv.DictWriter(f, fieldnames=["path", "size", "mtime", "ext", "drive"])
+        with out_path.open("w", newline="", encoding="utf-8") as f:
+            fieldnames = ["path", "size", "mtime", "ctime", "ext", "drive", "owner"]
+            w = csv.DictWriter(f, fieldnames=fieldnames)
             w.writeheader()
             for r in rows:
                 w.writerow(r)
+
+    @staticmethod
+    def collect_file_metadata(path: Path, *, allowed_exts: Optional[Iterable[str]] = None) -> Optional[Dict[str, Any]]:
+        """Build a single metadata row for `path` using the scanner's schema."""
+        try:
+            p = Path(path).expanduser().resolve(strict=True)
+        except (OSError, RuntimeError):
+            return None
+
+        ext = p.suffix.lower()
+        if allowed_exts is not None:
+            normalized = {
+                (e.lower() if e.startswith(".") else f".{e.lower()}")
+                for e in allowed_exts
+            }
+            if ext not in normalized:
+                return None
+
+        try:
+            st = p.stat()
+        except (FileNotFoundError, PermissionError, OSError):
+            return None
+
+        owner = FileFinder._resolve_owner(st)
+        return {
+            "path": str(p),
+            "size": st.st_size,
+            "mtime": st.st_mtime,
+            "ctime": st.st_ctime,
+            "ext": ext,
+            "drive": p.anchor,
+            "owner": owner,
+        }
+
+    @staticmethod
+    def _resolve_owner(stat_result) -> str:
+        if not stat_result:
+            return ""
+        if pwd is not None:
+            try:
+                return pwd.getpwuid(stat_result.st_uid).pw_name  # type: ignore[attr-defined]
+            except (KeyError, AttributeError):
+                return ""
+        return ""
