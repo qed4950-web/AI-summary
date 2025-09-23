@@ -82,6 +82,18 @@ Remove-Item .venv -Recurse -Force
 4. `fastparquet` 설치가 실패하면 Microsoft C++ Build Tools를 설치하거나 최신 휠이 포함된 Python 버전을 사용하세요.
 5. 이후 `pytest -q`, `python infopilot.py scan ...` 등 필요한 명령을 순차 실행합니다.
 
+#### Windows 실행 파일(.exe) 빌드
+PowerShell에서 아래 순서로 실행하면 `dist/InfoPilotLauncher.exe`가 생성됩니다.
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\activate
+pip install -r requirements.txt pyinstaller
+powershell -ExecutionPolicy Bypass -File scripts\build_windows_exe.ps1
+```
+
+빌드된 파일을 더블 클릭하면 간단한 콘솔 메뉴가 열리고, 파이프라인 실행(옵션: 번역, 루트 경로 입력) 후 Chat 자동 실행 또는 Chat만 단독 실행을 선택할 수 있습니다.
+
 ### Windows (Command Prompt)
 1. 가상환경 생성 및 활성화:
    ```cmd
@@ -100,6 +112,38 @@ Remove-Item .venv -Recurse -Force
    ```
 
 ## 테스트 및 검증
+
+### Benchmark & Evaluation
+1. ANN vs 정확 검색 벤치마크
+   ```bash
+   source .venv/bin/activate
+   python benchmarks/ann_benchmark.py \
+     --doc-count 20000 --queries 100 --top-k 10 --ann-threshold 2000 \
+     --ef-search 128 --ef-construction 200 --ann-m 32 \
+     --target-overlap 0.95 --target-p95 500 --output benchmarks/results/ann_run.json
+   ```
+   - `overlap@k`(정확 검색과의 겹침)과 `ann_ms.p95`가 목표에 못 미치면 종료 코드가 1이므로 CI 회귀 검증에 사용할 수 있습니다.
+2. 정확도 지표(P@K, nDCG@K) 측정
+   ```bash
+   python benchmarks/accuracy_eval.py \
+     --labels benchmarks/fixtures/sample_labels.csv \
+     --predictions benchmarks/fixtures/sample_predictions.csv \
+     --k 1 5 --target-p 0.8 --target-ndcg 0.7 --output benchmarks/results/accuracy.json
+   ```
+   - 실측 라벨/예측 CSV로 바꿔 실행하고, 목표치를 벗어나면 비정상 종료로 회귀를 잡아낼 수 있습니다.
+3. 프런트엔드 스모크
+   ```bash
+   pytest -m smoke
+   ```
+   - 세션/ANN 경로 관련 테스트가 포함되어 프런트 버튼-API 훅이 정상 동작하는지 재확인합니다.
+
+### 새 UI 이벤트 로그 확인
+로컬에서 카드 버튼을 클릭하면 `localStorage`의 `infopilot_ui_events` 키에 성공/실패 이벤트가 쌓입니다. 콘솔에서
+```js
+JSON.parse(localStorage.getItem('infopilot_ui_events') || '[]')
+```
+을 실행해 API 전송 누락 여부를 빠르게 점검하세요.
+
 - 모든 플랫폼에서 `pytest -q`로 스모크 + 풀 테스트를 한 번에 수행하세요.
 - 빠른 확인만 필요하면 `pytest -q -m smoke`, 전체 회귀만 재실행하려면 `pytest -q -m full`을 사용할 수 있습니다.
 - `tests/conftest.py`가 런타임에 필요한 `JOBLIB_MULTIPROCESSING=0`과 임시 폴더 설정을 제공하므로 추가 환경 변수 설정이 필요 없습니다.

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import List, Optional
+from typing import List, Literal, Optional
 
 from pydantic import BaseModel
 
@@ -12,8 +12,9 @@ class SearchRequest(BaseModel):
 
 
 class SessionSummary(BaseModel):
-    history: List[str]
-    preferences: Dict[str, List[str]]
+    recent_queries: List[str]
+    preferred_exts: List[str]
+    owner_prior: List[str]
 
 
 class SearchResponse(BaseModel):
@@ -29,12 +30,13 @@ class FeedbackRequest(BaseModel):
     path: Optional[str] = None
     ext: Optional[str] = None
     owner: Optional[str] = None
-    action: str
+    action: Literal["click", "pin", "like", "dislike"]
 
 
 class FeedbackResponse(BaseModel):
     session_id: Optional[str]
     status: str
+    session: Optional[SessionSummary] = None
 
 
 class ReindexRequest(BaseModel):
@@ -47,4 +49,4 @@ class ReindexResponse(BaseModel):
 
 class SessionResetResponse(BaseModel):
     session_id: Optional[str]
-    history: List[str]
+    recent_queries: List[str]
