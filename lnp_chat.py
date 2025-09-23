@@ -10,9 +10,9 @@ import time
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Dict, Any, Optional, Set
+from typing import List, Dict, Any, Optional, Set, Tuple
 
-from retriever import Retriever, _similarity_to_percent, _split_tokens  # Step3 검색기 재사용
+from retriever import Retriever, SessionState, _similarity_to_percent, _split_tokens  # Step3 검색기 재사용
 
 _PREVIEW_TOKEN_PATTERN = re.compile(r"(?u)(?:[가-힣]{1,}|[A-Za-z0-9]{2,})")
 from translation_cache import TranslationCache
@@ -87,6 +87,11 @@ class LNPChat:
     ready_done: bool = field(init=False, default=False)
     translation_cache: Optional[TranslationCache] = field(init=False, default=None)
     preview_translator: Optional[Any] = field(init=False, default=None)
+    index_loaded: bool = field(init=False, default=False)
+    index_reasons: List[str] = field(init=False, default_factory=list)
+    session_state: SessionState = field(init=False, default_factory=SessionState)
+    last_query_text: str = field(init=False, default="")
+    last_hits: List[Dict[str, Any]] = field(init=False, default_factory=list)
 
     # 초기화: Retriever 및 번역기 준비
     def ready(self, rebuild: bool = False):
@@ -124,10 +129,8 @@ class LNPChat:
             self.ready_done = True
         finally:
             spin.stop()
-        if self.retr.wait_until_ready(timeout=0.1):
-            print("✅ LNP Chat 준비 완료 (번역: " + ("활성" if self.translator else "비활성") + ")")
-        else:
-            print("⏳ 인덱스를 백그라운드에서 준비 중입니다. (번역: " + ("활성" if self.translator else "비활성") + ")")
+        index_ready = self.retr.wait_until_ready(timeout=0.1)
+        self._report_index_status(index_ready)
 
     def _ensure_preview_translator(self):
         if not self.show_translation:
@@ -145,6 +148,148 @@ class LNPChat:
             self.preview_translator = None
             self.show_translation = False
         return self.preview_translator
+
+    def _report_index_status(self, ready_flag: bool) -> None:
+        translator_state = "활성" if self.translator else "비활성"
+        index = None
+        last_error: Optional[BaseException] = None
+        if self.retr is not None:
+            try:
+                index = self.retr.index_manager.get_index(wait=False)
+                last_error = self.retr.index_manager.last_error
+            except Exception as exc:  # defensive guard
+                last_error = exc
+
+        self.index_loaded = index is not None
+        self.index_reasons = []
+
+        if self.index_loaded:
+            doc_count = len(getattr(index, "doc_ids", []) or [])
+            print(f"✅ LNP Chat 준비 완료 (문서 {doc_count:,}건 · 번역: {translator_state})")
+            return
+
+        if not ready_flag:
+            self.index_reasons.append("인덱스를 아직 구축 중입니다. 잠시만 기다려주세요.")
+
+        if last_error:
+            msg = str(last_error).strip() or last_error.__class__.__name__
+            if "유효 텍스트 문서가 없습니다" in msg:
+                msg = "학습된 문서가 없어 인덱스를 만들 수 없습니다. scan/train 결과를 확인해주세요."
+            self.index_reasons.append(msg)
+
+        if not self.corpus_path.exists():
+            self.index_reasons.append(f"코퍼스가 없습니다 → {self.corpus_path}")
+        else:
+            try:
+                if self.corpus_path.stat().st_size == 0:
+                    self.index_reasons.append(f"코퍼스가 비어 있습니다 → {self.corpus_path}")
+            except OSError as exc:
+                self.index_reasons.append(f"코퍼스 확인 실패: {exc}")
+
+        cache_hint_added = False
+        if not self.cache_dir.exists():
+            self.index_reasons.append(f"인덱스 캐시 디렉터리가 없습니다 → {self.cache_dir}")
+            cache_hint_added = True
+        else:
+            try:
+                next(self.cache_dir.iterdir())
+            except StopIteration:
+                self.index_reasons.append("index_cache 디렉터리가 비어 있습니다.")
+                cache_hint_added = True
+            except OSError as exc:
+                self.index_reasons.append(f"index_cache 확인 실패: {exc}")
+                cache_hint_added = True
+
+        self.index_reasons.append("python infopilot.py pipeline --out data/found_files.csv 로 scan/train을 다시 실행해보세요.")
+        if cache_hint_added:
+            self.index_reasons.append("파이프라인 완료 후 --cache 옵션을 chat 명령과 동일하게 지정했는지 확인해주세요.")
+
+        print("⚠️ 인덱스를 준비하지 못했습니다. (번역: " + translator_state + ")")
+        for reason in self.index_reasons:
+            print("   - " + reason)
+
+    def _extract_context_terms(self) -> List[str]:
+        terms: List[str] = []
+        for hit in self.last_hits[:3]:
+            raw_path = str(hit.get("path") or "").strip()
+            if not raw_path:
+                continue
+            try:
+                stem = Path(raw_path).stem
+            except Exception:
+                stem = raw_path
+            if stem:
+                terms.append(stem)
+        return terms
+
+    def _rewrite_query(self, query: str, tokens: Set[str]) -> Tuple[str, bool]:
+        if not self.last_query_text:
+            return query, False
+
+        lowered_tokens = {tok.lower() for tok in tokens if tok}
+        if not lowered_tokens:
+            lowered_tokens = set(_split_tokens(query))
+        pronoun_markers = {
+            "그",
+            "그거",
+            "그것",
+            "그문서",
+            "그파일",
+            "해당",
+            "이전",
+            "앞",
+            "방금",
+            "previous",
+            "earlier",
+            "above",
+            "that",
+            "those",
+        }
+        last_tokens = {tok.lower() for tok in _split_tokens(self.last_query_text)}
+        follow_markers = {
+            "추가",
+            "또",
+            "다른",
+            "같은",
+            "비슷",
+            "관련",
+            "계속",
+            "이어",
+            "더",
+        }
+        follow_token = bool(lowered_tokens & (pronoun_markers | follow_markers))
+        disjoint_from_last = last_tokens.isdisjoint(lowered_tokens)
+        type_markers = {
+            "pdf",
+            "ppt",
+            "pptx",
+            "doc",
+            "docx",
+            "hwp",
+            "xls",
+            "xlsx",
+            "csv",
+            "파일",
+            "문서",
+            "자료",
+            "형식",
+            "버전",
+        }
+        type_followup = disjoint_from_last and len(lowered_tokens) <= 4 and bool(lowered_tokens & type_markers)
+
+        if follow_token and disjoint_from_last and not type_followup and len(lowered_tokens) > 2:
+            follow_token = False
+
+        if not (follow_token or type_followup):
+            return query, False
+
+        context_terms = self._extract_context_terms()
+        pieces: List[str] = [query]
+        if context_terms:
+            pieces.append(" ".join(context_terms))
+        pieces.append(self.last_query_text)
+        rewritten = " ".join(piece for piece in pieces if piece).strip()
+        return (rewritten or query), True
 
     def _augment_translations(self, hits: List[Dict[str, Any]]) -> None:
         if not (self.show_translation and hits):
@@ -227,14 +372,20 @@ class LNPChat:
         query_tokens = {tok.lower() for tok in _split_tokens(query) if tok}
 
         # [번역 기능] 사용자 질문을 영어로 번역
-        query_for_search = query
+        contextual_query, used_context = self._rewrite_query(query, query_tokens)
+        if used_context:
+            print(f"  (이전 질문 맥락을 반영해 '{contextual_query}'로 검색합니다.)")
+
+        query_for_search = contextual_query
         if self.translator:
             try:
-                translated = self.translator.translate(query)
-                query_for_search = translated if isinstance(translated, str) else getattr(translated, "text", query)
-                print(f"  (질문 번역: '{query}' → '{query_for_search}')")
+                translated = self.translator.translate(query_for_search)
+                query_for_search = translated if isinstance(translated, str) else getattr(translated, "text", query_for_search)
+                print(f"  (질문 번역: '{contextual_query}' → '{query_for_search}')")
             except Exception as e:
                 print(f"\n[경고] 질문 번역 실패. 원본 질문으로 검색합니다. 오류: {e}")
+
+        self.session_state.add_query(contextual_query)
 
         # 스피너로 즉시 “살아있음” 표시
         index_ready = False
@@ -243,13 +394,21 @@ class LNPChat:
         t0 = time.time()
         try:
             index_ready = self.retr.wait_until_ready(timeout=0.4)
-            hits = self.retr.search(query_for_search, top_k=k)
+            hits = self.retr.search(query_for_search, top_k=k, session=self.session_state)
         finally:
             spin.stop()
         dt = time.time() - t0
 
+        if index_ready:
+            index_obj = self.retr.index_manager.get_index(wait=False)
+            if index_obj is not None:
+                self.index_loaded = True
+                self.index_reasons.clear()
+
         # 히스토리 적재 (원본 query 기준)
         self.history.append(ChatTurn(role="user", text=query))
+        self.last_hits = hits
+        self.last_query_text = contextual_query
 
         self._augment_translations(hits)
 
@@ -320,6 +479,12 @@ class LNPChat:
                 answer_lines.append(f"   번역({self.translation_lang}): {translation_text}")
         if not hits:
             answer_lines.append("관련 문서를 찾지 못했습니다. 표현을 바꿔보거나 더 구체적으로 적어주세요.")
+            if not self.index_loaded:
+                answer_lines.append("현재 인덱스를 사용할 수 없어 검색이 제한됩니다:")
+                for reason in self.index_reasons:
+                    answer_lines.append(f"   - {reason}")
+            else:
+                answer_lines.append("데이터셋에 해당 문서가 없다면 검색 결과 0건이 정상입니다.")
             if not index_ready:
                 answer_lines.append("(인덱스를 준비 중입니다. 잠시 후 다시 시도해주세요.)")
             elif self.rerank and self.rerank_min_score is not None:

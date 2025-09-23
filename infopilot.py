@@ -648,6 +648,36 @@ def cmd_pipeline(args):
     df, tm = run_step2(rows, out_corpus=out_corpus, out_model=out_model, cfg=cfg, use_tqdm=True, translate=args.translate)
     print("✅ 파이프라인 완료")
 
+    cache_dir = Path(args.cache)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    print(
+        "ℹ️ 파이프라인은 scan/train 단계까지만 자동 실행되며 chat 모드는 별도 실행이 필요합니다.\n"
+        f"   → python infopilot.py chat --model {out_model} --corpus {out_corpus} --cache {cache_dir}"
+    )
+
+    if getattr(args, "launch_chat", False):
+        print("\n💬 바로 chat 모드를 실행합니다. (종료하려면 'exit')")
+        chat_args = argparse.Namespace(
+            model=str(out_model),
+            corpus=str(out_corpus),
+            cache=str(cache_dir),
+            scan_csv=str(out),
+            topk=5,
+            translate=args.translate,
+            auto_train=True,
+            rerank=True,
+            rerank_model="cross-encoder/ms-marco-MiniLM-L-6-v2",
+            rerank_depth=80,
+            rerank_batch_size=16,
+            rerank_device=None,
+            rerank_min_score=0.35,
+            lexical_weight=0.0,
+            show_translation=False,
+            translation_lang="en",
+            min_similarity=0.35,
+        )
+        cmd_chat(chat_args)
+
 
 def cmd_chat(args):
     """대화형 검색 모드 (LNPChat 사용)"""
@@ -823,6 +853,7 @@ def main():
     )
     ap_pipe.add_argument("--corpus", default="./data/corpus.parquet")
     ap_pipe.add_argument("--model", default="./data/topic_model.joblib")
+    ap_pipe.add_argument("--cache", default="./index_cache")
     ap_pipe.add_argument("--max_features", type=int, default=50000)
     ap_pipe.add_argument("--n_components", type=int, default=DEFAULT_N_COMPONENTS)
     ap_pipe.add_argument("--n_clusters", type=int, default=25)
@@ -852,6 +883,11 @@ def main():
         help="번역 기능을 비활성화하고 원문으로 학습합니다.",
     )
     ap_pipe.add_argument("--no-embedding", dest="use_embedding", action="store_false", help="Sentence-BERT 대신 TF-IDF 백업 경로를 사용합니다.")
+    ap_pipe.add_argument(
+        "--launch-chat",
+        action="store_true",
+        help="파이프라인 완료 후 chat 모드를 바로 실행합니다.",
+    )
     ap_pipe.set_defaults(translate=False)
     ap_pipe.set_defaults(use_embedding=True)
     ap_pipe.set_defaults(func=cmd_pipeline)

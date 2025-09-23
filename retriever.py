@@ -14,11 +14,12 @@ import weakref
 import importlib
 import calendar
 import hashlib
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from typing import Any, Callable, Deque, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 try:
     import numpy as np
@@ -326,17 +327,15 @@ def _token_contains(unit: str, keyword: str) -> bool:
 
 @dataclass
 class SessionState:
-    history: List[str] = field(default_factory=list)
+    recent_queries: Deque[str] = field(default_factory=lambda: deque(maxlen=_SESSION_HISTORY_LIMIT))
     clicked_doc_ids: Set[int] = field(default_factory=set)
     preferred_exts: Dict[str, float] = field(default_factory=dict)
-    owner_priors: Dict[str, float] = field(default_factory=dict)
+    owner_prior: Dict[str, float] = field(default_factory=dict)
 
     def add_query(self, query: str) -> None:
         if not query:
             return
-        self.history.append(query)
-        if len(self.history) > _SESSION_HISTORY_LIMIT:
-            del self.history[: len(self.history) - _SESSION_HISTORY_LIMIT]
+        self.recent_queries.append(query)
 
     def record_click(
         self,
@@ -390,7 +389,7 @@ class SessionState:
         if owner:
             normalized_owner = _normalize_owner(owner)
             if normalized_owner:
-                self._update_pref(self.owner_priors, normalized_owner, delta)
+                self._update_pref(self.owner_prior, normalized_owner, delta)
 
     def _update_pref(self, store: Dict[str, float], key: str, delta: float) -> None:
         current = store.get(key, 0.0) * _SESSION_PREF_DECAY
@@ -399,6 +398,49 @@ class SessionState:
             store.pop(key, None)
         else:
             store[key] = updated
+
+@dataclass
+class EarlyStopConfig:
+    score_threshold: float = 0.05
+    window_size: int = 0
+    patience: int = 2
+
+    def create_state(self, batch_size: int) -> "EarlyStopState":
+        window = self.window_size or batch_size
+        return EarlyStopState(
+            threshold=max(0.0, float(self.score_threshold)),
+            window=max(1, int(window)),
+            patience=max(1, int(self.patience)),
+        )
+
+
+@dataclass
+class EarlyStopState:
+    threshold: float
+    window: int
+    patience: int
+    scores: Deque[float] = field(default_factory=deque)
+    patience_hits: int = 0
+    last_average: float = 0.0
+
+    def observe(self, new_scores: Iterable[float]) -> bool:
+        for score in new_scores:
+            self.scores.append(float(score))
+            if len(self.scores) > self.window:
+                self.scores.popleft()
+        if len(self.scores) < self.window:
+            self.patience_hits = 0
+            self.last_average = 0.0
+            return False
+        self.last_average = sum(self.scores) / len(self.scores)
+        if self.last_average < self.threshold:
+            self.patience_hits += 1
+            if self.patience_hits >= self.patience:
+                return True
+        else:
+            self.patience_hits = 0
+        return False
+
 
 
 def _extract_query_exts(query: str, *, available_exts: Set[str]) -> Set[str]:
@@ -592,7 +634,7 @@ def _compute_owner_bonus(owner: Optional[str], session: Optional[SessionState]) 
     normalized = _normalize_owner(str(owner))
     if not normalized:
         return 0.0
-    preference = session.owner_priors.get(normalized, 0.0)
+    preference = session.owner_prior.get(normalized, 0.0)
     if not preference:
         return 0.0
     return preference * _SESSION_OWNER_PREF_SCALE
@@ -1297,15 +1339,16 @@ class CrossEncoderReranker:
         *,
         device: Optional[str] = None,
         batch_size: int = 16,
+        early_stop: Optional[EarlyStopConfig] = None,
     ) -> None:
         if CrossEncoder is None:
             raise RuntimeError("sentence-transformers의 CrossEncoder를 사용할 수 없습니다.")
         self.model_name = model_name
         self.device = device or None
         self.batch_size = max(1, int(batch_size) if batch_size else 1)
-        self._early_stop_threshold: float = 0.05
-        self._early_stop_window: int = max(1, self.batch_size)
-        self._early_stop_patience: int = 2
+        self.early_stop_config = early_stop or EarlyStopConfig(window_size=self.batch_size)
+        if self.early_stop_config.window_size <= 0:
+            self.early_stop_config.window_size = self.batch_size
 
         load_kwargs: Dict[str, Any] = {}
         if self.device:
@@ -1364,7 +1407,6 @@ class CrossEncoderReranker:
             vector_component = vector_scaled[idx] if idx < len(vector_scaled) else 0.0
             lexical_component = lexical_scaled[idx] if idx < len(lexical_scaled) else 0.0
 
-            ext_bonus = 0.0
             ext = _normalize_ext(hit.get("ext"))
             total_ext_bonus, desired_ext_bonus, session_ext_bonus = _compute_extension_bonus(
                 ext,
@@ -1419,8 +1461,7 @@ class CrossEncoderReranker:
             return
 
         start = 0
-        window_scores: List[float] = []
-        patience_hits = 0
+        stop_state = self.early_stop_config.create_state(self.batch_size)
         while start < total:
             end = min(total, start + self.batch_size)
             batch = pairs[start:end]
@@ -1431,23 +1472,15 @@ class CrossEncoderReranker:
                 show_progress_bar=False,
             )
             yield batch_scores
-            window_scores.extend(float(s) for s in batch_scores)
-            if len(window_scores) >= self._early_stop_window:
-                recent = window_scores[-self._early_stop_window :]
-                avg = sum(recent) / len(recent)
-                if avg < self._early_stop_threshold:
-                    patience_hits += 1
-                    if patience_hits >= self._early_stop_patience:
-                        logger.info(
-                            "reranker early stop: avg=%.4f window=%d processed=%d/%d",
-                            avg,
-                            self._early_stop_window,
-                            end,
-                            total,
-                        )
-                        break
-                else:
-                    patience_hits = 0
+            if stop_state.observe(batch_scores):
+                logger.info(
+                    "reranker early stop: avg=%.4f window=%d processed=%d/%d",
+                    stop_state.last_average,
+                    stop_state.window,
+                    end,
+                    total,
+                )
+                break
             start = end
 
 
@@ -2049,13 +2082,14 @@ class VectorIndex:
         lexical_weight: float = 0.0,
         query_tokens: Optional[List[str]] = None,
         min_similarity: float = 0.0,
+        use_ann: Optional[bool] = None,
     ) -> List[Dict[str, Any]]:
         if not self.doc_ids:
             return []
         q = self._normalize_vector(qvec)
         fetch = max(1, min(len(self.doc_ids), top_k * max(1, oversample)))
 
-        vector_scores, vector_order = self._vector_scores(q, fetch)
+        vector_scores, vector_order = self._vector_scores(q, fetch, use_ann=use_ann)
         lex_weight = max(0.0, min(1.0, lexical_weight))
         use_lexical = lex_weight > 0.0 and bool(query_tokens)
 
@@ -2134,13 +2168,24 @@ class VectorIndex:
         limit = min(len(results), max(top_k, fetch))
         return results[:limit]
 
-    def _vector_scores(self, qvec: np.ndarray, fetch: int) -> Tuple[Dict[int, float], List[int]]:
+    def _vector_scores(
+        self,
+        qvec: np.ndarray,
+        fetch: int,
+        *,
+        use_ann: Optional[bool] = None,
+    ) -> Tuple[Dict[int, float], List[int]]:
         scores: Dict[int, float] = {}
         order: List[int] = []
-        if self._should_use_ann():
+        ann_choice = use_ann
+        if ann_choice is None and self._should_use_ann():
+            ann_choice = True
+        if ann_choice:
             scores, order = self._ann_scores(qvec, fetch)
             if scores:
                 return scores, order
+        elif ann_choice is False:
+            pass
         self._ensure_faiss_index()
         if self.faiss_index is not None and faiss is not None:
             query = qvec.reshape(1, -1).astype(np.float32, copy=False)
@@ -2196,16 +2241,22 @@ class VectorIndex:
             return
         dim = self.Z.shape[1]
         try:
-            index = faiss.IndexHNSWFlat(dim, max(8, int(self.ann_m)))
+            hnsw_index = faiss.IndexHNSWFlat(dim, max(8, int(self.ann_m)))
         except Exception:
             self.ann_index = None
             self._ann_dirty = False
             return
-        index.hnsw.efConstruction = max(16, int(self.ann_ef_construction))
-        index.hnsw.efSearch = max(8, int(self.ann_ef_search))
+        hnsw_index.hnsw.efConstruction = max(16, int(self.ann_ef_construction))
+        hnsw_index.hnsw.efSearch = max(8, int(self.ann_ef_search))
         ids = np.asarray(self.doc_ids, dtype=np.int64)
-        index.add_with_ids(self.Z, ids)
-        self.ann_index = index
+        target_index = hnsw_index if hasattr(hnsw_index, "add_with_ids") else faiss.IndexIDMap(hnsw_index)
+        try:
+            target_index.add_with_ids(self.Z, ids)
+        except Exception:
+            target_index = faiss.IndexIDMap(hnsw_index)
+            target_index.add_with_ids(self.Z, ids)
+        self.ann_index = target_index
+        self._ann_hnsw = hnsw_index
         self._ann_dirty = False
 
     def _ann_scores(self, qvec: np.ndarray, fetch: int) -> Tuple[Dict[int, float], List[int]]:
@@ -2217,8 +2268,13 @@ class VectorIndex:
             return {}, []
         query = qvec.reshape(1, -1).astype(np.float32, copy=False)
         try:
+            hnsw_struct = None
             if hasattr(self.ann_index, "hnsw"):
-                self.ann_index.hnsw.efSearch = max(self.ann_ef_search, fetch)
+                hnsw_struct = self.ann_index.hnsw
+            elif hasattr(self, "_ann_hnsw") and hasattr(self._ann_hnsw, "hnsw"):
+                hnsw_struct = self._ann_hnsw.hnsw
+            if hnsw_struct is not None:
+                hnsw_struct.efSearch = max(self.ann_ef_search, fetch)
             distances, ids = self.ann_index.search(query, k)
         except Exception:
             return {}, []
@@ -2613,6 +2669,7 @@ class Retriever:
         top_k: int = 5,
         *,
         session: Optional[SessionState] = None,
+        use_ann: Optional[bool] = None,
     ) -> List[Dict[str, Any]]:
         index = self._ensure_index()
         if index is None:
@@ -2695,6 +2752,7 @@ class Retriever:
             lexical_weight=adaptive_lex_weight,
             query_tokens=query_tokens,
             min_similarity=self.min_similarity,
+            use_ann=use_ann,
         )
         filtered_hits = _apply_metadata_filters(raw_hits, metadata_filters)
         if not filtered_hits:

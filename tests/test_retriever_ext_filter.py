@@ -222,7 +222,7 @@ def test_session_extension_preference_increases_bonus():
 def test_session_owner_preference_increases_bonus():
     retr = _make_stub_retriever()
     session = SessionState()
-    session.owner_priors["alice"] = 1.0
+    session.owner_prior["alice"] = 1.0
     hits = retr.search("파일 어떤것있어", top_k=5, session=session)
     owner_hit = next(hit for hit in hits if hit.get("owner") == "alice")
     assert owner_hit["score_breakdown"].get("session_owner", 0.0) > 0

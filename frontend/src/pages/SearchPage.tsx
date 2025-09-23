@@ -6,15 +6,40 @@ import {
   resetSession,
   triggerReindex,
   type SearchHit,
+  type SessionSummary,
+  type FeedbackAction,
 } from "../api/client";
+
+const UI_EVENT_KEY = "infopilot_ui_events";
+const MAX_UI_EVENT_LOGS = 50;
+
+const recordUiEvent = (event: Record<string, unknown>) => {
+  try {
+    const raw = localStorage.getItem(UI_EVENT_KEY);
+    const parsed: unknown[] = raw ? JSON.parse(raw) : [];
+    if (Array.isArray(parsed)) {
+      const next = [...parsed, { ...event, ts: new Date().toISOString() }];
+      if (next.length > MAX_UI_EVENT_LOGS) {
+        next.splice(0, next.length - MAX_UI_EVENT_LOGS);
+      }
+      localStorage.setItem(UI_EVENT_KEY, JSON.stringify(next));
+    } else {
+      localStorage.setItem(
+        UI_EVENT_KEY,
+        JSON.stringify([{ ...event, ts: new Date().toISOString() }])
+      );
+    }
+  } catch (err) {
+    console.warn("failed to persist UI event", err);
+  }
+};
 
 export const SearchPage: React.FC = () => {
   const [query, setQuery] = useState("");
   const [sessionId, setSessionId] = useState<string | null>(null);
-  const [sessionHistory, setSessionHistory] = useState<string[]>([]);
-  const [sessionPrefs, setSessionPrefs] = useState<{ exts: string[]; owners: string[] }>(
-    { exts: [], owners: [] }
-  );
+  const [recentQueries, setRecentQueries] = useState<string[]>([]);
+  const [preferredExts, setPreferredExts] = useState<string[]>([]);
+  const [ownerPrior, setOwnerPrior] = useState<string[]>([]);
   const [results, setResults] = useState<SearchHit[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -25,14 +50,14 @@ export const SearchPage: React.FC = () => {
     try {
       const res = await search({ query, session_id: sessionId ?? undefined });
       setResults(res.results ?? []);
-      if (res.session_id) {
-        setSessionId(res.session_id);
+      if (res.session_id ?? null) {
+        setSessionId(res.session_id ?? null);
       }
-      if (res.session?.history) {
-        setSessionHistory(res.session.history);
-      }
-      if (res.session?.preferences) {
-        setSessionPrefs(res.session.preferences);
+      const summary: SessionSummary | undefined = res.session;
+      if (summary) {
+        setRecentQueries(summary.recent_queries ?? []);
+        setPreferredExts(summary.preferred_exts ?? []);
+        setOwnerPrior(summary.owner_prior ?? []);
       }
     } catch (err) {
       setError((err as Error).message);
@@ -41,9 +66,9 @@ export const SearchPage: React.FC = () => {
     }
   };
 
-  const send = async (hit: SearchHit, action: "click" | "pin" | "like" | "dislike") => {
+  const send = async (hit: SearchHit, action: FeedbackAction) => {
     try {
-      await sendFeedback({
+      const res = await sendFeedback({
         session_id: sessionId ?? undefined,
         doc_id: (hit as any).doc_id,
         path: hit.path,
@@ -51,8 +76,19 @@ export const SearchPage: React.FC = () => {
         owner: (hit as any).owner,
         action,
       });
+      if (res.session_id ?? null) {
+        setSessionId(res.session_id ?? null);
+      }
+      const summary = res.session;
+      if (summary) {
+        setRecentQueries(summary.recent_queries ?? []);
+        setPreferredExts(summary.preferred_exts ?? []);
+        setOwnerPrior(summary.owner_prior ?? []);
+      }
+      recordUiEvent({ type: "feedback", action, path: hit.path, status: "ok" });
     } catch (err) {
       console.warn("feedback failed", err);
+      recordUiEvent({ type: "feedback", action, path: hit.path, status: "error", error: String(err) });
     }
   };
 
@@ -65,8 +101,9 @@ export const SearchPage: React.FC = () => {
   const handleReset = async () => {
     const res = await resetSession(sessionId ?? undefined);
     setSessionId(res.session_id ?? null);
-    setSessionHistory(res.history ?? []);
-    setSessionPrefs({ exts: [], owners: [] });
+    setRecentQueries(res.recent_queries ?? []);
+    setPreferredExts([]);
+    setOwnerPrior([]);
     setResults([]);
   };
 
@@ -100,11 +137,11 @@ export const SearchPage: React.FC = () => {
           <div className="text-xs text-gray-500">세션 ID: {sessionId}</div>
         )}
         <div className="grid grid-cols-1 md:grid-cols-2 gap-2 text-xs text-gray-500">
-          {sessionHistory.length > 0 && (
+          {recentQueries.length > 0 && (
             <div>
               <div className="font-semibold">최근 질의</div>
               <ul className="space-y-1">
-                {sessionHistory.slice(-5).map((item, idx) => (
+                {recentQueries.slice(-5).map((item, idx) => (
                   <li key={idx} className="truncate" title={item}>
                     {item}
                   </li>
@@ -112,13 +149,13 @@ export const SearchPage: React.FC = () => {
               </ul>
             </div>
           )}
-          {(sessionPrefs.exts.length > 0 || sessionPrefs.owners.length > 0) && (
+          {(preferredExts.length > 0 || ownerPrior.length > 0) && (
             <div className="space-y-1">
-              {sessionPrefs.exts.length > 0 && (
+              {preferredExts.length > 0 && (
                 <div>
                   <div className="font-semibold">선호 확장자</div>
                   <div className="flex flex-wrap gap-1">
-                    {sessionPrefs.exts.map((ext) => (
+                    {preferredExts.map((ext) => (
                       <span key={ext} className="badge">
                         {ext}
                       </span>
@@ -126,11 +163,11 @@ export const SearchPage: React.FC = () => {
                   </div>
                 </div>
               )}
-              {sessionPrefs.owners.length > 0 && (
+              {ownerPrior.length > 0 && (
                 <div>
                   <div className="font-semibold">선호 작성자</div>
                   <div className="flex flex-wrap gap-1">
-                    {sessionPrefs.owners.map((owner) => (
+                    {ownerPrior.map((owner) => (
                       <span key={owner} className="badge">
                         {owner}
                       </span>

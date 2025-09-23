@@ -4,13 +4,15 @@ export interface SearchRequest {
   session_id?: string | null;
 }
 
+export type FeedbackAction = "click" | "pin" | "like" | "dislike";
+
 export interface FeedbackRequest {
   session_id?: string | null;
   doc_id?: number;
   path?: string;
   ext?: string;
   owner?: string;
-  action: "click" | "pin" | "like" | "dislike";
+  action: FeedbackAction;
 }
 
 export interface SearchHit {
@@ -22,54 +24,65 @@ export interface SearchHit {
   match_reasons?: string[];
   metadata_matches?: string[];
   score_breakdown?: Record<string, number>;
+  session_ext_bonus?: number;
+  session_owner_bonus?: number;
+}
+
+export interface SessionSummary {
+  recent_queries: string[];
+  preferred_exts: string[];
+  owner_prior: string[];
+}
+
+export interface SearchResponse {
+  session_id?: string | null;
+  results: SearchHit[];
+  explain: string[][];
+  session: SessionSummary;
+}
+
+export interface FeedbackResponse {
+  session_id?: string | null;
+  status: string;
+  session?: SessionSummary;
+}
+
+export interface SessionResetResponse {
+  session_id?: string | null;
+  recent_queries: string[];
+}
+
+export interface ReindexResponse {
+  status: string;
 }
 
 const API_BASE = "/api";
+const JSON_HEADERS = { "Content-Type": "application/json" } as const;
 
-export async function search(req: SearchRequest) {
-  const res = await fetch(`${API_BASE}/search`, {
+async function postJson<T>(path: string, payload: unknown): Promise<T> {
+  const res = await fetch(`${API_BASE}${path}`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(req),
+    headers: JSON_HEADERS,
+    body: JSON.stringify(payload ?? {}),
   });
   if (!res.ok) {
-    throw new Error(`search failed: ${res.status}`);
+    throw new Error(`${path} failed: ${res.status}`);
   }
-  return res.json();
+  return (await res.json()) as T;
 }
 
-export async function sendFeedback(req: FeedbackRequest) {
-  const res = await fetch(`${API_BASE}/feedback`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(req),
-  });
-  if (!res.ok) {
-    throw new Error(`feedback failed: ${res.status}`);
-  }
-  return res.json();
+export function search(req: SearchRequest): Promise<SearchResponse> {
+  return postJson<SearchResponse>("/search", req);
 }
 
-export async function resetSession(sessionId?: string | null) {
-  const res = await fetch(`${API_BASE}/session/reset`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ session_id: sessionId }),
-  });
-  if (!res.ok) {
-    throw new Error(`reset failed: ${res.status}`);
-  }
-  return res.json();
+export function sendFeedback(req: FeedbackRequest): Promise<FeedbackResponse> {
+  return postJson<FeedbackResponse>("/feedback", req);
 }
 
-export async function triggerReindex(force = false) {
-  const res = await fetch(`${API_BASE}/reindex`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ force }),
-  });
-  if (!res.ok) {
-    throw new Error(`reindex failed: ${res.status}`);
-  }
-  return res.json();
+export function resetSession(sessionId?: string | null): Promise<SessionResetResponse> {
+  return postJson<SessionResetResponse>("/session/reset", { session_id: sessionId });
+}
+
+export function triggerReindex(force = false): Promise<ReindexResponse> {
+  return postJson<ReindexResponse>("/reindex", { force });
 }
