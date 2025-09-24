@@ -1,0 +1,37 @@
+주요 흐름                                                                                                 
+                                                                                                            
+  - infopilot.py chat 명령은 정책 엔진을 불러오고, 스캔·학습 산출물이 최신인지 _ensure_chat_artifacts로 확인
+  한 뒤 필요하면 자동으로 train을 다시 돌립니다 (infopilot.py:755, infopilot.py:898-931).                   
+  - 준비가 끝나면 LNPChat 인스턴스를 만들고 곧바로 ready()로 인덱스를 로딩하며, 이후에는 콘솔 루프에서 사용 
+  자의 질문을 받아 ask()에 넘겨 결과를 출력합니다 (infopilot.py:910-953).                                   
+                                                                                                            
+  응답 생성                                                                                                 
+                                                                                                            
+  - LNPChat은 다시 쓸 질문 컨텍스트, 번역, 재랭킹, 정책 필터링, 번역 미리보기 등 채팅 품질과 관련된 모든 옵 
+  션을 보존하는 데이터클래스입니다 (core/conversation/lnp_chat.py:73-144).                                  
+  - ask()는 이전 턴을 참고해 대명사/형태소 기반으로 질의를 재작성하고, 필요하면 deep-translator로 영어 번역 
+  한 뒤 검색에 투입합니다. 검색 중에는 스피너를 돌려 사용자를 기다리게 하지 않고, 결과를 정책 엔진으로 필터 
+  링해 히스토리에 저장합니다 (core/conversation/lnp_chat.py:236-428).                                       
+  - 반환 메시지는 상위 문서마다 overall/semantic/lexical/rerank 점수, 참고 근거, 프리뷰 하이라이트, 필      
+  요한 경우 번역본까지 포함하며, 검색 실패 시 원인(인덱스 미완료, 임계점 필터링 등)을 안내합니다 (core/     
+  conversation/lnp_chat.py:430-515).                                                                        
+  - 후속 질문 제안은 결과의 확장자 분포를 바탕으로 3개까지 생성되어 CLI 루프에서 함께 표시됩니다 (core/     
+  conversation/lnp_chat.py:520-579, infopilot.py:947-953).                                                  
+                                                                                                            
+  검색 엔진                                                                                                 
+                                                                                                            
+  - 내부에서 사용하는 Retriever는 임베딩 인덱스를 즉시 사용할 수 있도록 IndexManager와 캐시 감시 스레드를 준
+  비하며, SentenceTransformer 임베딩에 BM25 가중치와 Cross-Encoder 재랭킹을 결합해 최종 점수를 계산합니다   
+  (core/search/retriever.py:2582-2864).                                                                     
+  - 대화 컨텍스트는 SessionState가 관리하며, 최근 질의 히스토리와 선호 파일 형식/소유자를 추적해 검색 가중치
+  에 반영할 수 있는 구조입니다 (core/search/retriever.py:330-421).                                          
+                                                                                                            
+  부가 기능                                                                                                 
+                                                                                                            
+  - 결과 번역은 SQLite 기반 캐시로 중복 요청을 피하고, --show-translation 옵션이 켜졌을 때만 미리보기 하이  
+  라이트와 함께 출력됩니다 (core/conversation/lnp_chat.py:305-333, core/conversation/translation_cache.py:1-
+  57).                                                                                                      
+  - 정책 파일을 지정하면 검색 전 결과에서 접근 불가능한 경로를 제거하고, --scope로 정책 강제/무시 모드를 제 
+  어할 수 있습니다 (core/conversation/lnp_chat.py:526-558, infopilot.py:1220-1224).                         
+  - CLI 옵션은 번역 사용 여부, 재랭킹 모델/임계값, BM25 가중치, 최소 유사도, 번역 표시 언어 등 세부 튜닝을  
+  지원합니다 (infopilot.py:1210-1274).        

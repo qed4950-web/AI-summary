@@ -2,13 +2,15 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import itertools
 import math
 import queue
 import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, Iterator, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Set, Tuple
 
 import csv
 csv.field_size_limit(10**7)  # 10MB까지 허용
@@ -40,7 +42,7 @@ except Exception:
 
 # 모듈 임포트
 from infopilot_core.data_pipeline.filefinder import FileFinder
-from infopilot_core.data_pipeline.policies import PolicyEngine
+from infopilot_core.data_pipeline.policies import PolicyEngine, SmartFolderPolicy
 from infopilot_core.data_pipeline.pipeline import (
     run_step2,
     TrainConfig,
@@ -50,6 +52,7 @@ from infopilot_core.data_pipeline.pipeline import (
     remove_from_corpus,
     CorpusBuilder,
 )
+from infopilot_core.infra import JobScheduler, ScheduleSpec, ScheduledJob, ModelManager
 from infopilot_core.conversation.lnp_chat import LNPChat  # 새로운 LNP Chat 클래스를 임포트
 from infopilot_core.search.retriever import (
     VectorIndex,
@@ -62,6 +65,7 @@ KNOWLEDGE_AGENT = "knowledge_search"
 DEFAULT_POLICY_PATH = Path("./config/smart_folders.json")
 
 _POLICY_CACHE: Dict[Path, PolicyEngine] = {}
+_SENTENCE_ENCODER_MANAGER: Optional[ModelManager] = None
 
 
 NORMALIZED_ALIASES = {
@@ -73,6 +77,18 @@ NORMALIZED_ALIASES = {
     "drive": ("drive", "volume", "root"),
     "owner": ("owner", "user", "username", "author", "created_by"),
 }
+
+
+def _get_sentence_encoder_manager() -> ModelManager:
+    global _SENTENCE_ENCODER_MANAGER
+    if _SENTENCE_ENCODER_MANAGER is None:
+        def _load(model_name: str):
+            if SentenceTransformer is None:
+                raise RuntimeError("sentence-transformers 패키지가 필요합니다. pip install sentence-transformers")
+            return SentenceTransformer(model_name)
+
+        _SENTENCE_ENCODER_MANAGER = ModelManager(loader=_load)
+    return _SENTENCE_ENCODER_MANAGER
 
 
 def _normalize_key(name: str) -> str:
@@ -266,6 +282,38 @@ def _load_scan_rows(
         yield row
 
 
+@dataclass
+class _PolicyArtifacts:
+    base_dir: Path
+    scan_csv: Path
+    corpus: Path
+    model: Path
+    cache_dir: Path
+
+    def ensure_dirs(self) -> None:
+        self.base_dir.mkdir(parents=True, exist_ok=True)
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+
+
+def _policy_slug(policy: SmartFolderPolicy) -> str:
+    digest = hashlib.sha1(str(policy.path).encode("utf-8")).hexdigest()[:8]
+    candidate = policy.path.name or policy.path.anchor.strip("\\/") or "policy"
+    safe = "".join(ch.lower() if ch.isalnum() else "_" for ch in candidate).strip("_") or "policy"
+    return f"{safe}-{digest}"
+
+
+def _policy_artifacts(root: Path, policy: SmartFolderPolicy) -> _PolicyArtifacts:
+    slug = _policy_slug(policy)
+    base_dir = root / slug
+    return _PolicyArtifacts(
+        base_dir=base_dir,
+        scan_csv=base_dir / "found_files.csv",
+        corpus=base_dir / "corpus.parquet",
+        model=base_dir / "topic_model.joblib",
+        cache_dir=base_dir / "index_cache",
+    )
+
+
 def _sync_scan_csv(
     scan_csv: Path,
     rows_to_add: List[Dict[str, Any]],
@@ -332,12 +380,14 @@ def _load_sentence_encoder(model_path: Path) -> Tuple[Optional[SentenceTransform
         except Exception as exc:
             print(f"⚠️ 임베딩 모델 메타 로드 실패 → 기본값 사용({model_name}): {exc}")
 
-    if SentenceTransformer is None:
-        print("⚠️ 'sentence-transformers' 패키지를 찾을 수 없어 임베딩을 계산할 수 없습니다.")
+    try:
+        manager = _get_sentence_encoder_manager()
+    except RuntimeError as exc:
+        print(f"⚠️ SentenceTransformer 로더 초기화 실패: {exc}")
         return None, batch_size, model_name
 
     try:
-        encoder = SentenceTransformer(model_name)
+        encoder = manager.get(model_name)
     except Exception as exc:
         print(f"⚠️ SentenceTransformer 모델 로드 실패({model_name}): {exc}")
         return None, batch_size, model_name
@@ -603,6 +653,65 @@ def _watch_loop(
             _log_throughput(len(to_add), len(to_remove), time.time() - t0)
         except Exception as exc:
             print(f"⚠️ 증분 파이프라인 종료 처리 중 오류: {exc}")
+
+
+def _register_policy_jobs(
+    scheduler: JobScheduler,
+    *,
+    policy_engine: PolicyEngine,
+    agent: str,
+    output_root: Path,
+    translate: bool,
+) -> List[ScheduledJob]:
+    if not policy_engine or not policy_engine.has_policies:
+        return []
+
+    registered: List[ScheduledJob] = []
+    output_root = output_root.expanduser()
+
+    for policy in policy_engine.iter_policies():
+        if not policy.allows_agent(agent):
+            continue
+        schedule = ScheduleSpec.from_policy(policy)
+        if schedule.mode != "scheduled":
+            continue
+
+        artifacts = _policy_artifacts(output_root, policy)
+
+        def _job(policy=policy, artifacts=artifacts) -> None:
+            artifacts.ensure_dirs()
+            rows = _run_scan(artifacts.scan_csv, [policy.path], policy_engine=policy_engine)
+            filtered = policy_engine.filter_records(rows, agent=agent, include_manual=True)
+            if not filtered:
+                print(f"⚠️ 스케줄러: {policy.path}에 처리할 문서가 없어 건너뜁니다.")
+                return
+            cfg = _default_train_config()
+            run_step2(
+                filtered,
+                out_corpus=artifacts.corpus,
+                out_model=artifacts.model,
+                cfg=cfg,
+                use_tqdm=False,
+                translate=translate,
+            )
+            print(f"✅ 스케줄러: {policy.path} 학습 완료 → {artifacts.base_dir}")
+
+        job_name = f"{agent}:{_policy_slug(policy)}"
+        metadata = {
+            "path": str(policy.path),
+            "artifact_dir": str(artifacts.base_dir),
+            "mode": schedule.mode,
+        }
+        job = scheduler.register_callable(
+            job_name,
+            _job,
+            schedule,
+            metadata=metadata,
+            overwrite=True,
+        )
+        registered.append(job)
+
+    return registered
 
 
 def _build_train_config(args) -> TrainConfig:
@@ -924,6 +1033,51 @@ def cmd_watch(args):
         stop_event.set()
         observer.stop()
         observer.join()
+        try:
+            _get_sentence_encoder_manager().release(model_name)
+        except Exception:
+            pass
+
+
+def cmd_schedule(args):
+    policy_engine = _load_policy_engine(getattr(args, "policy", None))
+    if not policy_engine or not policy_engine.has_policies:
+        print("⚠️ 스케줄러: 정책이 없어 종료합니다.")
+        return
+
+    if args.agent != KNOWLEDGE_AGENT:
+        print("⚠️ 스케줄러: 현재는 knowledge_search 에이전트 예약만 지원합니다.")
+        return
+
+    scheduler = JobScheduler()
+    jobs = _register_policy_jobs(
+        scheduler,
+        policy_engine=policy_engine,
+        agent=args.agent,
+        output_root=Path(args.output_root),
+        translate=args.translate,
+    )
+
+    if not jobs:
+        print("⚠️ 스케줄러: 예약 작업이 없습니다. 정책의 indexing.mode를 확인해주세요.")
+        return
+
+    for job in jobs:
+        next_run = job.next_run.isoformat() if job.next_run else "manual"
+        print(f"⏱️ {job.metadata.get('path', job.name)} → 다음 실행: {next_run}")
+
+    poll = max(5.0, float(getattr(args, "poll_seconds", 60.0)))
+    if getattr(args, "once", False):
+        scheduler.run_pending()
+        return
+
+    print("🚀 정책 스케줄러를 시작합니다. (Ctrl+C로 종료)")
+    try:
+        while True:
+            scheduler.run_pending()
+            time.sleep(poll)
+    except KeyboardInterrupt:
+        print("👋 스케줄러를 종료합니다.")
 
 
 def main():
@@ -1134,6 +1288,43 @@ def main():
         help="스마트 폴더 정책 파일 경로 (비활성화하려면 'none').",
     )
     ap_watch.set_defaults(func=cmd_watch)
+
+    # schedule
+    ap_schedule = sp.add_parser("schedule", help="정책 기반 예약 파이프라인 실행")
+    ap_schedule.add_argument(
+        "--policy",
+        default=str(DEFAULT_POLICY_PATH),
+        help="스마트 폴더 정책 파일 경로 (비활성화하려면 'none').",
+    )
+    ap_schedule.add_argument(
+        "--agent",
+        default=KNOWLEDGE_AGENT,
+        choices=["knowledge_search", "meeting", "photo"],
+        help="예약 실행 대상 에이전트",
+    )
+    ap_schedule.add_argument(
+        "--output-root",
+        default="./data/scheduled",
+        help="정책별 산출물을 저장할 루트 디렉터리",
+    )
+    ap_schedule.add_argument(
+        "--translate",
+        action="store_true",
+        help="예약 학습 시 번역 파이프라인을 사용합니다.",
+    )
+    ap_schedule.add_argument(
+        "--once",
+        action="store_true",
+        help="즉시 실행 가능한 작업만 수행 후 종료합니다.",
+    )
+    ap_schedule.add_argument(
+        "--poll-seconds",
+        type=float,
+        default=60.0,
+        help="예약 작업 확인 간격(초). 최소 5초",
+    )
+    ap_schedule.set_defaults(translate=False)
+    ap_schedule.set_defaults(func=cmd_schedule)
 
     args = ap.parse_args()
     args.func(args)

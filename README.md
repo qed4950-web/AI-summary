@@ -18,6 +18,7 @@ AI 요약 소프트웨어를 구축하고 학습·조회 파이프라인을 돌�
 | 학습 | `python infopilot.py train --scan_csv data/found_files.csv --corpus data/corpus.parquet` | 코퍼스 및 토픽 모델 생성 |
 | 대화 | `python infopilot.py chat --model data/topic_model.joblib --corpus data/corpus.parquet --cache index_cache` | 의미 기반 검색 챗봇 실행 (`--translate`, `--show-translation`, `--lexical-weight` 옵션 지원) |
 | 감시 | `python infopilot.py watch --cache index_cache --corpus data/corpus.parquet --model data/topic_model.joblib` | 파일 변경을 감지해 코퍼스·FAISS 인덱스를 실시간으로 증분 갱신 |
+| 예약 | `python infopilot.py schedule --policy config/smart_folders.json` | 스마트 폴더 정책의 예약 스캔/학습을 실행하고 모니터링 |
 
 파이프라인실행
 python infopilot.py pipeline --corpus data/corpus.parquet --model data/topic_model.joblib
@@ -25,8 +26,77 @@ python infopilot.py pipeline --corpus data/corpus.parquet --model data/topic_mod
 ### 스마트 폴더 정책
 - 모든 명령은 `--policy` 옵션으로 스마트 폴더 정책(JSON) 경로를 지정할 수 있습니다. 기본값은 `config/smart_folders.json`이며, 비활성화하려면 `--policy none`을 사용하세요.
 - `chat` 명령은 추가로 `--scope` 옵션을 제공합니다. `auto`(기본)는 정책이 존재할 때만 적용, `policy`는 강제 적용, `global`은 정책을 무시하고 전역 검색을 수행합니다.
+- `schedule` 명령을 사용하면 `indexing.mode = scheduled`로 설정된 스마트 폴더를 주기적으로 스캔·학습해 별도 산출물 디렉터리에 적재할 수 있습니다 (`--output-root`로 경로 지정).
 - 정책 스키마는 `infopilot_core/data_pipeline/policies/schema/smart_folder_policy.schema.json`, 예시는 `infopilot_core/data_pipeline/policies/examples/smart_folder_policy_sample.json`에서 확인할 수 있습니다.
 - 정책이 활성화되면 Knowledge & Search 에이전트(`knowledge_search`)가 허용된 폴더만 스캔·학습·워치 대상으로 처리되며, 채팅 결과에서도 정책으로 제외된 문서 수를 안내합니다.
+
+## 업데이트 및 검증 절차
+
+### 1. 사전 준비
+- Python 3.9 이상 설치 여부를 확인합니다 (`python --version` 또는 `python3 --version`).
+- 모든 명령은 저장소 루트에서 실행하는 것을 권장합니다.
+
+### 2. 가상환경 생성 및 의존성 설치
+
+#### 공통 (권장)
+```bash
+python -m venv .venv
+```
+
+#### macOS / Linux
+```bash
+source .venv/bin/activate
+python -m pip install --upgrade pip
+pip install -r requirements.txt
+```
+
+#### Windows (PowerShell)
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+pip install -r requirements.txt
+```
+
+#### Windows (Command Prompt)
+```cmd
+python -m venv .venv
+.\.venv\Scripts\activate.bat
+python -m pip install --upgrade pip
+pip install -r requirements.txt
+```
+
+> 기존 가상환경이 있다면 생성 단계는 건너뛰고 활성화만 진행하세요.
+
+### 3. 업데이트 검증 플로우
+1. **테스트 실행**
+   ```bash
+   pytest -q
+   ```
+   Windows에서 `pytest`가 PATH에 없다면 `py -m pytest -q`를 사용하세요.
+2. **파이프라인 재구축(데이터 로직 변경 시)**
+   ```bash
+   python infopilot.py scan --out data/found_files.csv
+   python infopilot.py train --scan_csv data/found_files.csv --corpus data/corpus.parquet
+   ```
+3. **챗 캐시 새로고침(코퍼스/모델 변경 시)**
+   ```bash
+   python infopilot.py chat --model data/topic_model.joblib --corpus data/corpus.parquet --cache index_cache
+   ```
+   번역을 강제하려면 `--translate` 옵션을 추가하세요.
+4. **증분 감시로 인덱스 유지(선택 사항)**
+   ```bash
+   python infopilot.py watch --cache index_cache --corpus data/corpus.parquet --model data/topic_model.joblib
+   ```
+
+### 4. OS 별 참고 사항
+- **macOS**: `python3` 명령 사용을 권장하며, C 확장 빌드 오류 시 `xcode-select --install`로 Command Line Tools를 설치하세요.
+- **Windows**: 64비트 Python을 사용하고, 의존성 컴파일 실패 시 Microsoft C++ Build Tools 설치를 확인하세요.
+- **WSL / Linux**: `sudo apt-get install build-essential libsnappy-dev`로 빌드 도구를 준비하고, 환경에 따라 `python3` 명령을 사용하세요.
+
+### 5. 검증 후 마무리
+- 필요 시 `deactivate`로 가상환경을 종료합니다.
+- 변경 사항을 스테이징하고 커밋/푸시합니다.
 
 
 

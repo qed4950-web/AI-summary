@@ -34,9 +34,9 @@ class SmartFolderPolicy:
 
     @classmethod
     def from_dict(cls, data: Dict[str, object], *, base: Path) -> "SmartFolderPolicy":
-    if "path" not in data or not data.get("path"):
-        raise ValueError("Smart folder policy requires a 'path' key")
-    raw_path = Path(str(data.get("path")))
+        if "path" not in data or not data.get("path"):
+            raise ValueError("Smart folder policy requires a 'path' key")
+        raw_path = Path(str(data.get("path")))
         if not raw_path.is_absolute():
             raw_path = base / raw_path
         normalized_path = _normalize_path(raw_path)
@@ -114,6 +114,9 @@ class PolicyEngine:
             seen.add(key)
             unique.append(root)
         return unique
+
+    def iter_policies(self) -> Sequence[SmartFolderPolicy]:
+        return tuple(self._policies)
 
     def policy_for_path(self, path: Path) -> Optional[SmartFolderPolicy]:
         if not self._policies:
