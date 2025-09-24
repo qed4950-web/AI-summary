@@ -48,22 +48,58 @@ class LNPChat:
 
 
 class ChatScreen(ctk.CTkFrame):
-    def __init__(self, master, **kwargs):
+    def __init__(self, master, app, **kwargs):
         super().__init__(master, **kwargs)
+        self.app = app
 
         self.chat_engine = None
         self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(3, weight=1)
 
-        # Initialize UI elements that will be managed by refresh_state
-        self.warning_label = ctk.CTkLabel(self, text="", font=ctk.CTkFont(size=16))
-        self.train_button_redirect = ctk.CTkButton(self, text="🚀 전체 학습시키기",
-                                                   command=lambda: master.select_frame("train"))
+        self.title_label = ctk.CTkLabel(
+            self,
+            text="지식·검색 비서",
+            font=ctk.CTkFont(size=24, weight="bold"),
+        )
+        self.title_label.grid(row=0, column=0, padx=12, pady=(0, 4), sticky="w")
+
+        self.subtitle_label = ctk.CTkLabel(
+            self,
+            text="자료를 자연어로 검색하고 결과 요약을 바로 확인하세요.",
+            font=ctk.CTkFont(size=13),
+            text_color=("#4f4f4f", "#d0d0d0"),
+        )
+        self.subtitle_label.grid(row=1, column=0, padx=12, pady=(0, 12), sticky="w")
+
+        self.warning_label = ctk.CTkLabel(self, text="", font=ctk.CTkFont(size=15))
+        self.train_button_redirect = ctk.CTkButton(
+            self,
+            text="🚀 전체 학습 실행",
+            command=lambda: self.app.select_frame("train"),
+        )
+
         self.input_frame = ctk.CTkFrame(self, fg_color="transparent")
-        self.search_entry = ctk.CTkEntry(self.input_frame, placeholder_text="질문을 입력하세요...", height=40)
-        self.search_button = ctk.CTkButton(self.input_frame, text="검색", width=100, height=40, command=self.search_event)
-        self.results_textbox = ctk.CTkTextbox(self, font=ctk.CTkFont(size=14), state="disabled")
+        self.input_frame.grid_columnconfigure(0, weight=1)
+        self.search_entry = ctk.CTkEntry(
+            self.input_frame,
+            placeholder_text="예: 2024년 영업 보고서 요약 보여줘",
+            height=40,
+        )
+        self.search_button = ctk.CTkButton(
+            self.input_frame,
+            text="검색",
+            width=110,
+            height=40,
+            command=self.search_event,
+        )
 
-        self.refresh_state()  # Call refresh_state initially
+        self.results_textbox = ctk.CTkTextbox(
+            self,
+            font=ctk.CTkFont(size=14),
+            state="disabled",
+        )
+
+        self.refresh_state()
 
     def setup_ui(self):
         # This method is no longer directly called, its logic is integrated into refresh_state
@@ -72,26 +108,23 @@ class ChatScreen(ctk.CTkFrame):
     def refresh_state(self):
         # Clear previous state by forgetting grid layout
         self.warning_label.grid_forget()
-        self.train_button_redirect.grid_forget()  # Use grid_forget instead of pack_forget
+        self.train_button_redirect.grid_forget()
         self.input_frame.grid_forget()
         self.results_textbox.grid_forget()
 
         if not have_all_artifacts():
-            self.grid_rowconfigure(0, weight=1)
-            self.warning_label.configure(text="⚠️ 학습된 데이터가 없습니다. 먼저 '학습시키기'를 실행하세요.")
-            self.warning_label.grid(row=0, column=0, pady=(20, 10))
-            self.train_button_redirect.grid(row=1, column=0, pady=10)  # Use grid instead of pack
+            self.warning_label.configure(text="⚠️ 학습 데이터가 없습니다. 먼저 전체 학습을 실행하세요.")
+            self.warning_label.grid(row=2, column=0, pady=(60, 12))
+            self.train_button_redirect.grid(row=3, column=0, pady=(0, 12))
             self.search_entry.configure(state="disabled")
             self.search_button.configure(state="disabled")
         else:
             # Re-create/show input_frame and results_textbox
-            self.grid_rowconfigure(1, weight=1)
-            self.input_frame.grid(row=0, column=0, padx=20, pady=20, sticky="ew")
-            self.input_frame.grid_columnconfigure(0, weight=1)
+            self.input_frame.grid(row=2, column=0, padx=12, pady=(0, 12), sticky="ew")
             self.search_entry.grid(row=0, column=0, sticky="ew")
             self.search_entry.bind("<Return>", self.search_event)
-            self.search_button.grid(row=0, column=1, padx=(10, 0))
-            self.results_textbox.grid(row=1, column=0, padx=20, pady=(0, 20), sticky="nsew")
+            self.search_button.grid(row=0, column=1, padx=(12, 0))
+            self.results_textbox.grid(row=3, column=0, padx=12, pady=(0, 12), sticky="nsew")
 
             # Initialize chat engine if not already done
             if self.chat_engine is None or not self.chat_engine.ready_done:

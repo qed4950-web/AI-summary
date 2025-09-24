@@ -81,34 +81,55 @@ def _run_full_train_logic(exts_text, do_scan, log_callback, done_callback):
         done_callback()
 
 class TrainScreen(ctk.CTkFrame):
-    def __init__(self, master, start_task_callback, end_task_callback, **kwargs):
+    def __init__(self, master, app, start_task_callback, end_task_callback, **kwargs):
         super().__init__(master, **kwargs)
+        self.app = app
         self.start_task_callback = start_task_callback
         self.end_task_callback = end_task_callback
 
         self.grid_columnconfigure(0, weight=1)
-        self.grid_rowconfigure(1, weight=1)
+        self.grid_rowconfigure(3, weight=1)
 
-        # --- Options Frame ---
+        self.title_label = ctk.CTkLabel(
+            self,
+            text="전체 학습 파이프라인",
+            font=ctk.CTkFont(size=24, weight="bold"),
+        )
+        self.title_label.grid(row=0, column=0, padx=16, pady=(0, 6), sticky="w")
+
+        self.subtitle_label = ctk.CTkLabel(
+            self,
+            text="모든 문서를 스캔하고 코퍼스·인덱스를 새로 생성합니다.",
+            font=ctk.CTkFont(size=13),
+            text_color=("#4f4f4f", "#d0d0d0"),
+        )
+        self.subtitle_label.grid(row=1, column=0, padx=16, pady=(0, 12), sticky="w")
+
         options_frame = ctk.CTkFrame(self)
-        options_frame.grid(row=0, column=0, padx=20, pady=20, sticky="ew")
+        options_frame.grid(row=2, column=0, padx=16, pady=12, sticky="ew")
         options_frame.grid_columnconfigure(1, weight=1)
 
-        ctk.CTkLabel(options_frame, text="파일 확장자", font=ctk.CTkFont(weight="bold")).grid(row=0, column=0, padx=10, pady=10)
+        ctk.CTkLabel(options_frame, text="검색할 확장자", font=ctk.CTkFont(weight="bold")).grid(row=0, column=0, padx=12, pady=10)
         self.exts_entry = ctk.CTkEntry(options_frame)
         self.exts_entry.insert(0, ",".join(SUPPORTED_EXTS))
-        self.exts_entry.grid(row=0, column=1, padx=10, pady=10, sticky="ew")
+        self.exts_entry.grid(row=0, column=1, padx=12, pady=10, sticky="ew")
 
-        self.scan_checkbox = ctk.CTkCheckBox(options_frame, text="PC 전체 드라이브 스캔 실행 (시간이 오래 걸릴 수 있습니다)")
+        self.scan_checkbox = ctk.CTkCheckBox(
+            options_frame,
+            text="PC 전체 드라이브 스캔 실행 (시간이 오래 걸릴 수 있습니다)",
+        )
         self.scan_checkbox.select()
-        self.scan_checkbox.grid(row=1, column=0, columnspan=2, padx=10, pady=10, sticky="w")
+        self.scan_checkbox.grid(row=1, column=0, columnspan=2, padx=12, pady=8, sticky="w")
 
         self.start_button = ctk.CTkButton(options_frame, text="▶️ 전체 학습 시작", command=self.start_training)
-        self.start_button.grid(row=2, column=0, columnspan=2, padx=10, pady=10, sticky="ew")
+        self.start_button.grid(row=2, column=0, columnspan=2, padx=12, pady=(8, 10), sticky="ew")
 
-        # --- Log Frame ---
-        self.log_textbox = ctk.CTkTextbox(self, state="disabled", font=ctk.CTkFont(family="monospace"))
-        self.log_textbox.grid(row=1, column=0, padx=20, pady=(0, 20), sticky="nsew")
+        self.log_textbox = ctk.CTkTextbox(
+            self,
+            state="disabled",
+            font=ctk.CTkFont(family="monospace"),
+        )
+        self.log_textbox.grid(row=3, column=0, padx=16, pady=(0, 16), sticky="nsew")
 
     def log_message(self, message):
         self.after(0, self._insert_log, message)
@@ -121,13 +142,13 @@ class TrainScreen(ctk.CTkFrame):
 
     def training_done(self):
         self.after(0, self._enable_button)
-        self.end_task_callback() # Notify App that task is done
+        self.end_task_callback("✅ 전체 학습이 완료되었습니다.")
 
     def _enable_button(self):
         self.start_button.configure(state="normal", text="▶️ 전체 학습 시작")
 
     def start_training(self):
-        self.start_task_callback() # Notify App that task is starting
+        self.start_task_callback("⏳ 전체 학습 파이프라인을 실행 중입니다...")
         self.start_button.configure(state="disabled", text="학습 진행 중...")
         self.log_textbox.configure(state="normal")
         self.log_textbox.delete("1.0", "end")

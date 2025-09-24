@@ -93,6 +93,8 @@ PROJECT_ROOT = Path(__file__).parent.parent
 DATA_DIR = PROJECT_ROOT / "data"
 MODELS_DIR = PROJECT_ROOT / "models"
 CACHE_DIR = PROJECT_ROOT / "index_cache"
+MEETING_OUTPUT_DIR = DATA_DIR / "meetings"
+PHOTO_OUTPUT_DIR = DATA_DIR / "photo_reports"
 
 # 주요 파일 경로
 FOUND_FILES_CSV = DATA_DIR / "found_files.csv"

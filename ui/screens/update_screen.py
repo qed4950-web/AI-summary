@@ -103,22 +103,47 @@ def _run_update_index_logic(log_callback, done_callback):
         done_callback()
 
 class UpdateScreen(ctk.CTkFrame):
-    def __init__(self, master, start_task_callback, end_task_callback, **kwargs):
+    def __init__(self, master, app, start_task_callback, end_task_callback, **kwargs):
         super().__init__(master, **kwargs)
+        self.app = app
         self.start_task_callback = start_task_callback
         self.end_task_callback = end_task_callback
 
         self.grid_columnconfigure(0, weight=1)
-        self.grid_rowconfigure(1, weight=1)
+        self.grid_rowconfigure(3, weight=1)
 
-        # Initialize UI elements
-        self.warning_label = ctk.CTkLabel(self, text="", font=ctk.CTkFont(size=16))
-        self.train_button_redirect = ctk.CTkButton(self, text="🚀 전체 학습시키기", command=lambda: master.select_frame("train"))
+        self.title_label = ctk.CTkLabel(
+            self,
+            text="증분 업데이트",
+            font=ctk.CTkFont(size=24, weight="bold"),
+        )
+        self.title_label.grid(row=0, column=0, padx=16, pady=(0, 6), sticky="w")
+
+        self.subtitle_label = ctk.CTkLabel(
+            self,
+            text="기존 코퍼스를 기준으로 신규·수정·삭제된 파일만 반영합니다.",
+            font=ctk.CTkFont(size=13),
+            text_color=("#4f4f4f", "#d0d0d0"),
+        )
+        self.subtitle_label.grid(row=1, column=0, padx=16, pady=(0, 12), sticky="w")
+
+        self.warning_label = ctk.CTkLabel(self, text="", font=ctk.CTkFont(size=15))
+        self.train_button_redirect = ctk.CTkButton(
+            self,
+            text="🚀 전체 학습 실행",
+            command=lambda: self.app.select_frame("train"),
+        )
+
         self.options_frame = ctk.CTkFrame(self)
+        self.options_frame.grid_columnconfigure(0, weight=1)
         self.start_button = ctk.CTkButton(self.options_frame, text="▶️ 업데이트 시작", command=self.start_update)
-        self.log_textbox = ctk.CTkTextbox(self, state="disabled", font=ctk.CTkFont(family="monospace"))
+        self.log_textbox = ctk.CTkTextbox(
+            self,
+            state="disabled",
+            font=ctk.CTkFont(family="monospace"),
+        )
 
-        self.refresh_state() # Call refresh_state initially
+        self.refresh_state()
 
     def setup_ui(self):
         # This method is no longer directly called, its logic is integrated into refresh_state
@@ -132,19 +157,20 @@ class UpdateScreen(ctk.CTkFrame):
         self.log_textbox.grid_forget()
 
         if not have_all_artifacts():
-            self.grid_rowconfigure(0, weight=1)
-            self.warning_label.configure(text="⚠️ 기존 학습 데이터가 없습니다. 먼저 전체 학습을 실행해주세요.")
-            self.warning_label.grid(row=0, column=0, pady=(20, 10))
-            self.train_button_redirect.grid(row=1, column=0, pady=10)
+            self.warning_label.configure(text="⚠️ 학습 데이터가 없어 업데이트를 수행할 수 없습니다.")
+            self.warning_label.grid(row=2, column=0, pady=(60, 12))
+            self.train_button_redirect.grid(row=3, column=0, pady=(0, 12))
         else:
             # Re-create/show options_frame and log_textbox
-            self.options_frame.grid(row=0, column=0, padx=20, pady=20, sticky="ew")
-            self.options_frame.grid_columnconfigure(0, weight=1)
+            self.options_frame.grid(row=2, column=0, padx=16, pady=12, sticky="ew")
+            ctk.CTkLabel(
+                self.options_frame,
+                text="새로 추가되거나 수정된 파일만 효율적으로 업데이트합니다.",
+                justify="left",
+            ).grid(row=0, column=0, padx=12, pady=(12, 4), sticky="w")
+            self.start_button.grid(row=1, column=0, padx=12, pady=(0, 12), sticky="ew")
 
-            ctk.CTkLabel(self.options_frame, text="새로 추가되거나 수정된 파일만 효율적으로 업데이트합니다.", justify="left").grid(row=0, column=0, padx=10, pady=10)
-            self.start_button.grid(row=1, column=0, padx=10, pady=10, sticky="ew")
-
-            self.log_textbox.grid(row=1, column=0, padx=20, pady=(0, 20), sticky="nsew")
+            self.log_textbox.grid(row=3, column=0, padx=16, pady=(0, 16), sticky="nsew")
 
     def on_show(self):
         # Called when the frame is brought to front
@@ -161,12 +187,13 @@ class UpdateScreen(ctk.CTkFrame):
 
     def update_done(self):
         self.after(0, self._enable_button)
-        self.end_task_callback() # Notify App that task is done
+        self.end_task_callback("✅ 증분 업데이트가 완료되었습니다.")
 
     def _enable_button(self):
         self.start_button.configure(state="normal", text="▶️ 업데이트 시작")
 
     def start_update(self):
+        self.start_task_callback("⏳ 증분 업데이트를 실행 중입니다...")
         self.start_button.configure(state="disabled", text="업데이트 진행 중...")
         self.log_textbox.configure(state="normal")
         self.log_textbox.delete("1.0", "end")

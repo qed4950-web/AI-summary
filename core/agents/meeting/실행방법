@@ -1,0 +1,5 @@
+  실행 방법                                                                                                                                            
+                                                                                                                                                       
+  - 가상환경 준비: python3 -m venv .venv && source .venv/bin/activate                                                                                  
+  - 의존성 설치: .venv/bin/pip install -r requirements.txt (pytest는 이미 .venv에 설치됨)                                                              
+  - 단일 테스트 실행으로 파이프라인 확인: .venv/bin/python -m pytest tests/test_meeting_pipeline.py  

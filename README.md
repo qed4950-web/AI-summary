@@ -23,6 +23,25 @@ AI 요약 소프트웨어를 구축하고 학습·조회 파이프라인을 돌�
 파이프라인실행
 python infopilot.py pipeline --corpus data/corpus.parquet --model data/topic_model.joblib
 
+## 데스크톱 UI 실행
+- `python ui/app.py`로 데스크톱 런처를 실행하면 하나의 창에서 주요 기능을 모두 사용할 수 있습니다.
+  - 홈 대시보드: 코퍼스/모델 준비 상태 확인 및 빠른 이동 카드
+  - 지식·검색 비서: 의미 검색과 필터, 결과 미리보기
+  - 전체 학습 / 증분 업데이트: 기존 CLI 파이프라인을 GUI에서 실행
+  - 회의 비서 MVP: 오디오·전사 파일 요약, 액션 아이템·결정 사항 추출, 결과 폴더 저장
+  - 사진 비서 MVP: 폴더 스캔, 중복 그룹·베스트샷 추천, `photo_report.json` 생성
+- PyInstaller로 Windows용 실행 파일을 만들고 싶다면 아래 명령을 사용하세요.
+  ```powershell
+  python -m pip install --upgrade pip
+  pip install -r requirements_win313.txt pyinstaller
+  powershell -ExecutionPolicy Bypass -File scripts\build_desktop_ui.ps1 -OutputName InfoPilotDesktop
+  ```
+  설치용 ZIP까지 만들고 싶다면 `-CreateZip` 스위치를 추가하세요.
+  ```powershell
+  powershell -ExecutionPolicy Bypass -File scripts\build_desktop_ui.ps1 -OutputName InfoPilotDesktop -CreateZip
+  ```
+  생성된 `dist\InfoPilotDesktop\InfoPilotDesktop.exe` 또는 `dist\InfoPilotDesktop.zip`을 배포하면 사용자는 압축만 풀고 exe를 실행하면 됩니다.
+
 ### 스마트 폴더 정책
 - 모든 명령은 `--policy` 옵션으로 스마트 폴더 정책(JSON) 경로를 지정할 수 있습니다. 기본값은 `config/smart_folders.json`이며, 비활성화하려면 `--policy none`을 사용하세요.
 - `chat` 명령은 추가로 `--scope` 옵션을 제공합니다. `auto`(기본)는 정책이 존재할 때만 적용, `policy`는 강제 적용, `global`은 정책을 무시하고 전역 검색을 수행합니다.

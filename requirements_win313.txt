@@ -22,6 +22,10 @@ joblib>=1.4.2,<1.5
 scikit-learn>=1.7.2,<1.8
 sentence-transformers==3.0.1
 faiss-cpu==1.9.0.post1
+transformers>=4.44,<5
+faster-whisper>=1.0,<1.1
+pykospacing>=0.5,<0.6
+py-hanspell>=1.1,<1.2
 
 # === 시스템 유틸 ===
 watchdog==4.0.0
@@ -31,3 +35,4 @@ pywin32 ; platform_system == "Windows"
 tqdm>=4.66,<5
 pytest>=8.0,<9
 jsonschema>=4.18.0,<5
+customtkinter>=5.2,<6

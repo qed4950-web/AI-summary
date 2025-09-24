@@ -51,7 +51,7 @@
   - `MeetingPipeline`은 STT(음성 → 텍스트)와 요약 로직을 오케스트레이션하는 플레이스홀더입니다.
   - `MeetingJobConfig`는 오디오 경로, 출력 디렉터리, 언어, 정책 태그 등을 정의합니다.
   - 현재 STT/요약 구현은 자리 표시자이며, Whisper·LLM 등을 연결할 확장 포인트를 남깁니다 (`_transcribe`, `_summarise`).
-  - 실행 결과는 `transcript.txt`, `summary.json`, `segments.json`으로 저장되어 요약, 액션 아이템, 결정 사항, 세그먼트 타임라인을 제공합니다.
+- 실행 결과는 `transcript.txt`, `summary.json`, `segments.json`을 기본으로 생성하며 `summary.json`은 회의 메타데이터와 하이라이트/액션/결정 요약을 포함합니다. `MEETING_SAVE_TRANSCRIPT=1`을 지정하면 HH:MM:SS 타임스탬프와 SPEAKER_n 지표가 담긴 `transcript.json`도 추가로 생성됩니다.
 - 정책 연동: `policy_tag` 필드로 스마트 폴더 정책과 일관성 있게 관리하도록 설계되었습니다.
 
 ## 6. Photo Agent (사진 비서 MVP)
@@ -78,4 +78,3 @@
 - Meeting/Photo 에이전트는 백엔드 교체가 가능하도록 구성돼 있으며, Whisper·Vision Transformer 등의 실제 모델을 연결할 수 있습니다.
 - Knowledge & Search는 멀티 모델 레지스트리와 GPU 오프로딩(`core/infra/offload.py`)의 기반이 준비되어 있습니다.
 - 정책 스케줄러는 현재 `knowledge_search` 전용이지만, 에이전트 간 파이프라인을 확장할 수 있도록 메타데이터 구조를 포함합니다.
-

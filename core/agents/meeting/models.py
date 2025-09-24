@@ -33,3 +33,4 @@ class MeetingSummary:
     decisions: List[str]
     raw_summary: str
     transcript_path: Path
+    structured_summary: dict
