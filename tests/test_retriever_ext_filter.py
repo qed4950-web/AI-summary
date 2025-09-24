@@ -4,7 +4,7 @@ from pathlib import Path
 from types import SimpleNamespace
 import types
 
-import retriever
+from infopilot_core.search import retriever
 
 if "numpy" not in sys.modules:
     np_stub = types.ModuleType("numpy")
@@ -43,7 +43,7 @@ except ModuleNotFoundError:  # pytest 미설치 환경 대비
 
     pytest = types.SimpleNamespace(mark=_Mark())
 
-from retriever import (
+from infopilot_core.search.retriever import (
     Retriever,
     SessionState,
     VectorIndex,

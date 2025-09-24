@@ -1,0 +1,20 @@
+{
+  "path": "D:/주연테크/사업기획부",
+  "agents": [
+    "knowledge_search",
+    "meeting",
+    "photo"
+  ],
+  "security": {
+    "processing": "local_only",
+    "pii_filter": true
+  },
+  "indexing": {
+    "mode": "scheduled",
+    "cron": "0 3 * * *"
+  },
+  "retention": {
+    "summary_days": 180,
+    "preview_cache": false
+  }
+}
