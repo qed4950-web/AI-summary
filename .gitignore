@@ -1,6 +1,9 @@
 # Bytecode
 __pycache__/
 *.py[cod]
+dist/
+build/
+*.spec
 
 # IDE settings
 .vscode/
@@ -15,3 +18,10 @@ found_files.csv
 .venv/
 venv/
 
+# Model files
+*.pt
+*.bin
+*.ckpt
+*.safetensors
+*.onnx
+.cache/
