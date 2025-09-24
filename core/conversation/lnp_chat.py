@@ -12,10 +12,16 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Set, Tuple
 
-from retriever import Retriever, SessionState, _similarity_to_percent, _split_tokens  # Step3 검색기 재사용
+from infopilot_core.data_pipeline.policies import PolicyEngine
+from infopilot_core.search.retriever import (
+    Retriever,
+    SessionState,
+    _similarity_to_percent,
+    _split_tokens,
+)  # Step3 검색기 재사용
 
 _PREVIEW_TOKEN_PATTERN = re.compile(r"(?u)(?:[가-힣]{1,}|[A-Za-z0-9]{2,})")
-from translation_cache import TranslationCache
+from .translation_cache import TranslationCache
 
 try:
     from deep_translator import GoogleTranslator
@@ -80,6 +86,9 @@ class LNPChat:
     show_translation: bool = False
     translation_lang: str = "en"
     min_similarity: float = 0.35
+    policy_engine: Optional[PolicyEngine] = None
+    policy_scope: str = "auto"  # auto|policy|global
+    policy_agent: str = "knowledge_search"
 
     retr: Optional[Retriever] = field(init=False, default=None)
     translator: Optional[Any] = field(init=False, default=None)
@@ -92,6 +101,7 @@ class LNPChat:
     session_state: SessionState = field(init=False, default_factory=SessionState)
     last_query_text: str = field(init=False, default="")
     last_hits: List[Dict[str, Any]] = field(init=False, default_factory=list)
+    _policy_effective: bool = field(init=False, default=False)
 
     # 초기화: Retriever 및 번역기 준비
     def ready(self, rebuild: bool = False):
@@ -127,6 +137,7 @@ class LNPChat:
             self.cache_dir.mkdir(parents=True, exist_ok=True)
             self.translation_cache = TranslationCache(self.cache_dir / "translations.sqlite3")
             self.ready_done = True
+            self._policy_effective = bool(self._resolve_policy_engine())
         finally:
             spin.stop()
         index_ready = self.retr.wait_until_ready(timeout=0.1)
@@ -370,6 +381,8 @@ class LNPChat:
             self.ready(rebuild=False)
         k = topk or self.topk
         query_tokens = {tok.lower() for tok in _split_tokens(query) if tok}
+        effective_policy = self._resolve_policy_engine()
+        self._policy_effective = bool(effective_policy)
 
         # [번역 기능] 사용자 질문을 영어로 번역
         contextual_query, used_context = self._rewrite_query(query, query_tokens)
@@ -407,13 +420,18 @@ class LNPChat:
 
         # 히스토리 적재 (원본 query 기준)
         self.history.append(ChatTurn(role="user", text=query))
-        self.last_hits = hits
+        filtered_hits, filtered_count = self._apply_policy_scope(hits)
+        self.last_hits = filtered_hits
         self.last_query_text = contextual_query
 
-        self._augment_translations(hits)
+        self._augment_translations(filtered_hits)
+        hits = filtered_hits
 
         # 답변 생성(원본 query 기준)
-        answer_lines = [f"‘{query}’에 대한 추천 문서 Top {len(hits)} (검색 {dt:.2f}s):"]
+        policy_note = ""
+        if self._policy_effective and filtered_count:
+            policy_note = f" (정책으로 {filtered_count}건 제외)"
+        answer_lines = [f"‘{query}’에 대한 추천 문서 Top {len(hits)} (검색 {dt:.2f}s){policy_note}:"]
         for i, h in enumerate(hits, 1):
             semantic_pct = _similarity_to_percent(h.get("vector_similarity"))
             overall_pct = _similarity_to_percent(h.get("similarity", h.get("vector_similarity")))
@@ -504,6 +522,40 @@ class LNPChat:
             "hits": hits,
             "suggestions": self._suggest_followups(query, hits),
         }
+
+    def _resolve_policy_engine(self) -> Optional[PolicyEngine]:
+        engine = self.policy_engine
+        if engine is None:
+            return None
+        try:
+            if not engine.has_policies:
+                return None
+        except AttributeError:
+            return None
+        scope = (self.policy_scope or "auto").strip().lower()
+        if scope == "global":
+            return None
+        if scope == "policy":
+            return engine
+        # auto
+        return engine
+
+    def _apply_policy_scope(self, hits: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], int]:
+        engine = self._resolve_policy_engine()
+        if not engine:
+            return hits, 0
+        filtered: List[Dict[str, Any]] = []
+        for hit in hits:
+            path_val = hit.get("path")
+            if not path_val:
+                continue
+            try:
+                path_obj = Path(str(path_val))
+            except Exception:
+                continue
+            if engine.allows(path_obj, agent=self.policy_agent, include_manual=False):
+                filtered.append(hit)
+        return filtered, max(0, len(hits) - len(filtered))
 
     # 후속 질문 제안
     def _suggest_followups(self, query: str, hits: List[Dict[str, Any]]) -> List[str]:

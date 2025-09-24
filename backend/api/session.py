@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from typing import Dict, Optional, Tuple
 from uuid import uuid4
 
-from retriever import SessionState
+from infopilot_core.search.retriever import SessionState
 
 
 @dataclass

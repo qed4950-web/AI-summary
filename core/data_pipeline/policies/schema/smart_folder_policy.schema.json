@@ -1,0 +1,75 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "SmartFolderPolicy",
+  "type": "object",
+  "required": [
+    "path"
+  ],
+  "properties": {
+    "path": {
+      "type": "string",
+      "description": "Absolute folder path"
+    },
+    "agents": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "enum": [
+          "knowledge_search",
+          "meeting",
+          "photo"
+        ]
+      },
+      "description": "Agents enabled for this folder"
+    },
+    "security": {
+      "type": "object",
+      "properties": {
+        "processing": {
+          "type": "string",
+          "enum": [
+            "local_only",
+            "hybrid",
+            "cloud_allowed"
+          ]
+        },
+        "pii_filter": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false
+    },
+    "indexing": {
+      "type": "object",
+      "properties": {
+        "mode": {
+          "type": "string",
+          "enum": [
+            "realtime",
+            "scheduled",
+            "manual"
+          ]
+        },
+        "cron": {
+          "type": "string",
+          "description": "Cron expression when mode=scheduled"
+        }
+      },
+      "additionalProperties": false
+    },
+    "retention": {
+      "type": "object",
+      "properties": {
+        "summary_days": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "preview_cache": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

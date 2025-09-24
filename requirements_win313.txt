@@ -30,3 +30,4 @@ pywin32 ; platform_system == "Windows"
 # === 기타 ===
 tqdm>=4.66,<5
 pytest>=8.0,<9
+jsonschema>=4.18.0,<5

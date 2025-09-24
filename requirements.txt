@@ -31,4 +31,4 @@ pyhwp>=0.1.3,<0.2; platform_system != "Windows" and python_version < "3.12"
 # === 기타 ===
 tqdm>=4.66,<5
 pytest>=8.0,<9
->>>>>>> recover-mywork
+jsonschema>=4.18.0,<5

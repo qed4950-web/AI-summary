@@ -2,7 +2,7 @@ import threading
 
 import pytest
 
-from retriever import CacheSignatureMonitor
+from infopilot_core.search.retriever import CacheSignatureMonitor
 
 
 @pytest.mark.full

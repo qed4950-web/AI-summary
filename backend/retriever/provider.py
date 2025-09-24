@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from retriever import Retriever
+from infopilot_core.search.retriever import Retriever
 from backend.api.settings import Settings
 
 

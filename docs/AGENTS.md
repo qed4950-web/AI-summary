@@ -2,9 +2,13 @@
 
 ## Project Structure & Module Organization
 - `infopilot.py` orchestrates the CLI scan/train/chat flow and wires the supporting modules.
-- `filefinder.py` performs cross-platform scans and writes candidate metadata to CSV during Step 1.
-- `pipeline.py` builds the cleaned corpus and topic model artifacts stored in `data/`.
-- `retriever.py` and `lnp_chat.py` load the trained model, manage `index_cache/`, and drive the interactive chat.
+- `infopilot_core/data_pipeline/filefinder.py` performs cross-platform scans and writes candidate metadata to CSV during Step 1.
+- `infopilot_core/data_pipeline/pipeline.py` builds the cleaned corpus and topic model artifacts stored in `data/`.
+- `infopilot_core/search/retriever.py` and `infopilot_core/conversation/lnp_chat.py` load the trained model, manage `index_cache/`, and drive the interactive chat.
+- `infopilot_core/data_pipeline/policies/` hosts smart folder policy schemas, examples, and the runtime policy engine used to scope scanning/indexing.
+- `infopilot_core/agents/meeting/` contains the meeting agent MVP (transcription/summarisation stubs) and will evolve with future cycles.
+- `infopilot_core/agents/photo/` contains the photo agent MVP scaffold (tagging, duplicate detection, best-shot reporting).
+- `infopilot_core/infra/` collects shared infrastructure helpers such as offloading strategies, audit logging, and model selection utilities.
 - `data/` hosts generated corpora and models; `models/` is reserved for packaged exports.
 
 ## Build, Test, and Development Commands
