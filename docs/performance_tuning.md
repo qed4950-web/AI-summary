@@ -22,7 +22,7 @@ The script prints average/p50/p95 latency (ms), overlap@k against the exact rank
 
 ## Session Personalization Weights
 
-`retriever.py` exposes the session scaling constants:
+`infopilot_core/search/retriever.py` exposes the session scaling constants:
 
 | Constant | Purpose | Default |
 | --- | --- | --- |

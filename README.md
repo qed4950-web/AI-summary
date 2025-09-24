@@ -3,9 +3,12 @@ AI 요약 소프트웨어를 구축하고 학습·조회 파이프라인을 돌�
 
 ## 프로젝트 개요
 - `infopilot.py` : `scan → train → chat` 절차를 오케스트레이션하는 CLI 진입점
-- `filefinder.py` : 파일 시스템을 스캔해 후보 목록을 CSV로 저장
-- `pipeline.py` : 코퍼스 정제 및 토픽 모델 학습, Parquet/CSV 아티팩트 생성
-- `retriever.py / lnp_chat.py` : 학습된 모델을 불러와 쿼리 검색 및 대화 인터페이스 제공
+- `infopilot_core/data_pipeline/filefinder.py` : 파일 시스템을 스캔해 후보 목록을 CSV로 저장
+- `infopilot_core/data_pipeline/pipeline.py` : 코퍼스 정제 및 토픽 모델 학습, Parquet/CSV 아티팩트 생성
+- `infopilot_core/search/retriever.py` / `infopilot_core/conversation/lnp_chat.py` : 학습된 모델을 불러와 쿼리 검색 및 대화 인터페이스 제공
+- `infopilot_core/agents/meeting/` : 회의 비서(STT→요약) 파이프라인 초안과 설정이 위치
+- `infopilot_core/agents/photo/` : 사진 비서(태깅·중복 정리) MVP 골격과 설정 템플릿 제공
+- `infopilot_core/infra/` : 하이브리드 오프로딩/감사 로깅/모델 선택 유틸리티
 - `data/`, `index_cache/` : 생성된 코퍼스와 캐시가 위치하는 디렉터리 (대용량 파일은 커밋 금지)
 
 ## 핵심 명령
@@ -19,6 +22,11 @@ AI 요약 소프트웨어를 구축하고 학습·조회 파이프라인을 돌�
 파이프라인실행
 python infopilot.py pipeline --corpus data/corpus.parquet --model data/topic_model.joblib
 
+### 스마트 폴더 정책
+- 모든 명령은 `--policy` 옵션으로 스마트 폴더 정책(JSON) 경로를 지정할 수 있습니다. 기본값은 `config/smart_folders.json`이며, 비활성화하려면 `--policy none`을 사용하세요.
+- `chat` 명령은 추가로 `--scope` 옵션을 제공합니다. `auto`(기본)는 정책이 존재할 때만 적용, `policy`는 강제 적용, `global`은 정책을 무시하고 전역 검색을 수행합니다.
+- 정책 스키마는 `infopilot_core/data_pipeline/policies/schema/smart_folder_policy.schema.json`, 예시는 `infopilot_core/data_pipeline/policies/examples/smart_folder_policy_sample.json`에서 확인할 수 있습니다.
+- 정책이 활성화되면 Knowledge & Search 에이전트(`knowledge_search`)가 허용된 폴더만 스캔·학습·워치 대상으로 처리되며, 채팅 결과에서도 정책으로 제외된 문서 수를 안내합니다.
 
 
 

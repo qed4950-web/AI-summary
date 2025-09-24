@@ -39,8 +39,9 @@ except Exception:
 
 
 # 모듈 임포트
-from filefinder import FileFinder
-from pipeline import (
+from infopilot_core.data_pipeline.filefinder import FileFinder
+from infopilot_core.data_pipeline.policies import PolicyEngine
+from infopilot_core.data_pipeline.pipeline import (
     run_step2,
     TrainConfig,
     DEFAULT_N_COMPONENTS,
@@ -49,8 +50,18 @@ from pipeline import (
     remove_from_corpus,
     CorpusBuilder,
 )
-from lnp_chat import LNPChat  # 새로운 LNP Chat 클래스를 임포트
-from retriever import VectorIndex, MODEL_TEXT_COLUMN, _split_tokens
+from infopilot_core.conversation.lnp_chat import LNPChat  # 새로운 LNP Chat 클래스를 임포트
+from infopilot_core.search.retriever import (
+    VectorIndex,
+    MODEL_TEXT_COLUMN,
+    _split_tokens,
+)
+
+
+KNOWLEDGE_AGENT = "knowledge_search"
+DEFAULT_POLICY_PATH = Path("./config/smart_folders.json")
+
+_POLICY_CACHE: Dict[Path, PolicyEngine] = {}
 
 
 NORMALIZED_ALIASES = {
@@ -141,7 +152,41 @@ def _parse_roots(raw_roots: List[str] | None) -> List[Path] | None:
     return roots
 
 
-def _run_scan(out: Path, roots: List[Path] | None = None) -> List[Dict[str, Any]]:
+def _load_policy_engine(policy_arg: Optional[str]) -> PolicyEngine:
+    raw = (policy_arg or str(DEFAULT_POLICY_PATH)).strip()
+    if raw.lower() == "none" or raw == "":
+        return PolicyEngine.empty()
+    path = Path(raw).expanduser()
+    try:
+        cache_key = path.resolve()
+    except OSError:
+        cache_key = path
+    engine = _POLICY_CACHE.get(cache_key)
+    if engine is None:
+        try:
+            engine = PolicyEngine.from_file(path)
+        except Exception as exc:
+            print(f"⚠️ 정책 파일을 불러오지 못했습니다: {exc}")
+            engine = PolicyEngine.empty()
+        _POLICY_CACHE[cache_key] = engine
+    return engine
+
+
+def _run_scan(
+    out: Path,
+    roots: List[Path] | None = None,
+    *,
+    policy_engine: Optional[PolicyEngine] = None,
+) -> List[Dict[str, Any]]:
+    scan_roots = roots
+    if policy_engine and policy_engine.has_policies and not roots:
+        candidate_roots = policy_engine.roots_for_agent(KNOWLEDGE_AGENT, include_manual=True)
+        if candidate_roots:
+            scan_roots = candidate_roots
+            print("📁 정책 기반 스캔 루트:")
+            for root in candidate_roots:
+                print(f"   - {root}")
+
     finder = FileFinder(
         exts=FileFinder.DEFAULT_EXTS,
         scan_all_drives=True,
@@ -153,15 +198,18 @@ def _run_scan(out: Path, roots: List[Path] | None = None) -> List[Dict[str, Any]
         estimate_total_dirs=False,
         startup_banner=True,
     )
-    files = finder.find(roots=roots, run_async=False)
+    files = finder.find(roots=scan_roots, run_async=False)
+    if policy_engine and policy_engine.has_policies:
+        files = policy_engine.filter_records(files, agent=KNOWLEDGE_AGENT, include_manual=True)
     FileFinder.to_csv(files, out)
     print(f"📦 스캔 결과 저장: {out}")
     return files
 
 
 def cmd_scan(args):
+    policy_engine = _load_policy_engine(getattr(args, "policy", None))
     roots = _parse_roots(args.roots)
-    _run_scan(Path(args.out), roots)
+    _run_scan(Path(args.out), roots, policy_engine=policy_engine)
 
 
 def _resolve_scan_csv(path: Path) -> Path:
@@ -198,8 +246,24 @@ def _iter_scan_rows(scan_csv: Path) -> Iterator[Dict[str, Any]]:
                 yield normalized
 
 
-def _load_scan_rows(scan_csv: Path) -> Iterator[Dict[str, Any]]:
-    return _iter_scan_rows(scan_csv)
+def _load_scan_rows(
+    scan_csv: Path,
+    *,
+    policy_engine: Optional[PolicyEngine] = None,
+    include_manual: bool = True,
+) -> Iterator[Dict[str, Any]]:
+    for row in _iter_scan_rows(scan_csv):
+        if policy_engine and policy_engine.has_policies:
+            raw_path = row.get("path")
+            if not raw_path:
+                continue
+            if not policy_engine.allows(
+                Path(str(raw_path)),
+                agent=KNOWLEDGE_AGENT,
+                include_manual=include_manual,
+            ):
+                continue
+        yield row
 
 
 def _sync_scan_csv(
@@ -302,16 +366,31 @@ def _load_vector_index(cache_dir: Path) -> VectorIndex:
 
 
 class WatchEventHandler(FileSystemEventHandler):
-    def __init__(self, event_queue: "queue.Queue[Tuple[str, str]]", allowed_exts: Set[str]) -> None:
+    def __init__(
+        self,
+        event_queue: "queue.Queue[Tuple[str, str]]",
+        allowed_exts: Set[str],
+        *,
+        policy_engine: Optional[PolicyEngine] = None,
+        agent: str = KNOWLEDGE_AGENT,
+    ) -> None:
         super().__init__()
         self._queue = event_queue
         self._allowed_exts = {ext.lower() for ext in allowed_exts}
+        self._policy_engine = policy_engine
+        self._policy_agent = agent
 
     def _should_process(self, path: str) -> bool:
         if not path:
             return False
         ext = Path(path).suffix.lower()
-        return ext in self._allowed_exts
+        if ext not in self._allowed_exts:
+            return False
+        if self._policy_engine and self._policy_engine.has_policies and not self._policy_engine.allows(
+            Path(path), agent=self._policy_agent, include_manual=False
+        ):
+            return False
+        return True
 
     def on_created(self, event):  # type: ignore[override]
         if getattr(event, "is_directory", False):
@@ -350,6 +429,7 @@ class IncrementalPipeline:
         corpus_path: Path,
         cache_dir: Path,
         translate: bool,
+        policy_engine: Optional[PolicyEngine] = None,
     ) -> None:
         self.encoder = encoder
         self.batch_size = max(1, int(batch_size))
@@ -359,15 +439,27 @@ class IncrementalPipeline:
         self.translate = translate
         self.allowed_exts = {ext.lower() for ext in FileFinder.DEFAULT_EXTS}
         self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self.policy_engine = policy_engine
+        self.policy_agent = KNOWLEDGE_AGENT
 
     def process(self, add_paths: Set[str], remove_paths: Set[str]) -> None:
         if pd is None:
             raise RuntimeError("pandas 필요. pip install pandas")
         add_paths = {p for p in add_paths if Path(p).suffix.lower() in self.allowed_exts}
         remove_paths = {p for p in remove_paths if Path(p).suffix.lower() in self.allowed_exts}
+        if self.policy_engine and self.policy_engine.has_policies and add_paths:
+            add_paths = {
+                p
+                for p in add_paths
+                if self.policy_engine.allows(Path(p), agent=self.policy_agent, include_manual=False)
+            }
 
         rows_to_add: List[Dict[str, Any]] = []
         for raw_path in sorted(add_paths):
+            if self.policy_engine and self.policy_engine.has_policies and not self.policy_engine.allows(
+                Path(raw_path), agent=self.policy_agent, include_manual=False
+            ):
+                continue
             meta = FileFinder.collect_file_metadata(Path(raw_path), allowed_exts=self.allowed_exts)
             if meta:
                 rows_to_add.append(meta)
@@ -558,6 +650,7 @@ def _ensure_chat_artifacts(
     *,
     translate: bool,
     auto_train: bool,
+    policy_engine: Optional[PolicyEngine],
 ) -> bool:
     """Ensure chat artifacts exist and are up to date. Returns True if training ran."""
 
@@ -601,7 +694,13 @@ def _ensure_chat_artifacts(
         )
 
     print("⚠️ 스캔 결과가 모델보다 최신입니다. 자동으로 train 단계를 실행합니다.")
-    rows = list(_load_scan_rows(resolved_scan))
+    rows = list(
+        _load_scan_rows(
+            resolved_scan,
+            policy_engine=policy_engine,
+            include_manual=False,
+        )
+    )
     if not rows:
         raise ValueError("자동 학습을 위한 유효한 행이 없습니다. 스캔 결과를 확인해주세요.")
 
@@ -620,7 +719,8 @@ def _ensure_chat_artifacts(
 
 def cmd_train(args):
     scan_csv = _resolve_scan_csv(Path(args.scan_csv))
-    row_iter = _load_scan_rows(scan_csv)
+    policy_engine = _load_policy_engine(getattr(args, "policy", None))
+    row_iter = _load_scan_rows(scan_csv, policy_engine=policy_engine, include_manual=True)
     rows = _maybe_limit_rows(row_iter, args.limit_files)
 
     if not rows:
@@ -636,8 +736,14 @@ def cmd_train(args):
 def cmd_pipeline(args):
     out = Path(args.out)
     roots = _parse_roots(args.roots)
-    scan_rows = _run_scan(out, roots)
-    rows = _maybe_limit_rows(scan_rows, args.limit_files)
+    policy_engine = _load_policy_engine(getattr(args, "policy", None))
+    scan_rows = _run_scan(out, roots, policy_engine=policy_engine)
+    filtered_rows = (
+        scan_rows
+        if not policy_engine or not policy_engine.has_policies
+        else policy_engine.filter_records(scan_rows, agent=KNOWLEDGE_AGENT, include_manual=True)
+    )
+    rows = _maybe_limit_rows(filtered_rows, args.limit_files)
 
     if not rows:
         raise ValueError("유효한 학습 대상 행이 없습니다. 스캔 결과를 확인해주세요.")
@@ -675,18 +781,21 @@ def cmd_pipeline(args):
             show_translation=False,
             translation_lang="en",
             min_similarity=0.35,
+            policy=str(getattr(args, "policy", str(DEFAULT_POLICY_PATH))),
         )
         cmd_chat(chat_args)
 
 
 def cmd_chat(args):
     """대화형 검색 모드 (LNPChat 사용)"""
+    policy_engine = _load_policy_engine(getattr(args, "policy", None))
     auto_trained = _ensure_chat_artifacts(
         scan_csv=Path(args.scan_csv),
         corpus=Path(args.corpus),
         model=Path(args.model),
         translate=args.translate,
         auto_train=args.auto_train,
+        policy_engine=policy_engine,
     )
 
     # LNPChat 클래스 인스턴스 생성 및 준비
@@ -706,6 +815,9 @@ def cmd_chat(args):
         show_translation=args.show_translation,
         translation_lang=args.translation_lang,
         min_similarity=args.min_similarity,
+        policy_engine=policy_engine if policy_engine and policy_engine.has_policies else policy_engine,
+        policy_scope=(getattr(args, "scope", "auto") or "auto").lower(),
+        policy_agent=KNOWLEDGE_AGENT,
     )
     chat_session.ready(rebuild=auto_trained)
 
@@ -740,13 +852,44 @@ def cmd_watch(args):
     if encoder is None:
         raise RuntimeError("sentence-transformers 모델을 로드할 수 없어 watcher를 실행할 수 없습니다.")
 
+    policy_engine = _load_policy_engine(getattr(args, "policy", None))
     roots = _parse_roots(args.roots)
     if not roots:
-        roots = [Path.cwd()]
+        policy_roots = (
+            policy_engine.roots_for_agent(KNOWLEDGE_AGENT, include_manual=False)
+            if policy_engine and policy_engine.has_policies
+            else []
+        )
+        roots = policy_roots or [Path.cwd()]
+
+    deduped_roots: List[Path] = []
+    seen_roots: Set[str] = set()
+    for root in roots:
+        resolved = Path(root).expanduser()
+        try:
+            resolved = resolved.resolve()
+        except OSError:
+            pass
+        key = str(resolved)
+        if key in seen_roots:
+            continue
+        seen_roots.add(key)
+        deduped_roots.append(resolved)
+
+    roots = deduped_roots
+    existing_roots: List[Path] = []
+    for root in roots:
+        if root.exists():
+            existing_roots.append(root)
+        else:
+            print(f"⚠️ 감시 루트가 존재하지 않아 제외합니다: {root}")
+    if not existing_roots:
+        existing_roots = [Path.cwd()]
+    roots = existing_roots
 
     event_queue: "queue.Queue[Tuple[str, str]]" = queue.Queue()
     allowed_exts = {ext.lower() for ext in FileFinder.DEFAULT_EXTS}
-    handler = WatchEventHandler(event_queue, allowed_exts)
+    handler = WatchEventHandler(event_queue, allowed_exts, policy_engine=policy_engine, agent=KNOWLEDGE_AGENT)
     observer = Observer()
     for root in roots:
         observer.schedule(handler, str(root), recursive=True)
@@ -758,14 +901,16 @@ def cmd_watch(args):
         corpus_path=Path(args.corpus),
         cache_dir=Path(args.cache),
         translate=args.translate,
+        policy_engine=policy_engine,
     )
 
     debounce_sec = max(0.5, args.debounce_ms / 1000.0)
     stop_event = threading.Event()
 
+    policy_info = " (정책 기반)" if policy_engine and policy_engine.has_policies else ""
     print(
         "👀 파일 변경 감시를 시작합니다. (Ctrl+C로 종료)"
-        f"\n   roots: {', '.join(str(r) for r in roots)}"
+        f"\n   roots{policy_info}: {', '.join(str(r) for r in roots)}"
         f"\n   embedding model: {model_name} (batch={batch_size})"
         f"\n   debounce: {debounce_sec:.2f}s"
     )
@@ -794,6 +939,11 @@ def main():
         dest="roots",
         action="append",
         help="스캔할 루트 디렉터리. 여러 번 지정 가능. 미지정 시 전체 스캔.",
+    )
+    ap_scan.add_argument(
+        "--policy",
+        default=str(DEFAULT_POLICY_PATH),
+        help="스마트 폴더 정책 파일 경로 (비활성화하려면 'none').",
     )
     ap_scan.set_defaults(func=cmd_scan)
 
@@ -834,6 +984,11 @@ def main():
         help="번역 기능을 비활성화하고 원문으로 학습합니다.",
     )
     ap_train.add_argument("--no-embedding", dest="use_embedding", action="store_false", help="Sentence-BERT 대신 TF-IDF 백업 경로를 사용합니다.")
+    ap_train.add_argument(
+        "--policy",
+        default=str(DEFAULT_POLICY_PATH),
+        help="스마트 폴더 정책 파일 경로 (비활성화하려면 'none').",
+    )
     ap_train.set_defaults(translate=False)
     ap_train.set_defaults(use_embedding=True)
     ap_train.set_defaults(func=cmd_train)
@@ -888,6 +1043,11 @@ def main():
         action="store_true",
         help="파이프라인 완료 후 chat 모드를 바로 실행합니다.",
     )
+    ap_pipe.add_argument(
+        "--policy",
+        default=str(DEFAULT_POLICY_PATH),
+        help="스마트 폴더 정책 파일 경로 (비활성화하려면 'none').",
+    )
     ap_pipe.set_defaults(translate=False)
     ap_pipe.set_defaults(use_embedding=True)
     ap_pipe.set_defaults(func=cmd_pipeline)
@@ -902,6 +1062,12 @@ def main():
     ap_chat.add_argument("--cache", default="./index_cache")
     ap_chat.add_argument("--scan_csv", default="./data/found_files.csv")
     ap_chat.add_argument("--topk", type=int, default=5)
+    ap_chat.add_argument(
+        "--scope",
+        choices=["auto", "policy", "global"],
+        default="auto",
+        help="검색 범위: auto(정책 있으면 적용), policy(정책 강제), global(전체)"
+    )
     translate_group_chat = ap_chat.add_mutually_exclusive_group()
     translate_group_chat.add_argument(
         "--translate",
@@ -943,6 +1109,11 @@ def main():
     )
     ap_chat.add_argument("--show-translation", action="store_true", help="검색 결과에 번역본을 함께 표시합니다.")
     ap_chat.add_argument("--translation-lang", default="en", help="번역 대상 언어 코드 (기본: en)")
+    ap_chat.add_argument(
+        "--policy",
+        default=str(DEFAULT_POLICY_PATH),
+        help="스마트 폴더 정책 파일 경로 (비활성화하려면 'none').",
+    )
     ap_chat.set_defaults(translate=False)
     ap_chat.set_defaults(auto_train=True)
     ap_chat.set_defaults(rerank=True)
@@ -957,6 +1128,11 @@ def main():
     ap_watch.add_argument("--cache", default="./index_cache")
     ap_watch.add_argument("--debounce-ms", type=int, default=2000, help="파일 이벤트 디바운스 시간(ms)")
     ap_watch.add_argument("--translate", action="store_true", help="증분 추출 시 번역을 포함합니다.")
+    ap_watch.add_argument(
+        "--policy",
+        default=str(DEFAULT_POLICY_PATH),
+        help="스마트 폴더 정책 파일 경로 (비활성화하려면 'none').",
+    )
     ap_watch.set_defaults(func=cmd_watch)
 
     args = ap.parse_args()

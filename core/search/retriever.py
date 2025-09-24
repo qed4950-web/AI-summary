@@ -68,7 +68,7 @@ try:
 except Exception:
     BM25Okapi = None
 
-from index_manager import IndexManager
+from .index_manager import IndexManager
 
 MODEL_TEXT_COLUMN = "text_model"
 MODEL_TYPE_SENTENCE_TRANSFORMER = "sentence-transformer"

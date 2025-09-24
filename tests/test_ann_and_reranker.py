@@ -8,7 +8,7 @@ import numpy as np
 import pytest
 from fastapi.testclient import TestClient
 
-from retriever import (
+from infopilot_core.search.retriever import (
     EarlyStopConfig,
     Retriever,
     SessionState,
