@@ -1,0 +1,27 @@
+appId: com.ai-summary.toolbar
+productName: AI Summary Toolbar
+files:
+  - "**/*"
+  - "!node_modules/.cache"
+  - "!dist"
+mac:
+  category: public.app-category.utilities
+  artifactName: "AI-Summary-Toolbar-${version}-mac.${ext}"
+win:
+  target:
+    - nsis
+  artifactName: "AI-Summary-Toolbar-${version}-win.${ext}"
+linux:
+  target:
+    - AppImage
+  artifactName: "AI-Summary-Toolbar-${version}-linux.${ext}"
+extraMetadata:
+  version: "0.1.0"
+
+nsis:
+  oneClick: false
+  allowToChangeInstallationDirectory: true
+
+directories:
+  output: dist
+  buildResources: build-resources

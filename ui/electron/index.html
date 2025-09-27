@@ -1,0 +1,105 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Floating Toolbar</title>
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <div class="toolbar">
+      <div class="toolbar__left">
+        <button class="icon" data-action="mic" title="Record Voice">
+          <span aria-hidden="true">🎤</span>
+          <span class="visually-hidden">Start or stop voice capture</span>
+        </button>
+        <button class="icon" data-action="smart-folders" title="Smart folders">
+          <span aria-hidden="true">🗂️</span>
+          <span class="visually-hidden">Open smart folders</span>
+        </button>
+      </div>
+
+      <form class="command" id="command-form">
+        <input
+          type="text"
+          name="command"
+          id="command-input"
+          placeholder="무엇을 도와드릴까요? 예: 2019년 8월 회의록 요약해줘"
+          autocomplete="off"
+        />
+        <button type="submit" class="icon submit" title="Run command">
+          <span aria-hidden="true">➤</span>
+          <span class="visually-hidden">Run command</span>
+        </button>
+      </form>
+
+      <div class="toolbar__right">
+        <button class="icon" data-action="copy" title="Copy Latest Summary">
+          <span aria-hidden="true">📋</span>
+          <span class="visually-hidden">Copy latest summary</span>
+        </button>
+        <button class="icon" data-action="settings" title="Open Settings">
+          <span aria-hidden="true">⚙️</span>
+          <span class="visually-hidden">Open settings dialog</span>
+        </button>
+        <button class="icon close" title="Close">
+          <span aria-hidden="true">✖</span>
+          <span class="visually-hidden">Close toolbar</span>
+        </button>
+      </div>
+
+      <div class="status" role="status" aria-live="polite"></div>
+    </div>
+
+    <aside class="smart-folders" id="smart-folders" hidden>
+      <header>
+        <h2>스마트 폴더</h2>
+        <button class="icon close" data-action="close-smart-folders" title="Close smart folders">
+          <span aria-hidden="true">✖</span>
+          <span class="visually-hidden">Close smart folders</span>
+        </button>
+      </header>
+      <ul class="smart-folders__list" id="smart-folder-list" role="list"></ul>
+      <footer>
+        <small>폴더를 선택하면 해당 범위 안에서 회의 요약/지식 검색을 수행합니다.</small>
+      </footer>
+    </aside>
+
+    <aside class="meeting-summary" id="meeting-summary" hidden>
+      <header>
+        <div>
+          <h2>회의 요약</h2>
+          <p class="meeting-summary__folder"></p>
+        </div>
+        <button class="icon close" data-action="close-meeting-summary" title="Close meeting summary">
+          <span aria-hidden="true">✖</span>
+          <span class="visually-hidden">Close meeting summary</span>
+        </button>
+      </header>
+      <section class="meeting-summary__content">
+        <p class="meeting-summary__text">요약 내용이 여기에 표시됩니다.</p>
+        <h3>주요 하이라이트</h3>
+        <ul class="meeting-summary__highlights"></ul>
+        <h3>액션 아이템</h3>
+        <ul class="meeting-summary__actions"></ul>
+      </section>
+    </aside>
+
+    <aside class="knowledge-results" id="knowledge-results" hidden>
+      <header>
+        <div>
+          <h2>검색 결과</h2>
+          <p class="knowledge-results__folder"></p>
+        </div>
+        <button class="icon close" data-action="close-knowledge-results" title="Close knowledge results">
+          <span aria-hidden="true">✖</span>
+          <span class="visually-hidden">Close knowledge results</span>
+        </button>
+      </header>
+      <section class="knowledge-results__content">
+        <ul class="knowledge-results__list"></ul>
+      </section>
+    </aside>
+
+    <script src="renderer.js"></script>
+  </body>
+</html>

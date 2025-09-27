@@ -1,0 +1,17 @@
+{
+  "name": "ai-summary-floating-toolbar",
+  "version": "0.1.0",
+  "description": "Floating toolbar prototype for the AI Summary desktop assistant (Electron demo).",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "build": "electron-builder --dir",
+    "build:win": "electron-builder --win",
+    "build:mac": "electron-builder --mac",
+    "build:linux": "electron-builder --linux"
+  },
+  "devDependencies": {
+    "electron": "^32.1.2",
+    "electron-builder": "^25.1.6"
+  }
+}
