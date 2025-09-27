@@ -11,6 +11,15 @@
 - [ ] 회의 로그 저장 포맷 정의 및 인덱싱 파이프라인 통합
 - [ ] 작업 센터/알림 경로 프로토타입
 
+#### 2025-09-27 업데이트
+- Whisper diarization 정규화를 도입해 STT 세그먼트의 화자 라벨과 타임스탬프를 정제하고 연속 발화를 병합.
+- KoBART·Ollama·BitNet으로 확장 가능한 요약 백엔드 팩토리를 추가하고, UI에서 진단 가능한 상태 확인 API를 노출.
+- 입력 오디오 지문 기반 캐시를 적용해 동일 회의 반복 실행 시 산출물을 재사용하며, 파이프라인 테스트를 회귀 케이스로 보강.
+- MeetingScreen에 Whisper/요약 백엔드 가용성 표시 및 새로고침 버튼을 추가해 사용자 진단을 지원.
+- `MEETING_MASK_PII` 옵션으로 이메일/전화번호를 자동 마스킹하고, 다국어 키워드·품질 지표·JSONL 지표까지 저장해 후속 검색·모니터링을 준비.
+- 장시간 회의를 위해 `MEETING_STT_CHUNK_SECONDS` 기반 chunk STT 재시도 로직을 추가하고, 실패 시 자동으로 분할 전사를 수행하도록 보완.
+- 액션 아이템을 `tasks.json`, 회의 이벤트를 `meeting.ics`, 연동 정보를 `integrations.json`으로 출력해 캘린더/업무 도구에 곧바로 가져갈 수 있도록 구조화했습니다.
+
 ### 산출물
 - 에이전트 모델/파이프라인: `infopilot_core/agents/meeting/models.py`, `.../pipeline.py`
 - 기본 설정 템플릿: `config/meeting_agent.yaml`

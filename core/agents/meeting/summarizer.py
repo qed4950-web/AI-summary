@@ -1,15 +1,30 @@
-"""Summarisation helpers for the meeting agent."""
+"""Summarisation helpers and backends for the meeting agent."""
 from __future__ import annotations
 
+import importlib.util
 import logging
 import os
 import re
+import shutil
+import subprocess
+import textwrap
 from dataclasses import dataclass
-from typing import Callable, List
+from typing import Callable, Dict, List, Optional, Protocol
 
 LOGGER = logging.getLogger(__name__)
 
 SENTENCE_SPLIT = re.compile(r"(?<=[.!?\n])\s+")
+DEFAULT_OLLAMA_PROMPT = textwrap.dedent(
+    """
+    You are a helpful meeting assistant.
+    Summarise the following meeting transcript in the user's language.
+    Highlight key decisions and actionable follow-up items.
+    Respond using concise bullet points.
+
+    Transcript:
+    {transcript}
+    """
+)
 
 
 def _int_env(name: str, default: int) -> int:
@@ -25,10 +40,31 @@ def _int_env(name: str, default: int) -> int:
 
 @dataclass
 class SummariserConfig:
+    """Common configuration shared by the supported summariser backends."""
+
     model_name: str = os.getenv("MEETING_SUMMARY_MODEL", "gogamza/kobart-base-v2")
     max_length: int = _int_env("MEETING_SUMMARY_MAXLEN", 128)
     min_length: int = _int_env("MEETING_SUMMARY_MINLEN", 32)
     chunk_char_limit: int = _int_env("MEETING_SUMMARY_CHUNK_CHARS", 1800)
+
+    ollama_model: str = os.getenv("MEETING_SUMMARY_OLLAMA_MODEL", "llama3")
+    ollama_host: str = os.getenv("MEETING_SUMMARY_OLLAMA_HOST", "")
+    ollama_prompt: str = os.getenv("MEETING_SUMMARY_OLLAMA_PROMPT", DEFAULT_OLLAMA_PROMPT)
+
+    bitnet_model: str = os.getenv("MEETING_SUMMARY_BITNET_MODEL", "bitnet/b1.58-instruct")
+    bitnet_max_length: int = _int_env("MEETING_SUMMARY_BITNET_MAXLEN", 220)
+    bitnet_min_length: int = _int_env("MEETING_SUMMARY_BITNET_MINLEN", 60)
+
+
+class BaseSummariser(Protocol):
+    """Protocol describing the summariser interface."""
+
+    def summarise(self, text: str) -> str:
+        ...
+
+    @staticmethod
+    def is_available() -> bool:
+        ...
 
 
 class KoBARTSummariser:
@@ -37,6 +73,10 @@ class KoBARTSummariser:
     def __init__(self, config: SummariserConfig | None = None) -> None:
         self.config = config or SummariserConfig()
         self._pipeline = None
+
+    @staticmethod
+    def is_available() -> bool:
+        return importlib.util.find_spec("transformers") is not None
 
     def _ensure_pipeline(self):
         if self._pipeline is not None:
@@ -126,3 +166,148 @@ class KoBARTSummariser:
             chunks.append(" ".join(current))
 
         return chunks or [text]
+
+
+class OllamaSummariser:
+    """Summariser that delegates to a locally running Ollama server/CLI."""
+
+    def __init__(self, config: SummariserConfig | None = None) -> None:
+        self.config = config or SummariserConfig()
+        self._ollama_cmd = shutil.which("ollama")
+
+    @staticmethod
+    def is_available() -> bool:
+        return shutil.which("ollama") is not None
+
+    def summarise(self, text: str) -> str:
+        text = (text or "").strip()
+        if not text:
+            return ""
+        if not self._ollama_cmd:
+            raise RuntimeError("ollama executable not detected")
+
+        prompt_template = self.config.ollama_prompt or DEFAULT_OLLAMA_PROMPT
+        prompt = prompt_template.format(transcript=text)
+        env = os.environ.copy()
+        if self.config.ollama_host:
+            env["OLLAMA_HOST"] = self.config.ollama_host
+
+        try:
+            result = subprocess.run(
+                ["ollama", "run", self.config.ollama_model],
+                input=prompt,
+                capture_output=True,
+                text=True,
+                env=env,
+                check=False,
+            )
+        except FileNotFoundError as exc:  # pragma: no cover - defensive
+            raise RuntimeError("ollama executable not found in PATH") from exc
+
+        if result.returncode != 0:
+            stderr = (result.stderr or "").strip()
+            stdout = (result.stdout or "").strip()
+            error_text = stderr or stdout or "unknown error"
+            raise RuntimeError(f"ollama run failed ({result.returncode}): {error_text}")
+
+        return (result.stdout or "").strip()
+
+
+class BitNetSummariser:
+    """Summariser for BitNet / low-bit quantised models via HuggingFace pipeline."""
+
+    def __init__(self, config: SummariserConfig | None = None) -> None:
+        self.config = config or SummariserConfig()
+        self._pipeline = None
+
+    @staticmethod
+    def is_available() -> bool:
+        return importlib.util.find_spec("transformers") is not None
+
+    def _ensure_pipeline(self):
+        if self._pipeline is not None:
+            return self._pipeline
+
+        try:
+            from transformers import pipeline  # type: ignore
+        except ImportError as exc:  # pragma: no cover - optional dependency
+            raise RuntimeError("transformers is required for BitNet summarisation") from exc
+
+        LOGGER.info("Loading BitNet summariser model: %s", self.config.bitnet_model)
+        self._pipeline = pipeline(
+            "summarization",
+            model=self.config.bitnet_model,
+            tokenizer=self.config.bitnet_model,
+        )
+        return self._pipeline
+
+    def summarise(self, text: str) -> str:
+        text = (text or "").strip()
+        if not text:
+            return ""
+
+        pipeline = self._ensure_pipeline()
+        try:
+            result: List[dict] = pipeline(
+                text,
+                max_length=self.config.bitnet_max_length,
+                min_length=self.config.bitnet_min_length,
+                do_sample=False,
+            )
+        except Exception as exc:  # pragma: no cover - inference guard
+            LOGGER.exception("BitNet summarisation failed: %s", exc)
+            return ""
+
+        if not result:
+            return ""
+        return (result[0].get("summary_text") or "").strip()
+
+
+_SUMMARY_BACKEND_ALIASES = {
+    "kobart": "kobart",
+    "kobart_chunk": "kobart",
+    "ollama": "ollama",
+    "bitnet": "bitnet",
+}
+_SUMMARY_BACKENDS = {
+    "kobart": KoBARTSummariser,
+    "ollama": OllamaSummariser,
+    "bitnet": BitNetSummariser,
+}
+
+
+def create_summary_backend(name: str | None, config: SummariserConfig | None = None) -> Optional[BaseSummariser]:
+    """Instantiate the configured summary backend, returning ``None`` for heuristics."""
+
+    if not name:
+        return None
+
+    key = _SUMMARY_BACKEND_ALIASES.get(name.lower().strip(), name.lower().strip())
+    if key in {"heuristic", "none", "placeholder"}:
+        return None
+    backend_cls = _SUMMARY_BACKENDS.get(key)
+    if backend_cls is None:
+        LOGGER.warning("Unknown summary backend '%s'; using heuristic summary", name)
+        return None
+
+    try:
+        return backend_cls(config)
+    except RuntimeError as exc:  # pragma: no cover - optional dependency
+        LOGGER.warning("%s summariser unavailable: %s", key, exc)
+        return None
+
+
+def available_summary_backends() -> Dict[str, bool]:
+    """Return availability information for the known summary backends."""
+
+    availability: Dict[str, bool] = {"heuristic": True}
+    for alias, key in _SUMMARY_BACKEND_ALIASES.items():
+        backend_cls = _SUMMARY_BACKENDS.get(key)
+        if backend_cls is None:
+            availability[alias] = False
+            continue
+        try:
+            availability[alias] = bool(getattr(backend_cls, "is_available")())
+        except Exception:  # pragma: no cover - defensive
+            availability[alias] = False
+    return availability

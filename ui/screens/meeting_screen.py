@@ -12,7 +12,7 @@ import customtkinter as ctk
 from tkinter import filedialog
 
 from core.agents.meeting.models import MeetingJobConfig
-from core.agents.meeting.pipeline import MeetingPipeline
+from core.agents.meeting.pipeline import MeetingPipeline, get_backend_diagnostics
 from src.config import MEETING_OUTPUT_DIR
 
 
@@ -171,11 +171,28 @@ class MeetingScreen(ctk.CTkFrame):
         )
         help_label.grid(row=2, column=0, columnspan=2, pady=(6, 0), sticky="w")
 
+        diag_row = ctk.CTkFrame(self.form_frame, fg_color="transparent")
+        diag_row.grid(row=4, column=1, padx=12, pady=(0, 8), sticky="ew")
+        diag_row.grid_columnconfigure(0, weight=1)
+        self.backend_status_label = ctk.CTkLabel(
+            diag_row,
+            text="백엔드 상태 확인 중...",
+            anchor="w",
+        )
+        self.backend_status_label.grid(row=0, column=0, sticky="w")
+        ctk.CTkButton(
+            diag_row,
+            text="상태 새로고침",
+            width=120,
+            command=self.refresh_backend_status,
+        ).grid(row=0, column=1, padx=(12, 0))
+
         self.on_stt_backend_change("auto")
+        self.refresh_backend_status()
 
         # Diarisation controls
         diar_row = ctk.CTkFrame(self.form_frame, fg_color="transparent")
-        diar_row.grid(row=4, column=1, padx=12, pady=8, sticky="ew")
+        diar_row.grid(row=5, column=1, padx=12, pady=8, sticky="ew")
         diar_row.grid_columnconfigure(1, weight=1)
         self.diarize_switch = ctk.CTkSwitch(diar_row, text="화자 분리(실험적)", command=self.on_toggle_diarize)
         self.diarize_switch.grid(row=0, column=0, sticky="w")
@@ -191,7 +208,7 @@ class MeetingScreen(ctk.CTkFrame):
 
         # Action buttons
         button_row = ctk.CTkFrame(self.form_frame, fg_color="transparent")
-        button_row.grid(row=5, column=1, padx=12, pady=(8, 12), sticky="ew")
+        button_row.grid(row=6, column=1, padx=12, pady=(8, 12), sticky="ew")
         button_row.grid_columnconfigure(0, weight=1)
         self.run_button = ctk.CTkButton(button_row, text="회의 요약 실행", command=self.start_meeting_job)
         self.run_button.grid(row=0, column=0, sticky="ew")
@@ -242,6 +259,33 @@ class MeetingScreen(ctk.CTkFrame):
         directory = filedialog.askdirectory(title="출력 폴더 선택")
         if directory:
             self.output_dir_var.set(directory)
+
+    def refresh_backend_status(self) -> None:
+        try:
+            diagnostics = get_backend_diagnostics()
+        except Exception as exc:  # pragma: no cover - UI feedback
+            self.backend_status_label.configure(text=f"상태 확인 실패: {exc}")
+            return
+
+        whisper_available = diagnostics.get("stt", {}).get("whisper", False)
+        summary_status = diagnostics.get("summary", {})
+        resource_status = diagnostics.get("resources", {})
+
+        whisper_text = "사용 가능" if whisper_available else "미설치"
+        summary_parts = []
+        for name, available in sorted(summary_status.items()):
+            status = "OK" if available else "X"
+            summary_parts.append(f"{name}:{status}")
+        summary_text = ", ".join(summary_parts) if summary_parts else "정보 없음"
+
+        gpu_text = "GPU 사용 가능" if resource_status.get("gpu_available") else "GPU 없음"
+        device_name = resource_status.get("cuda_device_name")
+        if device_name:
+            gpu_text += f" ({device_name})"
+
+        self.backend_status_label.configure(
+            text=f"Whisper: {whisper_text} | 요약: {summary_text} | 자원: {gpu_text}"
+        )
 
     def on_toggle_diarize(self) -> None:
         enabled = self.diarize_switch.get() == 1

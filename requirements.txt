@@ -37,3 +37,5 @@ tqdm>=4.66,<5
 pytest>=8.0,<9
 jsonschema>=4.18.0,<5
 customtkinter>=5.2,<6
+fastapi>=0.117,<0.118   # 테스트용 API 서버 의존성
+httpx>=0.28,<0.29       # FastAPI TestClient 의존성
