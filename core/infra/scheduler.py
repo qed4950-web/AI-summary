@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence
 
-from infopilot_core.utils import get_logger
+from core.utils import get_logger
 
 LOGGER = get_logger("infra.scheduler")
 

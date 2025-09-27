@@ -6,7 +6,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict
 
-from infopilot_core.utils import get_logger
+from core.utils import get_logger
 
 LOGGER = get_logger("infra.audit")
 

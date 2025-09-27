@@ -9,9 +9,9 @@
 
    ## Project Structure & Module Organization
    - `infopilot.py` orchestrates the CLI scan/train/chat flow and wires the supporting modules.
-   - `infopilot_core/data_pipeline/filefinder.py` performs cross-platform scans and writes candidate metadata to CSV during Step 1.
-   - `infopilot_core/data_pipeline/pipeline.py` builds the cleaned corpus and topic model artifacts stored in `data/`.
-   - `infopilot_core/search/retriever.py` and `infopilot_core/conversation/lnp_chat.py` load the trained model, manage `index_cache/`, and drive the interactive chat.
+   - `core/data_pipeline/filefinder.py` performs cross-platform scans and writes candidate metadata to CSV during Step 1.
+   - `core/data_pipeline/pipeline.py` builds the cleaned corpus and topic model artifacts stored in `data/`.
+   - `core/search/retriever.py` and `core/conversation/lnp_chat.py` load the trained model, manage `index_cache/`, and drive the interactive chat.
    - `data/` hosts generated corpora and models; `models/` is reserved for packaged exports.
 
    ## Build, Test, and Development Commands
@@ -69,10 +69,10 @@ Append new entries below with timestamps in the same format to keep this log cur
    - `UPDATE_EXECUTION_GUIDE.md:1-83` explains how to re-run the project after changes, including virtual-environment setup plus macOS, Windows (PowerShell/CMD), and WSL/Linux specifics.
 
    Why `fastparquet` keeps failing:
-   - The code writes parquet with `pandas.DataFrame.to_parquet` (`infopilot_core/data_pipeline/pipeline.py:847-858`). Pandas needs either `pyarrow` or `fastparquet`; if neither is available, it throws an engine error and the pipeline falls back to CSV. Installing one of those engines (binary wheels exist for most OSes) or forcing CSV output resolves it. Compilation failures usually mean missing build tools (Xcode CLT on macOS, MSVC Build Tools on Windows).
+   - The code writes parquet with `pandas.DataFrame.to_parquet` (`core/data_pipeline/pipeline.py:847-858`). Pandas needs either `pyarrow` or `fastparquet`; if neither is available, it throws an engine error and the pipeline falls back to CSV. Installing one of those engines (binary wheels exist for most OSes) or forcing CSV output resolves it. Compilation failures usually mean missing build tools (Xcode CLT on macOS, MSVC Build Tools on Windows).
 
    Why `deep-translator` fails:
-   - Translator support is optional (`infopilot_core/data_pipeline/pipeline.py:672-681`, `infopilot_core/conversation/lnp_chat.py:82-90`). Errors appear if the library is missing or if it cannot reach the external translation APIs—common in offline or firewalled environments, or when network access is disabled. Use the default multilingual embeddings, or enable `--translate` only after ensuring outbound HTTPS access.
+   - Translator support is optional (`core/data_pipeline/pipeline.py:672-681`, `core/conversation/lnp_chat.py:82-90`). Errors appear if the library is missing or if it cannot reach the external translation APIs—common in offline or firewalled environments, or when network access is disabled. Use the default multilingual embeddings, or enable `--translate` only after ensuring outbound HTTPS access.
 
    Next steps:
    1. Install `pyarrow` or `fastparquet` inside the active virtualenv and rerun `python infopilot.py train …` if parquet output is required.
@@ -85,11 +85,11 @@ Append new entries below with timestamps in the same format to keep this log cur
     - `UPDATE_EXECUTION_GUIDE.md:1-83`에서 가상환경 생성·활성화, macOS/Windows/WSL 별 설치 및 실행 절차, 업데이트 후 검증 플로우(pytest, scan/train/chat 재실행)까지 정리했어요.
 
     **fastparquet 오류 원인**  
-    - `infopilot_core/data_pipeline/pipeline.py:847-858`에서 `pandas.DataFrame.to_parquet`가 `pyarrow`나 `fastparquet` 같은 엔진을 요구하는데, 엔진이 없거나 설치가 실패하면 예외가 발생하고 CSV로 폴백돼요.  
+    - `core/data_pipeline/pipeline.py:847-858`에서 `pandas.DataFrame.to_parquet`가 `pyarrow`나 `fastparquet` 같은 엔진을 요구하는데, 엔진이 없거나 설치가 실패하면 예외가 발생하고 CSV로 폴백돼요.  
     - macOS는 Xcode CLT, Windows는 MSVC Build Tools, Linux/WSL은 `build-essential` 등이 없으면 빌드가 실패하는 경우가 많아요. 휠이 제공되는 버전을 선택하거나 CSV 저장을 유지해 문제를 피할 수 있어요.
 
     **deep-translator 오류 원인**  
-    - `infopilot_core/data_pipeline/pipeline.py:672-681`와 `infopilot_core/conversation/lnp_chat.py:82-90`에서 번역 옵션을 켤 때 `deep-translator`를 임포트·초기화합니다. 패키지가 없거나 외부 번역 API에 접속할 수 없는 환경(오프라인, 방화벽, 네트워크 제한)에서는 예외가 나면서 번역 기능이 비활성화돼요.  
+    - `core/data_pipeline/pipeline.py:672-681`와 `core/conversation/lnp_chat.py:82-90`에서 번역 옵션을 켤 때 `deep-translator`를 임포트·초기화합니다. 패키지가 없거나 외부 번역 API에 접속할 수 없는 환경(오프라인, 방화벽, 네트워크 제한)에서는 예외가 나면서 번역 기능이 비활성화돼요.  
     - 기본값은 번역 비활성 상태이니 다국어 Sentence-BERT로 그대로 사용하거나, 필요하면 `--translate`/`--show-translation` 옵션을 추가하고 네트워크 접근을 허용하세요.
 
     **다음 단계 제안**  
@@ -106,7 +106,7 @@ Append new entries below with timestamps in the same format to keep this log cur
 14. [2025-09-21 23:05:00] User: 현재문제점
 15. [2025-09-21 23:05:05] User: 의미검색만사용
 16. [2025-09-21 23:05:15] Assistant:
-    `infopilot_core/search/retriever.py`가 `_LEXICAL_WEIGHT = 0.0`으로 고정돼 있어 BM25가 배제되고, 검색이 SBERT 임베딩만으로 수행된다고 진단했습니다. 하이브리드 검색을 복구하려면 `_LEXICAL_WEIGHT`나 `--lexical-weight`를 높이라고 안내했습니다.
+    `core/search/retriever.py`가 `_LEXICAL_WEIGHT = 0.0`으로 고정돼 있어 BM25가 배제되고, 검색이 SBERT 임베딩만으로 수행된다고 진단했습니다. 하이브리드 검색을 복구하려면 `_LEXICAL_WEIGHT`나 `--lexical-weight`를 높이라고 안내했습니다.
 17. [2025-09-21 23:06:00] User: SBERT 임베딩만으로코사인유사도계산→단어가조금이라도비슷하면관련없는문서도상위에노출됨 / .Reranker 미사용
 18. [2025-09-21 23:06:10] Assistant:
     코사인 유사도만으로 순위가 결정되고 재랭커가 비활성화된 상황을 설명하고, `--lexical-weight`와 `--rerank`/`--rerank-depth` 옵션을 사용해 하이브리드+Cross-Encoder 전략을 제안했습니다.
@@ -130,7 +130,7 @@ Append new entries below with timestamps in the same format to keep this log cur
     `Retriever`와 CLI 기본값을 조정해 Cross-Encoder rerank 및 0.35 컷오프를 기본 적용했고, 관련 테스트를 재실행했습니다.
 31. [2025-09-21 23:22:00] User: chunk 크기를 200~500 tokens로통일 / 과도한 stopword/불용어제거추가 / 검색 결과출력개선
 32. [2025-09-21 23:22:30] Assistant:
-    `infopilot_core/data_pipeline/pipeline.py`에서 200~500 토큰 청크와 확장 스톱워드 필터를 강제했고, `infopilot_core/conversation/lnp_chat.py` 출력에 점수 breakdown과 근거 문장을 추가했다고 보고했습니다.
+    `core/data_pipeline/pipeline.py`에서 200~500 토큰 청크와 확장 스톱워드 필터를 강제했고, `core/conversation/lnp_chat.py` 출력에 점수 breakdown과 근거 문장을 추가했다고 보고했습니다.
 33. [2025-09-21 23:27:00] User: 점수낮으면“관련없음”표시 / 쿼리와매칭된문장 highlight기능추가 / 🚀개선전략
 34. [2025-09-21 23:27:10] Assistant:
     낮은 점수 라벨링과 문장 하이라이트, 테스트 추가를 다음 개선 단계로 제안했습니다.

@@ -3,33 +3,94 @@ AI 요약 소프트웨어를 구축하고 학습·조회 파이프라인을 돌�
 
 ## 프로젝트 개요
 - `infopilot.py` : `scan → train → chat` 절차를 오케스트레이션하는 CLI 진입점
-- `infopilot_core/data_pipeline/filefinder.py` : 파일 시스템을 스캔해 후보 목록을 CSV로 저장
-- `infopilot_core/data_pipeline/pipeline.py` : 코퍼스 정제 및 토픽 모델 학습, Parquet/CSV 아티팩트 생성
-- `infopilot_core/search/retriever.py` / `infopilot_core/conversation/lnp_chat.py` : 학습된 모델을 불러와 쿼리 검색 및 대화 인터페이스 제공
-- `infopilot_core/agents/meeting/` : 회의 비서(STT→요약) 파이프라인 초안과 설정이 위치
-- `infopilot_core/agents/photo/` : 사진 비서(태깅·중복 정리) MVP 골격과 설정 템플릿 제공
-- `infopilot_core/infra/` : 하이브리드 오프로딩/감사 로깅/모델 선택 유틸리티
+- `core/data_pipeline/filefinder.py` : 파일 시스템을 스캔해 후보 목록을 CSV로 저장
+- `core/data_pipeline/pipeline.py` : 코퍼스 정제 및 토픽 모델 학습, Parquet/CSV 아티팩트 생성
+- `core/search/retriever.py` / `core/conversation/lnp_chat.py` : 학습된 모델을 불러와 쿼리 검색 및 대화 인터페이스 제공
+- `core/agents/meeting/` : 회의 비서(STT→요약) 파이프라인 초안과 설정이 위치
+- `core/agents/photo/` : 사진 비서(태깅·중복 정리) MVP 골격과 설정 템플릿 제공
+- `core/infra/` : 하이브리드 오프로딩/감사 로깅/모델 선택 유틸리티
 - `data/`, `index_cache/` : 생성된 코퍼스와 캐시가 위치하는 디렉터리 (대용량 파일은 커밋 금지)
+
+## 리포지토리 구조
+
+```
+AI-summary/
+├─ core/          # 엔진, 파이프라인, 에이전트 구현
+│  ├─ agents/     # 회의/검색/사진 등 도메인별 에이전트
+│  ├─ conversation/
+│  ├─ data_pipeline/
+│  ├─ infra/
+│  ├─ search/
+│  ├─ utils/
+│  └─ legacy/     # 이전 백엔드/패키지(backend, core, src)
+├─ ui/            # 데스크톱 UI (CustomTkinter)
+│  ├─ app.py
+│  └─ legacy/web_frontend/   # React 기반 기존 UI
+├─ data/          # 실행 중 생성되는 캐시/산출물 (Git 무시)
+│  ├─ ami_outputs/
+│  ├─ artifacts/
+│  ├─ index_cache/
+│  ├─ build/, dist/
+│  └─ tools/
+├─ models/        # 모델 체크포인트 캐시 (Git 무시)
+├─ scripts/       # CLI·런처·빌드 스크립트
+│  ├─ infopilot.py
+│  ├─ launch_desktop.py
+│  ├─ packaging/
+│  └─ …
+├─ docs/          # 설계·로드맵·벤치마크 등 문서
+│  ├─ benchmarks/
+│  └─ notes/
+├─ tests/
+└─ README.md
+```
+
+`.gitignore`에는 `data/` 전체와 `models/` 폴더가 포함되어 있으므로, `ami_outputs`, `artifacts`, `index_cache`, `build`, `dist`, 모델 체크포인트 같은 대용량 산출물이 Git에 올라가지 않습니다. 필요하다면 `data/.gitkeep` 등 빈 파일을 추가해 디렉터리 구조만 유지할 수 있습니다.
 
 ## 핵심 명령
 | 단계 | 명령 | 설명 |
 | --- | --- | --- |
-| 스캔 | `python infopilot.py scan --out data/found_files.csv` | 새/변경 파일 메타데이터 수집 |
-| 학습 | `python infopilot.py train --scan_csv data/found_files.csv --corpus data/corpus.parquet` | 코퍼스 및 토픽 모델 생성 |
-| 대화 | `python infopilot.py chat --model data/topic_model.joblib --corpus data/corpus.parquet --cache index_cache` | 의미 기반 검색 챗봇 실행 (`--translate`, `--show-translation`, `--lexical-weight` 옵션 지원) |
-| 감시 | `python infopilot.py watch --cache index_cache --corpus data/corpus.parquet --model data/topic_model.joblib` | 파일 변경을 감지해 코퍼스·FAISS 인덱스를 실시간으로 증분 갱신 |
-| 예약 | `python infopilot.py schedule --policy config/smart_folders.json` | 스마트 폴더 정책의 예약 스캔/학습을 실행하고 모니터링 |
+| 스캔 | `python scripts/infopilot.py scan --out data/found_files.csv` | 새/변경 파일 메타데이터 수집 |
+| 학습 | `python scripts/infopilot.py train --scan_csv data/found_files.csv --corpus data/corpus.parquet` | 코퍼스 및 토픽 모델 생성 |
+| 대화 | `python scripts/infopilot.py chat --model data/corpus/topic_model.joblib --corpus data/corpus.parquet --cache data/index_cache` | 의미 기반 검색 챗봇 실행 (`--translate`, `--show-translation`, `--lexical-weight` 옵션 지원) |
+| 감시 | `python scripts/infopilot.py watch --cache data/index_cache --corpus data/corpus.parquet --model data/corpus/topic_model.joblib` | 파일 변경을 감지해 코퍼스·FAISS 인덱스를 실시간으로 증분 갱신 |
+| 예약 | `python scripts/infopilot.py schedule --policy core/config/smart_folders.json` | 스마트 폴더 정책의 예약 스캔/학습을 실행하고 모니터링 |
 
 파이프라인실행
-python infopilot.py pipeline --corpus data/corpus.parquet --model data/topic_model.joblib
+python scripts/infopilot.py pipeline --corpus data/corpus.parquet --model data/corpus/topic_model.joblib
 
 ## 데스크톱 UI 실행
-- `python ui/app.py`로 데스크톱 런처를 실행하면 하나의 창에서 주요 기능을 모두 사용할 수 있습니다.
+- `python scripts/launch_desktop.py` (또는 개발 환경에서는 `python ui/app.py`)로 데스크톱 런처를 실행하면 하나의 창에서 주요 기능을 모두 사용할 수 있습니다.
   - 홈 대시보드: 코퍼스/모델 준비 상태 확인 및 빠른 이동 카드
   - 지식·검색 비서: 의미 검색과 필터, 결과 미리보기
   - 전체 학습 / 증분 업데이트: 기존 CLI 파이프라인을 GUI에서 실행
   - 회의 비서 MVP: 오디오·전사 파일 요약, 액션 아이템·결정 사항 추출, 결과 폴더 저장
   - 사진 비서 MVP: 폴더 스캔, 중복 그룹·베스트샷 추천, `photo_report.json` 생성
+- 회의 비서를 사용하려면 `pip install -r requirements_win313.txt torch`로 필수 의존성을 준비하고, 다음 환경 변수를 설정하세요.
+  - `MEETING_OUTPUT_DIR`: 회의별 산출물을 저장할 루트 경로 (예: `C:\python\github\AI-summary\ami_outputs`).
+  - `MEETING_ANALYTICS_DIR`: 대시보드와 재학습 큐를 저장할 경로. 지정하지 않으면 산출물 폴더 내 `analytics/`를 사용합니다.
+  - `MEETING_SUMMARY_MODEL`: 요약 기본 모델 경로(예: fine-tuned KoBART 체크포인트). 지정하지 않으면 기본값 `gogamza/kobart-base-v2`.
+  - 선택 옵션: `MEETING_RETRAIN_OUTPUT_DIR`, `MEETING_AUDIT_LOG`, `MEETING_MASK_PII`, `MEETING_SAVE_TRANSCRIPT` 등.
+- 런처 실행 후 **회의 비서** 탭에서 작업하면 `summary.json`, `action_items.json`, `meeting.ics`, `analytics/dashboard.json` 등이 생성되고, UI와 `/api/meeting/dashboard`에서 결과를 확인할 수 있습니다.
+- 재학습을 돌리고 싶다면 아래 순서로 진행하세요.
+  1. 회의 실행 후 각 회의 디렉터리에 생성된 `analytics/training_queue.jsonl`을 통합합니다.
+     ```powershell
+     python -m core.agents.meeting.retraining_sync \
+       --source-root "C:\\python\\github\\AI-summary\\ami_outputs" \
+       --output-dir "C:\\python\\github\\AI-summary\\analytics"
+     ```
+  2. 미세조정을 실행합니다 (`--max-runs 0`은 큐가 빌 때까지 반복, `--watch`는 주기적으로 큐를 감시).
+     ```powershell
+     python -m core.agents.meeting.retraining_runner \
+       --mode finetune \
+       --analytics-dir "C:\\python\\github\\AI-summary\\analytics" \
+       --dataset-root "C:\\python\\github\\AI-summary\\ami_outputs" \
+       --output-root "C:\\python\\github\\AI-summary\\artifacts\\retraining" \
+       --base-model "gogamza/kobart-base-v2" \
+       --max-runs 0
+     ```
+     실행 후 각 체크포인트 폴더에 `run_summary.json`이 저장되어 최종 평가 loss 등을 확인할 수 있습니다.
+  (이전 FastAPI/React 기반 서비스는 제거했습니다. 데스크톱 앱에서 회의 분석 버튼을 통해 동일 지표를 확인할 수 있습니다.)
 - PyInstaller로 Windows용 실행 파일을 만들고 싶다면 아래 명령을 사용하세요.
   ```powershell
   python -m pip install --upgrade pip
@@ -46,7 +107,7 @@ python infopilot.py pipeline --corpus data/corpus.parquet --model data/topic_mod
 - 모든 명령은 `--policy` 옵션으로 스마트 폴더 정책(JSON) 경로를 지정할 수 있습니다. 기본값은 `config/smart_folders.json`이며, 비활성화하려면 `--policy none`을 사용하세요.
 - `chat` 명령은 추가로 `--scope` 옵션을 제공합니다. `auto`(기본)는 정책이 존재할 때만 적용, `policy`는 강제 적용, `global`은 정책을 무시하고 전역 검색을 수행합니다.
 - `schedule` 명령을 사용하면 `indexing.mode = scheduled`로 설정된 스마트 폴더를 주기적으로 스캔·학습해 별도 산출물 디렉터리에 적재할 수 있습니다 (`--output-root`로 경로 지정).
-- 정책 스키마는 `infopilot_core/data_pipeline/policies/schema/smart_folder_policy.schema.json`, 예시는 `infopilot_core/data_pipeline/policies/examples/smart_folder_policy_sample.json`에서 확인할 수 있습니다.
+- 정책 스키마는 `core/data_pipeline/policies/schema/smart_folder_policy.schema.json`, 예시는 `core/data_pipeline/policies/examples/smart_folder_policy_sample.json`에서 확인할 수 있습니다.
 - 정책이 활성화되면 Knowledge & Search 에이전트(`knowledge_search`)가 허용된 폴더만 스캔·학습·워치 대상으로 처리되며, 채팅 결과에서도 정책으로 제외된 문서 수를 안내합니다.
 
 ## 업데이트 및 검증 절차

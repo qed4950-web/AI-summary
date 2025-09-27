@@ -4,11 +4,17 @@ import json
 import os
 from pathlib import Path
 
+import argparse
+
 import pytest
 
+from core.agents.meeting import cli as meeting_cli
 from core.agents.meeting import pipeline as meeting_pipeline_module
+from core.agents.meeting.analytics import format_dashboard, load_dashboard
+from core.agents.meeting.retraining import RetrainingQueueProcessor, process_next
+from core.agents.meeting.retraining_runner import run_once
 from core.agents.meeting.stt import TranscriptionPayload
-from infopilot_core.agents.meeting import (
+from core.agents.meeting import (
     MeetingJobConfig,
     MeetingPipeline,
     MeetingTranscriptionResult,
@@ -55,6 +61,185 @@ def test_meeting_pipeline_runs(tmp_path: Path) -> None:
     assert metadata.get("feedback", {}).get("status") == "pending"
 
 
+def test_context_documents_are_packaged(tmp_path: Path) -> None:
+    audio = tmp_path / "meeting.wav"
+    audio.write_bytes(b"placeholder")
+    transcript = tmp_path / "meeting.wav.txt"
+    transcript.write_text("회의 전후 공유 자료를 확인했습니다.", encoding="utf-8")
+
+    context_dir = tmp_path / "context"
+    context_dir.mkdir()
+    (context_dir / "meeting_agenda.txt").write_text("프로젝트 범위 정리", encoding="utf-8")
+
+    output_dir = tmp_path / "out"
+    job = MeetingJobConfig(audio_path=audio, output_dir=output_dir, context_dirs=[context_dir])
+    pipeline = MeetingPipeline(stt_backend="placeholder", summary_backend="heuristic")
+
+    summary = pipeline.run(job)
+
+    attachments = summary.attachments.get("context")
+    assert attachments and attachments[0]["name"] == "meeting_agenda.txt"
+    assert (output_dir / "attachments" / "meeting_agenda.txt").exists()
+    assert summary.context and "프로젝트" in summary.context
+
+    payload = json.loads((output_dir / "summary.json").read_text(encoding="utf-8"))
+    assert "context" in payload.get("attachments", {})
+    assert payload.get("context_prompt")
+
+
+def test_meeting_analytics_outputs(tmp_path: Path, capfd) -> None:
+    audio = tmp_path / "meeting.wav"
+    audio.write_bytes(b"placeholder")
+    transcript = tmp_path / "meeting.wav.txt"
+    transcript.write_text("분석 대시보드를 위한 회의입니다.", encoding="utf-8")
+
+    output_dir = tmp_path / "out"
+    job = MeetingJobConfig(audio_path=audio, output_dir=output_dir)
+    pipeline = MeetingPipeline(stt_backend="placeholder", summary_backend="heuristic")
+
+    pipeline.run(job)
+
+    analytics_dir = output_dir / "analytics"
+    meeting_path = analytics_dir / f"{audio.stem}.json"
+    assert meeting_path.exists()
+    entry = json.loads(meeting_path.read_text(encoding="utf-8"))
+    assert entry["meeting_id"] == audio.stem
+    assert entry["speaker_stats"]
+    assert entry["counts"]["action_items"] >= 0
+
+    dashboard_path = analytics_dir / "dashboard.json"
+    assert dashboard_path.exists()
+    dashboard = json.loads(dashboard_path.read_text(encoding="utf-8"))
+    assert dashboard["total_meetings"] == 1
+    loaded_dashboard = load_dashboard(analytics_dir)
+    assert loaded_dashboard == dashboard
+    rendered = format_dashboard(loaded_dashboard)
+    assert "총 회의 수" in rendered
+
+    queue_path = analytics_dir / "training_queue.jsonl"
+    assert queue_path.exists()
+    lines = queue_path.read_text(encoding="utf-8").splitlines()
+    assert lines
+    queue_entry = json.loads(lines[0])
+    assert queue_entry["meeting_id"] == audio.stem
+
+    processor = RetrainingQueueProcessor(analytics_dir)
+    pending = processor.pending()
+    assert pending and pending[0].meeting_id == audio.stem
+    claimed = processor.claim_next()
+    assert claimed and claimed.meeting_id == audio.stem
+    processor.mark_processed(claimed, status="tested")
+
+    claimed_flag = {
+        "called": False,
+    }
+
+    queue_entry = processor.make_entry(meeting_id="manual")
+    processor.mark_processed(queue_entry, status="seed")
+
+    def fake_handler(entry):
+        claimed_flag["called"] = True
+        return "done"
+
+    # process_next should return False when queue empty
+    assert process_next(fake_handler, base_dir=analytics_dir) is False
+
+    # Reinsert an entry and verify handler path
+    entry = processor.make_entry(
+        meeting_id="reinforced",
+        summary_path="summary.json",
+        transcript_path="transcript.txt",
+        language="ko",
+    )
+    processor.enqueue(entry)
+    assert process_next(fake_handler, base_dir=analytics_dir) is True
+    assert claimed_flag["called"]
+    assert run_once(base_dir=analytics_dir, handler=fake_handler) is False
+
+    # CLI smoke checks
+    dashboard_ns = argparse.Namespace(analytics_dir=str(analytics_dir), json=False)
+    meeting_cli.dashboard_command(dashboard_ns)
+    queue_list_ns = argparse.Namespace(analytics_dir=str(analytics_dir), json=False)
+    meeting_cli.queue_list_command(queue_list_ns)
+    queue_run_ns = argparse.Namespace(analytics_dir=str(analytics_dir), status="done", echo=True)
+    meeting_cli.queue_run_command(queue_run_ns)
+    output = capfd.readouterr().out
+    assert "회의" in output or "대기" in output
+
+
+def test_context_store_and_integrations_scaffolding(tmp_path: Path, monkeypatch) -> None:
+    model_path = tmp_path / "model.bin"
+    model_path.write_bytes(b"stub")
+    rag_store = tmp_path / "rag"
+    integration_out = tmp_path / "integrations"
+    audit_log = tmp_path / "audit.jsonl"
+    context_src = tmp_path / "context_src"
+    context_src.mkdir()
+    (context_src / "notes.txt").write_text("Prior agreement on budget.", encoding="utf-8")
+
+    monkeypatch.setenv("MEETING_ONDEVICE_MODEL_PATH", str(model_path))
+    monkeypatch.setenv("MEETING_RAG_ENABLED", "1")
+    monkeypatch.setenv("MEETING_RAG_STORE", str(rag_store))
+    monkeypatch.setenv("MEETING_INTEGRATIONS_PROVIDER", "local")
+    monkeypatch.setenv("MEETING_INTEGRATIONS_OUT", str(integration_out))
+    monkeypatch.setenv("MEETING_AUDIT_LOG", str(audit_log))
+
+    audio = tmp_path / "meeting.wav"
+    audio.write_bytes(b"placeholder")
+    transcript = tmp_path / "meeting.wav.txt"
+    transcript.write_text(
+        "회의에서 액션 아이템으로 김대리가 문서를 정리하기로 했습니다. 출시 일정은 확정되었습니다.",
+        encoding="utf-8",
+    )
+
+    output_dir = tmp_path / "out"
+    job = MeetingJobConfig(
+        audio_path=audio,
+        output_dir=output_dir,
+        context_dirs=[context_src],
+    )
+
+    pipeline = MeetingPipeline(stt_backend="placeholder", summary_backend="heuristic")
+    assert pipeline._on_device_loader.is_configured()
+    summary = pipeline.run(job)
+    assert summary.highlights
+    assert pipeline._on_device_loader.load() is not None
+
+    store_file = rag_store / f"{audio.stem}.jsonl"
+    assert store_file.exists()
+    lines = store_file.read_text(encoding="utf-8").splitlines()
+    assert any("\"type\": "summary"" in line for line in lines)
+    assert any("\"type\": "transcript"" in line for line in lines)
+    integration_file = integration_out / "action_items.json"
+    assert integration_file.exists()
+
+    data = json.loads(integration_file.read_text(encoding="utf-8"))
+    assert isinstance(data, list)
+    assert data
+    assert audit_log.exists()
+    audit_lines = audit_log.read_text(encoding="utf-8").splitlines()
+    assert audit_lines
+
+
+def test_cli_ingest_single_file(tmp_path: Path, monkeypatch) -> None:
+    audio = tmp_path / "sample.wav"
+    audio.write_bytes(b"placeholder")
+    (tmp_path / "sample.wav.txt").write_text("간단한 회의 메모입니다.", encoding="utf-8")
+
+    output_dir = tmp_path / "output"
+    ns = argparse.Namespace(
+        file=str(audio),
+        input_dir=None,
+        output_dir=str(output_dir),
+        pattern="*.wav",
+        recursive=False,
+        echo=False,
+    )
+
+    meeting_cli.ingest_command(ns)
+    assert (output_dir / "sample" / "summary.json").exists()
+
+
 def test_streaming_session_finalize(tmp_path: Path) -> None:
     pipeline = MeetingPipeline(stt_backend="placeholder", summary_backend="heuristic")
     job = MeetingJobConfig(audio_path=tmp_path / "live.wav", output_dir=tmp_path / "out")
@@ -76,6 +261,36 @@ def test_streaming_session_finalize(tmp_path: Path) -> None:
     assert payload["feedback"]["status"] == "pending"
     queue_name = payload["attachments"]["feedback_queue"]
     assert (job.output_dir / queue_name).exists()
+
+
+def test_workflow_resume_skips_summary_recompute(monkeypatch, tmp_path: Path) -> None:
+    audio = tmp_path / "meeting.wav"
+    audio.write_bytes(b"placeholder")
+    transcript = tmp_path / "meeting.wav.txt"
+    transcript.write_text("테스트 회의를 진행했습니다.", encoding="utf-8")
+
+    output_dir = tmp_path / "out"
+    job = MeetingJobConfig(audio_path=audio, output_dir=output_dir, enable_resume=True)
+    pipeline = MeetingPipeline(stt_backend="placeholder", summary_backend="heuristic")
+
+    pipeline.run(job)
+    state_file = output_dir / "workflow_state.json"
+    assert state_file.exists()
+
+    original_summarise = MeetingPipeline._summarise
+
+    def fail_summarise(self, job_config, transcription, context_bundle=None):  # type: ignore[override]
+        raise AssertionError("summary recomputation should be skipped when resuming")
+
+    monkeypatch.setattr(MeetingPipeline, "_summarise", fail_summarise)
+
+    try:
+        summary = pipeline.run(job)
+    finally:
+        monkeypatch.setattr(MeetingPipeline, "_summarise", original_summarise)
+
+    assert summary.raw_summary
+    assert (output_dir / "checkpoints" / "summary.json").exists()
 
 
 @pytest.mark.full
@@ -311,6 +526,11 @@ def test_pipeline_reuses_cache(monkeypatch, tmp_path: Path) -> None:
     assert metadata.get("cache", {}).get("version") == 1
     assert (tmp_path / "meeting_vector_index.jsonl").exists()
     assert (output_dir / "tasks.json").exists()
+    action_items_path = output_dir / "action_items.json"
+    assert action_items_path.exists()
+    action_payload = json.loads(action_items_path.read_text(encoding="utf-8"))
+    assert action_payload.get("meeting_id") == "meeting"
+    assert "items" in action_payload
     assert (output_dir / "meeting.ics").exists()
 
     def fail_transcribe(self, *_args, **_kwargs):  # type: ignore[override]

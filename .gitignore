@@ -1,29 +1,32 @@
-# Bytecode
+# Bytecode / caches
 __pycache__/
 *.py[cod]
+*.pyc
+
+# Build artifacts
 dist/
 build/
 *.spec
 
-# IDE settings
-.vscode/
-.idea/
-
-# Generated artifacts
-index_cache/
-data/*.csv
-found_files.csv
+# Data & models (runtime artifacts)
+data/
+models/
+*.parquet
+*.joblib
+*.safetensors
+*.pt
+*.bin
+*.ckpt
+*.onnx
 
 # Virtual environments
 .venv/
 venv/
 
-# Model files
-*.pt
-*.bin
-*.ckpt
-*.safetensors
-*.onnx
+# IDE / editor settings
+.vscode/
+.idea/
+
+# Misc
 .cache/
-models/
-*.pyc
+found_files.csv

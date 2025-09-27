@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-from infopilot_core.utils import get_logger
+from core.utils import get_logger
 
 LOGGER = get_logger("infra.offload")
 

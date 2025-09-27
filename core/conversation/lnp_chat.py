@@ -12,8 +12,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Set, Tuple
 
-from infopilot_core.data_pipeline.policies import PolicyEngine
-from infopilot_core.search.retriever import (
+from core.data_pipeline.policies.engine import PolicyEngine
+from core.search.retriever import (
     Retriever,
     SessionState,
     _similarity_to_percent,

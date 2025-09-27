@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 
-from infopilot_core.data_pipeline.pipeline import TextCleaner
+from core.data_pipeline.pipeline import TextCleaner
 
 PII_PATTERNS = [
     re.compile(r"\d{3}-\d{2}-\d{4}"),

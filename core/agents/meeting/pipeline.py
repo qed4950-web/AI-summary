@@ -11,16 +11,32 @@ from datetime import timedelta
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
-from infopilot_core.utils import get_logger
+from core.utils import get_logger
 
+try:  # Optional dependency handled gracefully.
+    from dotenv import load_dotenv
+except ImportError:  # pragma: no cover - optional
+    load_dotenv = None
+
+if load_dotenv is not None:
+    load_dotenv()
+
+from .analytics import MeetingAnalyticsRecorder
+from .audit import MeetingAuditLogger
+from .context_adapter import ContextBundle, MeetingContextAdapter
+from .context_store import MeetingContextStore
+from .integrations import IntegrationConfig, load_provider_config, sync_action_items
+from .llm.loader import OnDeviceModelLoader
 from .models import (
     MeetingJobConfig,
     MeetingSummary,
     MeetingTranscriptionResult,
     StreamingSummarySnapshot,
 )
+from .speaker_id import SpeakerIdentifier, load_speaker_identifier
 from .stt import TranscriptionPayload, create_stt_backend
 from .summarizer import SummariserConfig, available_summary_backends, create_summary_backend
+from .workflow import MeetingWorkflowEngine
 
 LOGGER = get_logger("meeting.pipeline")
 
@@ -121,8 +137,11 @@ QUESTION_STOP_WORDS = {
 
 try:  # Optional dependency for spacing correction
     from pykospacing import Spacing  # type: ignore
-except ImportError:  # pragma: no cover - optional dependency
-    Spacing = None  # type: ignore
+except ImportError:  # pragma: no cover - optional dependency (PyPI: python <3.12)
+    try:
+        from kosspacing import Spacing  # type: ignore
+    except ImportError:  # pragma: no cover - optional dependency (PyPI: python >=3.12)
+        Spacing = None  # type: ignore
 
 try:  # Optional dependency for spell checking
     from hanspell import spell_checker  # type: ignore
@@ -185,6 +204,14 @@ class MeetingPipeline:
         chunk_env = os.getenv("MEETING_STT_CHUNK_SECONDS", "0").strip()
         self._chunk_seconds = self._coerce_positive_float(chunk_env, default=0.0)
 
+        self._speaker_identifier: Optional[SpeakerIdentifier] = load_speaker_identifier()
+        self._context_adapter = MeetingContextAdapter()
+        self._analytics_recorder = MeetingAnalyticsRecorder()
+        self._context_store = MeetingContextStore.from_env()
+        self._integration_config: Optional[IntegrationConfig] = load_provider_config()
+        self._on_device_loader = OnDeviceModelLoader.from_env()
+        self._audit_logger = MeetingAuditLogger.from_env()
+
     def start_streaming(
         self,
         job: MeetingJobConfig,
@@ -194,6 +221,8 @@ class MeetingPipeline:
         return StreamingMeetingSession(self, job, update_interval=update_interval)
 
     def run(self, job: MeetingJobConfig) -> MeetingSummary:
+        self._maybe_prepare_on_device_model()
+        workflow = MeetingWorkflowEngine(job.output_dir, enable_resume=job.enable_resume)
         LOGGER.info(
             "meeting pipeline start: audio=%s backend=%s policy=%s",
             job.audio_path,
@@ -201,18 +230,58 @@ class MeetingPipeline:
             job.policy_tag,
         )
         cached_summary = self._load_cache(job)
-        if cached_summary is not None:
+        if cached_summary is not None and not job.enable_resume:
             LOGGER.info(
                 "meeting pipeline cache hit: audio=%s summary_backend=%s",
                 job.audio_path,
                 self.summary_backend,
             )
             return cached_summary
-        transcript = self._transcribe(job)
-        summary = self._summarise(job, transcript)
+
+        transcript: Optional[MeetingTranscriptionResult] = None
+        if not workflow.should_run("transcription"):
+            transcript = workflow.load_transcription()
+        if transcript is None:
+            transcript = self._transcribe(job)
+            workflow.store_transcription(transcript)
+            workflow.mark_completed("transcription")
+
+        context_bundle: Optional[ContextBundle] = None
+        summary: Optional[MeetingSummary] = None
+        if not workflow.should_run("summary"):
+            summary = workflow.load_summary()
+            if summary is not None:
+                summary.transcript_path = job.output_dir / "transcript.txt"
+                if not isinstance(summary.attachments, dict):
+                    summary.attachments = {}
+
+        if summary is None:
+            context_bundle = self._collect_context_bundle(job)
+            summary = self._summarise(job, transcript, context_bundle)
+            workflow.store_summary(summary)
+            workflow.mark_completed("summary")
+
+        if context_bundle is None:
+            context_bundle = self._collect_context_bundle(job)
+            if context_bundle.documents and not summary.attachments.get("context"):
+                summary.attachments.setdefault("context", [])
+                summary.attachments["context"] = [
+                    {
+                        "name": doc.target_name,
+                        "kind": doc.kind,
+                        "path": f"attachments/{doc.target_name}",
+                        "preview": doc.preview,
+                    }
+                    for doc in context_bundle.documents
+                ]
+                if not summary.context:
+                    summary.context = context_bundle.summary_prompt
+
         if self._mask_pii_enabled:
             self._mask_sensitive_content(transcription=transcript, summary=summary)
+        self._sync_action_items(job, summary)
         self._persist(job, transcript, summary)
+        workflow.mark_completed("persistence")
         LOGGER.info("meeting pipeline finished: saved=%s", summary.transcript_path.parent)
         return summary
 
@@ -240,6 +309,24 @@ class MeetingPipeline:
             duration_seconds=duration,
             language=language,
         )
+
+    def _collect_context_bundle(self, job: MeetingJobConfig) -> ContextBundle:
+        try:
+            bundle = self._context_adapter.collect(
+                job_audio=job.audio_path,
+                output_dir=job.output_dir,
+                extra_dirs=job.context_dirs,
+            )
+            self._record_context(job.audio_path.stem, bundle)
+            return bundle
+        except Exception as exc:  # pragma: no cover - defensive
+            LOGGER.warning("context collection failed: %s", exc)
+            return ContextBundle(summary_prompt=None, documents=[])
+
+    def _record_context(self, meeting_id: str, bundle: ContextBundle) -> None:
+        if not self._context_store.is_enabled() or not bundle or not bundle.documents:
+            return
+        self._context_store.record_documents(meeting_id, bundle.documents)
 
     def _detect_language(self, text: str, *hints: Optional[str]) -> str:
         for hint in hints:
@@ -397,7 +484,20 @@ class MeetingPipeline:
                     }
                 )
 
-        return normalised
+        return self._apply_speaker_labels(job.audio_path, normalised)
+
+    def _apply_speaker_labels(self, audio_path: Path, segments: List[dict]) -> List[dict]:
+        if not segments:
+            return segments
+        if self._speaker_identifier is None:
+            self._speaker_identifier = load_speaker_identifier()
+        if self._speaker_identifier is None:
+            return segments
+        try:
+            return self._speaker_identifier.label_segments(audio_path, segments)
+        except Exception as exc:  # pragma: no cover - defensive guard
+            LOGGER.warning("speaker identification failed: %s", exc)
+            return segments
 
     @staticmethod
     def _safe_time(value: Optional[float], default: float) -> float:
@@ -542,16 +642,27 @@ class MeetingPipeline:
         self,
         job: MeetingJobConfig,
         transcription: MeetingTranscriptionResult,
+        context_bundle: Optional[ContextBundle] = None,
     ) -> MeetingSummary:
         language = self._map_language_code(transcription.language) or self._map_language_code(job.language) or DEFAULT_LANGUAGE
         highlight_entries = self._extract_highlights(transcription.segments, language)
         action_entries = self._extract_action_items(transcription.segments, language)
         decision_entries = self._extract_decisions(transcription.segments, language)
 
+        context_prompt = context_bundle.summary_prompt if context_bundle else None
+        summary_input = transcription.text
+        if context_prompt:
+            summary_input = (
+                "Context:\n"
+                f"{context_prompt}\n\n"
+                "Transcript:\n"
+                f"{transcription.text}"
+            )
+
         model_summary = ""
         if self._summariser is not None:
             try:
-                model_summary = self._summariser.summarise(transcription.text)
+                model_summary = self._summariser.summarise(summary_input)
             except Exception as exc:  # pragma: no cover - inference guard
                 LOGGER.warning(
                     "%s summariser failed; falling back to heuristic summary: %s",
@@ -577,6 +688,18 @@ class MeetingPipeline:
         decisions = [entry.get("text", "") for entry in decision_entries]
 
         transcript_path = job.output_dir / "transcript.txt"
+        attachments: Dict[str, List[dict]] = {}
+        if context_bundle and context_bundle.documents:
+            attachments["context"] = [
+                {
+                    "name": doc.target_name,
+                    "kind": doc.kind,
+                    "path": f"attachments/{doc.target_name}",
+                    "preview": doc.preview,
+                }
+                for doc in context_bundle.documents
+            ]
+
         return MeetingSummary(
             highlights=highlights,
             action_items=action_items,
@@ -584,7 +707,17 @@ class MeetingPipeline:
             raw_summary=raw_summary,
             transcript_path=transcript_path,
             structured_summary=structured_summary,
+            context=context_prompt,
+            attachments=attachments,
         )
+
+    def _maybe_prepare_on_device_model(self) -> None:
+        if not self._on_device_loader.is_configured():
+            return
+        try:
+            self._on_device_loader.load()
+        except Exception as exc:  # pragma: no cover - defensive
+            LOGGER.warning("failed to prepare on-device model: %s", exc)
 
     def _resolve_stt_backend(self, requested: Optional[str]) -> str:
         value = (requested or "").strip()
@@ -736,6 +869,12 @@ class MeetingPipeline:
             "pii_masked": self._mask_pii_enabled,
             "quality_metrics": self._compute_quality_metrics(transcription, summary),
         }
+        if summary.context:
+            summary_payload["context_prompt"] = summary.context
+        if summary.attachments:
+            attachments = summary_payload.setdefault("attachments", {})
+            for key, value in summary.attachments.items():
+                attachments[key] = value
         feedback_info = self._queue_feedback_request(job, summary)
         if feedback_info:
             summary_payload["feedback"] = feedback_info
@@ -771,6 +910,13 @@ class MeetingPipeline:
             encoding="utf-8",
         )
 
+        self._context_store.record_meeting_artifacts(
+            job.audio_path.stem,
+            transcription.text,
+            summary.raw_summary,
+            summary_payload.get("quality_metrics"),
+        )
+
         if self._save_transcript:
             transcript_file = job.output_dir / "transcript.json"
             transcript_entries = [
@@ -802,6 +948,16 @@ class MeetingPipeline:
 
         self._record_for_search(job, transcription, summary, summary_payload["quality_metrics"])
         self._export_integrations(job, transcription, summary)
+        self._record_analytics(job, transcription, summary, summary_payload["quality_metrics"])
+        self._record_audit(
+            job,
+            transcription,
+            summary,
+            summary_payload,
+            summary_path,
+            metadata_path,
+            segments_path,
+        )
 
     # ------------------------------------------------------------------
     # Post-processing helpers
@@ -864,7 +1020,7 @@ class MeetingPipeline:
         speakers: List[str] = []
         seen = set()
         for segment in segments:
-            speaker = segment.get("speaker")
+            speaker = segment.get("speaker_name") or segment.get("speaker")
             if not speaker or speaker in seen:
                 continue
             seen.add(speaker)
@@ -945,6 +1101,70 @@ class MeetingPipeline:
         except Exception as exc:  # pragma: no cover - diagnostic only
             LOGGER.debug("failed to record meeting entry for search: %s", exc)
 
+    def _record_analytics(
+        self,
+        job: MeetingJobConfig,
+        transcription: MeetingTranscriptionResult,
+        summary: MeetingSummary,
+        quality_metrics: Dict[str, float | int | str],
+    ) -> None:
+        try:
+            self._analytics_recorder.record(job, transcription, summary, quality_metrics)
+        except Exception as exc:  # pragma: no cover - analytics is optional
+            LOGGER.warning("analytics recording failed: %s", exc)
+
+    def _record_audit(
+        self,
+        job: MeetingJobConfig,
+        transcription: MeetingTranscriptionResult,
+        summary: MeetingSummary,
+        summary_payload: Dict[str, object],
+        summary_path: Path,
+        metadata_path: Path,
+        segments_path: Path,
+    ) -> None:
+        if not self._audit_logger.is_enabled():
+            return
+        payload: Dict[str, object] = {
+            "event_type": "meeting_pipeline.completed",
+            "meeting_id": job.audio_path.stem,
+            "audio_path": str(job.audio_path),
+            "output_dir": str(job.output_dir),
+            "summary_path": str(summary_path),
+            "metadata_path": str(metadata_path),
+            "segments_path": str(segments_path),
+            "summary_backend": self.summary_backend,
+            "stt_backend": self.stt_backend,
+            "language": transcription.language,
+            "duration_seconds": transcription.duration_seconds,
+            "highlight_count": len(summary.highlights),
+            "action_count": len(summary.action_items),
+            "decision_count": len(summary.decisions),
+            "quality_metrics": summary_payload.get("quality_metrics"),
+            "status": "completed",
+        }
+        if job.policy_tag:
+            payload["policy_tag"] = job.policy_tag
+        if job.created_at:
+            payload["created_at"] = job.created_at.isoformat()
+        if summary.context:
+            payload["context_snippet"] = summary.context[:500]
+        try:
+            self._audit_logger.record(payload)
+        except Exception as exc:  # pragma: no cover - defensive
+            LOGGER.warning("audit logging failed: %s", exc)
+
+    def _sync_action_items(self, job: MeetingJobConfig, summary: MeetingSummary) -> None:
+        if not self._integration_config:
+            return
+        entries = summary.structured_summary.get("action_items") or []
+        if not entries:
+            return
+        try:
+            sync_action_items(entries, self._integration_config, output_dir=job.output_dir)
+        except Exception as exc:  # pragma: no cover - defensive
+            LOGGER.warning("action item sync failed: %s", exc)
+
     def _mask_sensitive_content(
         self,
         *,
@@ -996,6 +1216,23 @@ class MeetingPipeline:
         )
         attachments["tasks"] = tasks_path.name
 
+        action_items_path = job.output_dir / "action_items.json"
+        action_entries = [
+            item
+            for item in summary.structured_summary.get("action_items", [])
+            if isinstance(item, dict)
+        ]
+        action_items_payload = {
+            "meeting_id": job.audio_path.stem,
+            "generated_at": job.created_at.isoformat(),
+            "items": action_entries,
+        }
+        action_items_path.write_text(
+            json.dumps(action_items_payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        attachments["action_items"] = action_items_path.name
+
         calendar_path = job.output_dir / "meeting.ics"
         calendar_path.write_text(
             self._build_calendar_event(job, transcription, summary),
@@ -1009,6 +1246,7 @@ class MeetingPipeline:
             "generated_at": job.created_at.isoformat(),
             "tasks_file": tasks_path.name,
             "calendar_file": calendar_path.name,
+            "action_items_file": action_items_path.name,
             "action_items": summary.structured_summary.get("action_items", []),
             "decisions": summary.structured_summary.get("decisions", []),
         }
@@ -1300,6 +1538,11 @@ class MeetingPipeline:
             "decisions": summary_section.get("decisions", []),
         }
 
+        attachments = summary_payload.get("attachments") or {}
+        if not isinstance(attachments, dict):
+            attachments = {}
+        context_prompt = summary_payload.get("context_prompt")
+
         return MeetingSummary(
             highlights=highlights,
             action_items=action_items,
@@ -1307,6 +1550,8 @@ class MeetingPipeline:
             raw_summary=raw_summary,
             transcript_path=transcript_path,
             structured_summary=structured_summary,
+            context=context_prompt,
+            attachments=attachments,
         )
 
 
@@ -1419,7 +1664,8 @@ class StreamingMeetingSession:
             return self._final_summary
 
         transcription = self._build_transcription_result()
-        summary = self._pipeline._summarise(self._job, transcription)
+        context_bundle = self._pipeline._collect_context_bundle(self._job)
+        summary = self._pipeline._summarise(self._job, transcription, context_bundle)
         if self._pipeline._mask_pii_enabled:
             self._pipeline._mask_sensitive_content(transcription=transcription, summary=summary)
         self._pipeline._persist(self._job, transcription, summary)
@@ -1565,7 +1811,8 @@ class StreamingMeetingSession:
             return self._final_summary
 
         transcription = self._build_transcription_result()
-        summary = self._pipeline._summarise(self._job, transcription)
+        context_bundle = self._pipeline._collect_context_bundle(self._job)
+        summary = self._pipeline._summarise(self._job, transcription, context_bundle)
         if self._pipeline._mask_pii_enabled:
             self._pipeline._mask_sensitive_content(transcription=transcription, summary=summary)
         self._pipeline._persist(self._job, transcription, summary)

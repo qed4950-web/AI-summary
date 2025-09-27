@@ -5,8 +5,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence
 
-from infopilot_core.data_pipeline.policies.loader import load_policy_file
-from infopilot_core.utils import get_logger, resolve_repo_root
+from core.data_pipeline.policies.loader import load_policy_file
+from core.utils import get_logger, resolve_repo_root
 
 LOGGER = get_logger("policy.engine")
 

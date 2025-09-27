@@ -1,30 +1,11 @@
 import customtkinter as ctk
 import sys
-import os
+from pathlib import Path
 from typing import Dict
 
-# 프로젝트 루트 경로를 sys.path에 추가
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if BASE_DIR not in sys.path:
-    sys.path.append(BASE_DIR)
-
-# Add project root to sys.path for module imports
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-# Ensure infopilot_core import aliases point to local core package (runtime parity with tests)
-if "infopilot_core" not in sys.modules:
-    try:
-        import infopilot_core as _infopilot_core  # type: ignore
-    except ImportError:
-        import core as _core
-
-        sys.modules["infopilot_core"] = _core
-        for _name in ("agents", "conversation", "data_pipeline", "infra", "search", "utils"):
-            module = __import__(f"core.{_name}", fromlist=[_name])
-            sys.modules[f"infopilot_core.{_name}"] = module
-            setattr(_core, _name, module)
-    else:  # pragma: no cover - already available as installed package
-        sys.modules.setdefault("infopilot_core", _infopilot_core)
+REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 # Import screen modules
 from ui.screens.home_screen import HomeScreen

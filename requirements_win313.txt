@@ -24,7 +24,8 @@ sentence-transformers==3.0.1
 faiss-cpu==1.9.0.post1
 transformers>=4.44,<5
 faster-whisper>=1.0,<1.1
-pykospacing>=0.5,<0.6
+pykospacing>=0.5,<0.6; python_version < "3.12"
+kosspacing>=0.5,<0.6; python_version >= "3.12"
 py-hanspell>=1.1,<1.2
 
 # === 시스템 유틸 ===

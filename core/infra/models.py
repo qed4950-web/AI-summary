@@ -5,7 +5,7 @@ import threading
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Iterable, Optional
 
-from infopilot_core.utils import get_logger
+from core.utils import get_logger
 
 LOGGER = get_logger("infra.models")
 

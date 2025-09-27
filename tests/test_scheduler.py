@@ -6,8 +6,8 @@ from pathlib import Path
 import pytest
 
 import infopilot
-from infopilot_core.data_pipeline.policies.engine import PolicyEngine, SmartFolderPolicy
-from infopilot_core.infra import JobScheduler, ScheduleSpec
+from core.data_pipeline.policies.engine import PolicyEngine, SmartFolderPolicy
+from core.infra import JobScheduler, ScheduleSpec
 
 pytestmark = pytest.mark.smoke
 

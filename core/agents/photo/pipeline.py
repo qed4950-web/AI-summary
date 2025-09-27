@@ -4,7 +4,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Iterable, List
 
-from infopilot_core.utils import get_logger
+from core.utils import get_logger
 
 from .models import PhotoAsset, PhotoJobConfig, PhotoRecommendation
 

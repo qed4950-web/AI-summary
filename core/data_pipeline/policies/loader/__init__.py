@@ -7,7 +7,7 @@ from typing import Any, Dict, Iterable, List
 
 import jsonschema
 
-from infopilot_core.utils import get_logger, resolve_repo_root
+from core.utils import get_logger, resolve_repo_root
 
 LOGGER = get_logger("policy.loader")
 
@@ -40,7 +40,7 @@ def load_policy_file(path: Path) -> List[Dict[str, Any]]:
 
 
 def _load_schema() -> Dict[str, Any]:
-    schema_path = resolve_repo_root() / "infopilot_core" / "data_pipeline" / "policies" / "schema" / "smart_folder_policy.schema.json"
+    schema_path = resolve_repo_root() / "core" / "data_pipeline" / "policies" / "schema" / "smart_folder_policy.schema.json"
     try:
         return json.loads(schema_path.read_text(encoding="utf-8"))
     except FileNotFoundError as exc:

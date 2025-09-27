@@ -9,7 +9,7 @@ import shutil
 import subprocess
 import textwrap
 from dataclasses import dataclass
-from typing import Callable, Dict, List, Optional, Protocol
+from typing import Any, Callable, Dict, List, Optional, Protocol
 
 LOGGER = logging.getLogger(__name__)
 
@@ -43,8 +43,12 @@ class SummariserConfig:
     """Common configuration shared by the supported summariser backends."""
 
     model_name: str = os.getenv("MEETING_SUMMARY_MODEL", "gogamza/kobart-base-v2")
+    english_model_name: str = os.getenv("MEETING_SUMMARY_EN_MODEL", "facebook/bart-large-cnn")
     max_length: int = _int_env("MEETING_SUMMARY_MAXLEN", 128)
     min_length: int = _int_env("MEETING_SUMMARY_MINLEN", 32)
+    max_new_tokens: int = _int_env("MEETING_SUMMARY_MAX_NEW_TOKENS", 128)
+    num_beams: int = _int_env("MEETING_SUMMARY_NUM_BEAMS", 4)
+    model_max_input_chars: int = _int_env("MEETING_SUMMARY_MODEL_MAX_CHARS", 1024)
     chunk_char_limit: int = _int_env("MEETING_SUMMARY_CHUNK_CHARS", 1800)
 
     ollama_model: str = os.getenv("MEETING_SUMMARY_OLLAMA_MODEL", "llama3")
@@ -72,36 +76,71 @@ class KoBARTSummariser:
 
     def __init__(self, config: SummariserConfig | None = None) -> None:
         self.config = config or SummariserConfig()
-        self._pipeline = None
+        self._pipelines: Dict[str, Any] = {}
+        self._device = self._resolve_device()
 
     @staticmethod
     def is_available() -> bool:
         return importlib.util.find_spec("transformers") is not None
 
-    def _ensure_pipeline(self):
-        if self._pipeline is not None:
-            return self._pipeline
+    def _resolve_device(self) -> int:
+        try:
+            override = os.getenv("MEETING_SUMMARY_DEVICE")
+            if override:
+                override = override.strip().lower()
+                if override in {"cpu", "-1"}:
+                    return -1
+                if override in {"cuda", "gpu", "0"}:
+                    return 0
+                if override.isdigit():
+                    return int(override)
+            try:
+                import torch
+
+                return 0 if torch.cuda.is_available() else -1
+            except ImportError:  # pragma: no cover - torch optional
+                return -1
+        except Exception:  # pragma: no cover - defensive fallback
+            return -1
+
+    def _ensure_pipeline(self, flavour: str = "ko"):
+        if flavour in self._pipelines:
+            return self._pipelines[flavour]
 
         try:
             from transformers import pipeline  # type: ignore
         except ImportError as exc:  # pragma: no cover - optional dependency
             raise RuntimeError("transformers is required for KoBART summarisation") from exc
 
-        LOGGER.info("Loading KoBART summariser model: %s", self.config.model_name)
-        self._pipeline = pipeline(
-            "summarization",
-            model=self.config.model_name,
-            tokenizer=self.config.model_name,
+        if flavour == "en":
+            model_name = self.config.english_model_name
+        else:
+            model_name = self.config.model_name
+
+        device_label = self._device if isinstance(self._device, int) and self._device >= 0 else "cpu"
+        LOGGER.info(
+            "Loading %s summariser model: %s on device=%s",  # noqa: G004
+            flavour.upper(),
+            model_name,
+            device_label,
         )
-        return self._pipeline
+        task = "text2text-generation"
+        self._pipelines[flavour] = pipeline(
+            task,
+            model=model_name,
+            tokenizer=model_name,
+            device=self._device,
+        )
+        return self._pipelines[flavour]
 
     def summarise(self, text: str) -> str:
         text = (text or "").strip()
         if not text:
             return ""
 
+        flavour = "en" if self._is_likely_english(text) else "ko"
         chunks = self._chunk_text(text, self.config.chunk_char_limit)
-        summarise_chunk = self._make_chunk_summariser()
+        summarise_chunk = self._make_chunk_summariser(flavour)
         partials = [summarise_chunk(chunk) for chunk in chunks if chunk.strip()]
         partials = [item for item in partials if item]
 
@@ -118,27 +157,44 @@ class KoBARTSummariser:
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
-    def _make_chunk_summariser(self) -> Callable[[str], str]:
-        pipeline = self._ensure_pipeline()
+    def _make_chunk_summariser(self, flavour: str) -> Callable[[str], str]:
+        transformer_pipeline = self._ensure_pipeline(flavour)
         max_length = self.config.max_length
         min_length = self.config.min_length
+        max_new_tokens = self.config.max_new_tokens
+        num_beams = self.config.num_beams
+        max_input_chars = self.config.model_max_input_chars
 
         def _summarise_chunk(chunk: str) -> str:
             try:
-                result: List[dict] = pipeline(
-                    chunk,
+                trimmed = chunk[:max_input_chars] if max_input_chars > 0 else chunk
+                result: List[dict] = transformer_pipeline(
+                    trimmed,
+                    max_new_tokens=max_new_tokens,
                     max_length=max_length,
                     min_length=min_length,
                     do_sample=False,
+                    num_beams=num_beams,
                 )
                 if not result:
                     return ""
-                return (result[0].get("summary_text") or "").strip()
+                payload = result[0].get("generated_text") or result[0].get("summary_text") or ""
+                return payload.strip()
             except Exception as exc:  # pragma: no cover - inference guard
                 LOGGER.exception("KoBART summarisation failed: %s", exc)
                 return ""
 
         return _summarise_chunk
+
+    def _is_likely_english(self, text: str) -> bool:
+        # Quick heuristic based on Hangul vs ASCII letter ratio.
+        if not text:
+            return False
+
+        hangul = sum(1 for ch in text if "가" <= ch <= "힣")
+        latin = sum(1 for ch in text if "a" <= ch.lower() <= "z")
+        # Treat as English when Hangul is rare and there is a reasonable amount of Latin chars.
+        return hangul == 0 and latin > 0 or (latin > 5 and hangul * 5 < latin)
 
     def _chunk_text(self, text: str, limit: int) -> List[str]:
         if limit <= 0:

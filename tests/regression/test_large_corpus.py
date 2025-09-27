@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from infopilot_core.data_pipeline.pipeline import run_step2, TrainConfig
+from core.data_pipeline.pipeline import run_step2, TrainConfig
 
 
 def test_large_corpus_chunking(tmp_path: Path) -> None:

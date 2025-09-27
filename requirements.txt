@@ -12,6 +12,7 @@ python-pptx>=1.0.0,<1.1
 pdfminer.six>=20231228,<20240600
 PyMuPDF>=1.26.4,<1.27
 pdfplumber>=0.11.4,<0.12
+python-dotenv>=1.0.1,<1.1
 
 # === 번역/텍스트 유틸 ===
 deep-translator>=1.11.4,<2
@@ -24,7 +25,8 @@ sentence-transformers>=3.0.1,<4
 faiss-cpu>=1.9,<2   # (Windows 3.13 → 실제 설치는 faiss-cpu==1.9.0.post1 권장)
 faster-whisper>=1.0,<1.1   # 회의 비서 STT 백엔드
 transformers>=4.44,<5   # KoBART summarisation
-pykospacing>=0.5,<0.6   # STT 후처리 (띄어쓰기)
+pykospacing>=0.5,<0.6; python_version < "3.12"   # STT 후처리 (띄어쓰기)
+kosspacing>=0.5,<0.6; python_version >= "3.12"   # torch 기반 띄어쓰기 대체
 py-hanspell>=1.1,<1.2   # STT 후처리 (맞춤법)
 
 # === 시스템 유틸 ===

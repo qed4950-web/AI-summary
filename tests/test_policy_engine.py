@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from infopilot_core.data_pipeline.policies.engine import PolicyEngine
+from core.data_pipeline.policies.engine import PolicyEngine
 
 
 def _write_policy(path: Path, payload: str) -> Path:

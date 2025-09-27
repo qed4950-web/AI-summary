@@ -11,9 +11,9 @@
 - [ ] LLM/프론트엔드에서 정책 준수 및 컨텍스트 표시
 
 ### 산출물
-- 스마트 폴더 정책 엔진 확장: `infopilot_core/data_pipeline/policies/engine.py`
+- 스마트 폴더 정책 엔진 확장: `core/data_pipeline/policies/engine.py`
 - CLI 정책/스코프 연동: `infopilot.py`
-- 정책 적용 대화 세션: `infopilot_core/conversation/lnp_chat.py`
+- 정책 적용 대화 세션: `core/conversation/lnp_chat.py`
 
 ### 다음 단계 체크리스트
 - Cycle 2 완료 후 사용자 피드백 세션 및 Cycle 3(회의 비서) 준비

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from infopilot_core.infra import AuditLogger
+from core.infra import AuditLogger
 
 
 def test_audit_logger_writes_file(tmp_path: Path) -> None:

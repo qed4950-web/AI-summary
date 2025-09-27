@@ -6,7 +6,7 @@
 - 최소 기능의 작업 센터 연동(회의 기록/요약 푸시)과 연계 테스트
 
 ### 진행 현황
-- [x] STT 모델/서비스 샘플 파이프라인 구조 마련 (`infopilot_core/agents/meeting/`)
+- [x] STT 모델/서비스 샘플 파이프라인 구조 마련 (`core/agents/meeting/`)
 - [x] 요약·액션 추출 로직과 정책 연동을 위한 데이터 모델/스토리지 뼈대 정의
 - [ ] 회의 로그 저장 포맷 정의 및 인덱싱 파이프라인 통합
 - [ ] 작업 센터/알림 경로 프로토타입
@@ -21,9 +21,9 @@
 - 액션 아이템을 `tasks.json`, 회의 이벤트를 `meeting.ics`, 연동 정보를 `integrations.json`으로 출력해 캘린더/업무 도구에 곧바로 가져갈 수 있도록 구조화했습니다.
 
 ### 산출물
-- 에이전트 모델/파이프라인: `infopilot_core/agents/meeting/models.py`, `.../pipeline.py`
+- 에이전트 모델/파이프라인: `core/agents/meeting/models.py`, `.../pipeline.py`
 - 기본 설정 템플릿: `config/meeting_agent.yaml`
-- 정책 예시 업데이트: `infopilot_core/data_pipeline/policies/examples/smart_folder_policy_sample.json`
+- 정책 예시 업데이트: `core/data_pipeline/policies/examples/smart_folder_policy_sample.json`
 - 회귀 테스트: `tests/test_meeting_pipeline.py`
 
 ### 다음 단계 체크리스트

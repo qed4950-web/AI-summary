@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from infopilot_core.infra import ModelSelector
+from core.infra import ModelSelector
 
 
 def test_model_selector_prefers_policy_and_gpu():

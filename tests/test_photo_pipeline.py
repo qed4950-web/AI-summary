@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from infopilot_core.agents.photo import PhotoJobConfig, PhotoPipeline
+from core.agents.photo import PhotoJobConfig, PhotoPipeline
 
 
 def test_photo_pipeline_scans_and_reports(tmp_path: Path) -> None:

@@ -4,7 +4,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 
 @dataclass
@@ -15,6 +15,8 @@ class MeetingJobConfig:
     diarize: bool = False
     speaker_count: Optional[int] = None
     policy_tag: Optional[str] = None
+    context_dirs: List[Path] = field(default_factory=list)
+    enable_resume: bool = False
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
 
@@ -34,6 +36,8 @@ class MeetingSummary:
     raw_summary: str
     transcript_path: Path
     structured_summary: dict
+    context: Optional[str] = None
+    attachments: Dict[str, List[dict] | dict | str] = field(default_factory=dict)
 
 
 @dataclass
