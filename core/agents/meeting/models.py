@@ -34,3 +34,13 @@ class MeetingSummary:
     raw_summary: str
     transcript_path: Path
     structured_summary: dict
+
+
+@dataclass
+class StreamingSummarySnapshot:
+    summary_text: str
+    highlights: List[str]
+    action_items: List[str]
+    decisions: List[str]
+    elapsed_seconds: float
+    language: str

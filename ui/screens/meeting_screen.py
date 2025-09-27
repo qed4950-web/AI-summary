@@ -11,9 +11,16 @@ from typing import Optional
 import customtkinter as ctk
 from tkinter import filedialog
 
-from core.agents.meeting.models import MeetingJobConfig
-from core.agents.meeting.pipeline import MeetingPipeline, get_backend_diagnostics
+from core.agents.meeting.models import MeetingJobConfig, StreamingSummarySnapshot
+from core.agents.meeting.pipeline import (
+    MeetingPipeline,
+    StreamingMeetingSession,
+    get_backend_diagnostics,
+)
 from src.config import MEETING_OUTPUT_DIR
+
+
+DEFAULT_STREAM_INTERVAL = 60.0
 
 
 class MeetingScreen(ctk.CTkFrame):
@@ -32,6 +39,13 @@ class MeetingScreen(ctk.CTkFrame):
         self.stt_device_var = ctk.StringVar()
         self.stt_compute_var = ctk.StringVar()
         self.stt_download_var = ctk.StringVar()
+        self.live_mode_var = ctk.IntVar(value=0)
+        self.live_interval_var = ctk.StringVar(value=str(int(DEFAULT_STREAM_INTERVAL)))
+        self.live_speaker_var = ctk.StringVar()
+
+        self.streaming_session: Optional[StreamingMeetingSession] = None
+        self.streaming_job: Optional[MeetingJobConfig] = None
+        self.streaming_log_path: Optional[Path] = None
 
         self.grid_columnconfigure(0, weight=1)
         self.grid_rowconfigure(3, weight=1)
@@ -206,9 +220,90 @@ class MeetingScreen(ctk.CTkFrame):
         )
         self.speaker_entry.grid(row=0, column=1, padx=(12, 0), sticky="w")
 
+        # Streaming mode controls
+        live_row = ctk.CTkFrame(self.form_frame, fg_color="transparent")
+        live_row.grid(row=6, column=1, padx=12, pady=8, sticky="ew")
+        live_row.grid_columnconfigure(0, weight=0)
+        live_row.grid_columnconfigure(1, weight=1)
+        self.live_mode_switch = ctk.CTkSwitch(
+            live_row,
+            text="실시간 요약 모드",
+            variable=self.live_mode_var,
+            command=self.on_toggle_live_mode,
+        )
+        self.live_mode_switch.grid(row=0, column=0, sticky="w")
+        self.live_interval_entry = ctk.CTkEntry(
+            live_row,
+            textvariable=self.live_interval_var,
+            placeholder_text="스냅샷 간격(초)",
+            width=150,
+            state="disabled",
+        )
+        self.live_interval_entry.grid(row=0, column=1, padx=(12, 0), sticky="w")
+        self.live_hint_label = ctk.CTkLabel(
+            live_row,
+            text="실시간 모드에서는 발화를 추가하면 주기적으로 요약이 갱신됩니다.",
+            font=ctk.CTkFont(size=11),
+            text_color=("#636363", "#bdbdbd"),
+        )
+        self.live_hint_label.grid(row=1, column=0, columnspan=2, pady=(6, 0), sticky="w")
+
+        self.live_controls_frame = ctk.CTkFrame(self.form_frame, fg_color="transparent")
+        self.live_controls_frame.grid(row=7, column=1, padx=12, pady=8, sticky="ew")
+        self.live_controls_frame.grid_columnconfigure(0, weight=0)
+        self.live_controls_frame.grid_columnconfigure(1, weight=1)
+
+        ctk.CTkLabel(
+            self.live_controls_frame,
+            text="발화자",
+            font=ctk.CTkFont(weight="bold"),
+        ).grid(row=0, column=0, padx=(0, 12), pady=(0, 6), sticky="w")
+        self.live_speaker_entry = ctk.CTkEntry(
+            self.live_controls_frame,
+            textvariable=self.live_speaker_var,
+            placeholder_text="발화자 라벨 (선택)",
+        )
+        self.live_speaker_entry.grid(row=0, column=1, pady=(0, 6), sticky="ew")
+
+        self.live_textbox = ctk.CTkTextbox(
+            self.live_controls_frame,
+            height=90,
+            font=ctk.CTkFont(family="monospace"),
+        )
+        self.live_textbox.grid(row=1, column=0, columnspan=2, sticky="ew")
+
+        live_button_row = ctk.CTkFrame(self.live_controls_frame, fg_color="transparent")
+        live_button_row.grid(row=2, column=0, columnspan=2, pady=8, sticky="ew")
+        live_button_row.grid_columnconfigure(0, weight=1)
+        self.live_add_button = ctk.CTkButton(
+            live_button_row,
+            text="발화 추가",
+            command=self.add_live_segment,
+            state="disabled",
+        )
+        self.live_add_button.grid(row=0, column=0, sticky="ew")
+        self.live_finalize_button = ctk.CTkButton(
+            live_button_row,
+            text="실시간 요약 마무리",
+            width=150,
+            command=self.finalize_streaming_session,
+            state="disabled",
+        )
+        self.live_finalize_button.grid(row=0, column=1, padx=(12, 0))
+
+        self.live_status_label = ctk.CTkLabel(
+            self.live_controls_frame,
+            text="실시간 세션을 시작하면 요약이 여기에 표시됩니다.",
+            anchor="w",
+            text_color=("#636363", "#bdbdbd"),
+        )
+        self.live_status_label.grid(row=3, column=0, columnspan=2, sticky="w")
+
+        self.live_controls_frame.grid_remove()
+
         # Action buttons
         button_row = ctk.CTkFrame(self.form_frame, fg_color="transparent")
-        button_row.grid(row=6, column=1, padx=12, pady=(8, 12), sticky="ew")
+        button_row.grid(row=8, column=1, padx=12, pady=(8, 12), sticky="ew")
         button_row.grid_columnconfigure(0, weight=1)
         self.run_button = ctk.CTkButton(button_row, text="회의 요약 실행", command=self.start_meeting_job)
         self.run_button.grid(row=0, column=0, sticky="ew")
@@ -294,6 +389,29 @@ class MeetingScreen(ctk.CTkFrame):
         if not enabled:
             self.speaker_var.set("")
 
+    def on_toggle_live_mode(self) -> None:
+        if self.streaming_session is not None:
+            self.append_log("⚠️ 실시간 세션이 진행 중입니다. 먼저 마무리하세요.")
+            self.live_mode_var.set(1)
+            return
+
+        enabled = self.live_mode_var.get() == 1
+        if enabled:
+            self.live_controls_frame.grid()
+            self.live_interval_entry.configure(state="normal")
+            self.live_add_button.configure(state="disabled")
+            self.live_finalize_button.configure(state="disabled")
+            self.run_button.configure(text=self._default_run_button_label())
+            self.live_status_label.configure(text="실시간 세션을 시작하면 요약이 여기에 표시됩니다.")
+        else:
+            self.live_controls_frame.grid_remove()
+            self.live_interval_entry.configure(state="disabled")
+            self.live_add_button.configure(state="disabled")
+            self.live_finalize_button.configure(state="disabled")
+            self.live_textbox.delete("1.0", "end")
+            self.live_speaker_var.set("")
+            self.run_button.configure(text=self._default_run_button_label())
+
     def on_stt_backend_change(self, _: str) -> None:
         backend = self.stt_backend_var.get()
         is_whisper = backend == "whisper"
@@ -315,6 +433,15 @@ class MeetingScreen(ctk.CTkFrame):
     # Pipeline execution
     # ------------------------------------------------------------------
     def start_meeting_job(self) -> None:
+        if self.live_mode_var.get() == 1:
+            if self.streaming_session is not None:
+                self.append_log("⚠️ 이미 실시간 세션이 진행 중입니다.")
+                return
+            if self.is_running:
+                return
+            self.start_streaming_session()
+            return
+
         if self.is_running:
             return
 
@@ -405,34 +532,305 @@ class MeetingScreen(ctk.CTkFrame):
     def _run_pipeline(self, pipeline: MeetingPipeline, job: MeetingJobConfig) -> None:
         try:
             summary = pipeline.run(job)
-            lines = [
-                "✅ 회의 요약이 완료되었습니다!",
-                f"출력 폴더: {job.output_dir}",
-                "",
-                "요약 하이라이트:",
-            ]
-            lines.extend(f"- {item}" for item in summary.highlights)
-            lines.append("")
-            lines.append("액션 아이템:")
-            lines.extend(f"- {item}" for item in summary.action_items)
-            lines.append("")
-            lines.append("결정 사항:")
-            lines.extend(f"- {item}" for item in summary.decisions)
-            if summary.raw_summary:
-                lines.append("")
-                lines.append("자동 요약:")
-                lines.append(summary.raw_summary)
-
-            self.append_log("\n".join(lines), reset=True)
-            self.after(0, lambda: self.open_folder_button.configure(state="normal"))
-            self.after(0, lambda: self.run_button.configure(state="normal", text="회의 요약 실행"))
-            self.after(0, lambda: self.end_task_callback("✅ 회의 요약이 완료되었습니다."))
+            self._handle_summary_completion(
+                summary,
+                job,
+                headline="✅ 회의 요약이 완료되었습니다!",
+                completion_message="✅ 회의 요약이 완료되었습니다.",
+            )
         except Exception as exc:  # pragma: no cover - GUI feedback
             self.append_log(f"❌ 회의 요약 중 오류가 발생했습니다: {exc}")
-            self.after(0, lambda: self.run_button.configure(state="normal", text="회의 요약 실행"))
+            self.after(0, lambda: self.run_button.configure(state="normal", text=self._default_run_button_label()))
             self.after(0, lambda: self.end_task_callback("❌ 회의 요약 중 오류가 발생했습니다."))
         finally:
             self.is_running = False
+
+    def start_streaming_session(self) -> None:
+        try:
+            interval_str = self.live_interval_var.get().strip()
+            if interval_str:
+                interval = float(interval_str)
+                if interval < 0:
+                    raise ValueError
+            else:
+                interval = DEFAULT_STREAM_INTERVAL
+        except ValueError:
+            self.append_log("⚠️ 스냅샷 간격은 0 이상의 숫자로 입력해주세요.")
+            return
+
+        audio_path_text = self.audio_path_var.get().strip()
+        safe_name = "live-session"
+        audio_path: Optional[Path] = None
+        if audio_path_text:
+            audio_path = Path(audio_path_text)
+            safe_name = audio_path.stem or safe_name
+
+        output_root_text = self.output_dir_var.get().strip()
+        if output_root_text:
+            output_dir = Path(output_root_text)
+        else:
+            timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+            output_dir = MEETING_OUTPUT_DIR / safe_name / timestamp
+
+        try:
+            output_dir.mkdir(parents=True, exist_ok=True)
+        except Exception as exc:
+            self.append_log(f"⚠️ 출력 폴더를 생성할 수 없습니다: {exc}")
+            return
+
+        if audio_path is None or not audio_path.exists():
+            audio_path = output_dir / "live_session.txt"
+            try:
+                audio_path.write_text("", encoding="utf-8")
+            except Exception as exc:
+                self.append_log(f"⚠️ 실시간 입력 파일을 준비할 수 없습니다: {exc}")
+                return
+            self.audio_path_var.set(str(audio_path))
+
+        diarize = self.diarize_switch.get() == 1
+        speaker_count = None
+        if diarize:
+            try:
+                speaker_count = int(self.speaker_var.get()) if self.speaker_var.get().strip() else None
+            except ValueError:
+                self.append_log("⚠️ 화자 수는 숫자로 입력해주세요.")
+                return
+
+        job = MeetingJobConfig(
+            audio_path=audio_path,
+            output_dir=output_dir,
+            language=self.language_option.get(),
+            diarize=diarize,
+            speaker_count=speaker_count,
+            policy_tag=self.policy_var.get().strip() or None,
+        )
+
+        pipeline = self._build_pipeline()
+        try:
+            session = pipeline.start_streaming(job, update_interval=interval)
+        except Exception as exc:  # pragma: no cover - defensive UI message
+            self.append_log(f"❌ 실시간 세션을 시작할 수 없습니다: {exc}")
+            return
+
+        events_log = output_dir / "live_session_events.log"
+        try:
+            events_log.write_text("", encoding="utf-8")
+        except Exception:
+            # Non-fatal; continue without log file
+            events_log = None
+
+        self.streaming_session = session
+        self.streaming_job = job
+        self.streaming_log_path = events_log
+        self.is_running = True
+        self.last_output_dir = output_dir
+
+        backend_display = self._describe_backend_choice()
+        self.append_log(
+            "\n".join(
+                [
+                    "실시간 요약 세션을 시작했습니다.",
+                    f"STT 설정: {backend_display}",
+                    "발화를 입력하고 '발화 추가' 버튼을 눌러 스냅샷을 갱신하세요.",
+                ]
+            ),
+            reset=True,
+        )
+
+        self.open_folder_button.configure(state="disabled")
+        self.run_button.configure(state="disabled", text="세션 진행 중...")
+        self.live_add_button.configure(state="normal")
+        self.live_finalize_button.configure(state="normal")
+        self.live_status_label.configure(text="발화를 추가하면 요약이 업데이트됩니다.")
+        self.live_textbox.delete("1.0", "end")
+        self.start_task_callback("🟢 실시간 요약 세션이 활성화되었습니다.")
+
+    def add_live_segment(self) -> None:
+        if self.streaming_session is None or self.streaming_job is None:
+            self.append_log("⚠️ 실시간 세션을 먼저 시작하세요.")
+            return
+
+        text = self.live_textbox.get("1.0", "end").strip()
+        if not text:
+            self.append_log("⚠️ 추가할 발화를 입력하세요.")
+            return
+
+        speaker = self.live_speaker_var.get().strip() or None
+
+        try:
+            snapshot = self.streaming_session.ingest(text, speaker=speaker)
+        except Exception as exc:  # pragma: no cover - streaming diagnostics
+            self.append_log(f"⚠️ 발화를 처리하는 중 오류가 발생했습니다: {exc}")
+            return
+
+        if self.streaming_log_path is not None:
+            try:
+                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                speaker_label = speaker or "(unknown)"
+                with self.streaming_log_path.open("a", encoding="utf-8") as handle:
+                    handle.write(f"[{timestamp}] {speaker_label}: {text}\n")
+            except Exception:
+                pass
+
+        self.live_textbox.delete("1.0", "end")
+        self.live_speaker_var.set("")
+
+        if snapshot is not None:
+            self._render_snapshot(snapshot)
+        else:
+            self.append_log("발화를 기록했습니다. 스냅샷은 곧 업데이트됩니다.")
+
+    def _render_snapshot(self, snapshot: StreamingSummarySnapshot) -> None:
+        elapsed = int(snapshot.elapsed_seconds)
+        lines = [
+            f"🟢 실시간 스냅샷 (경과 {elapsed}초)",
+            "",
+            "요약 하이라이트:",
+        ]
+        highlights = snapshot.highlights or []
+        if highlights:
+            lines.extend(f"- {item}" for item in highlights)
+        else:
+            lines.append("- (없음)")
+
+        lines.append("")
+        lines.append("액션 아이템:")
+        actions = snapshot.action_items or []
+        if actions:
+            lines.extend(f"- {item}" for item in actions)
+        else:
+            lines.append("- (없음)")
+
+        lines.append("")
+        lines.append("결정 사항:")
+        decisions = snapshot.decisions or []
+        if decisions:
+            lines.extend(f"- {item}" for item in decisions)
+        else:
+            lines.append("- (없음)")
+
+        self.append_log("\n".join(lines), reset=True)
+        self.live_status_label.configure(
+            text=f"최근 스냅샷: {datetime.now().strftime('%H:%M:%S')} (경과 {elapsed}초)",
+        )
+
+    def finalize_streaming_session(self) -> None:
+        if self.streaming_session is None or self.streaming_job is None:
+            self.append_log("⚠️ 진행 중인 실시간 세션이 없습니다.")
+            return
+
+        if self.live_textbox.get("1.0", "end").strip():
+            # 자동으로 남아있는 입력을 기록
+            self.add_live_segment()
+
+        self.live_add_button.configure(state="disabled")
+        self.live_finalize_button.configure(state="disabled")
+        self.run_button.configure(state="disabled", text="정리 중...")
+        self.start_task_callback("⏳ 실시간 요약을 마무리하는 중입니다...")
+
+        thread = threading.Thread(target=self._finalize_streaming_background, daemon=True)
+        thread.start()
+
+    def _finalize_streaming_background(self) -> None:
+        session = self.streaming_session
+        job = self.streaming_job
+        if session is None or job is None:
+            self.after(0, lambda: self.append_log("⚠️ 실시간 세션 정보를 찾을 수 없습니다."))
+            return
+
+        try:
+            summary = session.finalize()
+        except Exception as exc:  # pragma: no cover - streaming diagnostics
+            self.after(0, lambda: self._handle_streaming_error(exc))
+            return
+
+        self.after(0, lambda: self._handle_streaming_completion(summary, job))
+
+    def _handle_streaming_completion(self, summary, job) -> None:
+        self.streaming_session = None
+        self.streaming_job = None
+        self.streaming_log_path = None
+        self.is_running = False
+
+        self.live_add_button.configure(state="disabled")
+        self.live_finalize_button.configure(state="disabled")
+        self.live_status_label.configure(text="실시간 세션을 시작하면 요약이 여기에 표시됩니다.")
+
+        self._handle_summary_completion(
+            summary,
+            job,
+            headline="✅ 실시간 요약이 완료되었습니다!",
+            completion_message="✅ 실시간 요약이 완료되었습니다.",
+        )
+
+    def _handle_streaming_error(self, exc: Exception) -> None:
+        self.streaming_session = None
+        self.streaming_job = None
+        self.streaming_log_path = None
+        self.is_running = False
+
+        self.live_add_button.configure(state="disabled")
+        self.live_finalize_button.configure(state="disabled")
+        self.live_status_label.configure(text="실시간 세션을 시작하면 요약이 여기에 표시됩니다.")
+        self.run_button.configure(state="normal", text=self._default_run_button_label())
+
+        self.append_log(f"❌ 실시간 요약 중 오류가 발생했습니다: {exc}")
+        self.end_task_callback("❌ 실시간 요약 중 오류가 발생했습니다.")
+
+    def _handle_summary_completion(
+        self,
+        summary,
+        job: MeetingJobConfig,
+        *,
+        headline: str,
+        completion_message: str,
+    ) -> None:
+        lines = [
+            headline,
+            f"출력 폴더: {job.output_dir}",
+            "",
+            "요약 하이라이트:",
+        ]
+
+        highlights = summary.highlights or []
+        if highlights:
+            lines.extend(f"- {item}" for item in highlights)
+        else:
+            lines.append("- (없음)")
+
+        lines.append("")
+        lines.append("액션 아이템:")
+        actions = summary.action_items or []
+        if actions:
+            lines.extend(f"- {item}" for item in actions)
+        else:
+            lines.append("- (없음)")
+
+        lines.append("")
+        lines.append("결정 사항:")
+        decisions = summary.decisions or []
+        if decisions:
+            lines.extend(f"- {item}" for item in decisions)
+        else:
+            lines.append("- (없음)")
+
+        if summary.raw_summary:
+            lines.append("")
+            lines.append("자동 요약:")
+            lines.append(summary.raw_summary)
+
+        self.append_log("\n".join(lines), reset=True)
+        self.last_output_dir = job.output_dir
+
+        def _update_controls() -> None:
+            self.open_folder_button.configure(state="normal")
+            self.run_button.configure(state="normal", text=self._default_run_button_label())
+            self.end_task_callback(completion_message)
+
+        self.after(0, _update_controls)
+
+    def _default_run_button_label(self) -> str:
+        return "실시간 세션 시작" if self.live_mode_var.get() == 1 else "회의 요약 실행"
 
     def _describe_backend_choice(self) -> str:
         mapping = {

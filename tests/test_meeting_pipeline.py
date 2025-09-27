@@ -12,6 +12,7 @@ from infopilot_core.agents.meeting import (
     MeetingJobConfig,
     MeetingPipeline,
     MeetingTranscriptionResult,
+    StreamingSummarySnapshot,
 )
 
 
@@ -41,9 +42,40 @@ def test_meeting_pipeline_runs(tmp_path: Path) -> None:
     assert "meeting_meta" in summary_payload
     assert summary_payload["summary"]["action_items"][0]["text"]
     assert "quality_metrics" in summary_payload
+    metrics = summary_payload["quality_metrics"]
+    assert metrics["rouge1_f"] >= 0.0
+    assert metrics["rougeL_f"] >= 0.0
+    assert "lfqa_coverage" in metrics
+    assert summary_payload["feedback"]["status"] == "pending"
+    assert summary_payload["attachments"]["feedback_queue"].endswith("feedback_queue.jsonl")
+    assert (output_dir / summary_payload["attachments"]["feedback_queue"]).exists()
 
     metadata = json.loads((output_dir / "metadata.json").read_text(encoding="utf-8"))
     assert metadata.get("quality_metrics", {}).get("summary_chars") > 0
+    assert metadata.get("feedback", {}).get("status") == "pending"
+
+
+def test_streaming_session_finalize(tmp_path: Path) -> None:
+    pipeline = MeetingPipeline(stt_backend="placeholder", summary_backend="heuristic")
+    job = MeetingJobConfig(audio_path=tmp_path / "live.wav", output_dir=tmp_path / "out")
+
+    session = pipeline.start_streaming(job, update_interval=0.0)
+    snapshot = session.ingest("첫 번째 의제는 프로젝트 일정 조율입니다.", speaker="호스트")
+    assert isinstance(snapshot, StreamingSummarySnapshot)
+    assert snapshot.highlights
+
+    session.ingest("액션 아이템으로 김대리가 위험 요소를 정리합니다.", speaker="호스트")
+    final_summary = session.finalize()
+
+    assert final_summary.raw_summary
+    assert final_summary.transcript_path.exists()
+
+    summary_json = job.output_dir / "summary.json"
+    assert summary_json.exists()
+    payload = json.loads(summary_json.read_text(encoding="utf-8"))
+    assert payload["feedback"]["status"] == "pending"
+    queue_name = payload["attachments"]["feedback_queue"]
+    assert (job.output_dir / queue_name).exists()
 
 
 @pytest.mark.full
