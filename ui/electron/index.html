@@ -1,104 +1,94 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="ko">
   <head>
     <meta charset="UTF-8" />
-    <title>Floating Toolbar</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Liquid Glass Assistant</title>
     <link rel="stylesheet" href="style.css" />
   </head>
   <body>
-    <div class="toolbar">
-      <div class="toolbar__left">
-        <button class="icon" data-action="mic" title="Record Voice">
+    <div class="toolbar-dock">
+      <div class="toolbar" role="toolbar">
+        <button class="icon" data-action="mic" title="음성 명령">
           <span aria-hidden="true">🎤</span>
-          <span class="visually-hidden">Start or stop voice capture</span>
+          <span class="visually-hidden">음성 명령</span>
         </button>
-        <button class="icon" data-action="smart-folders" title="Smart folders">
+        <button class="icon" data-view="smart-folders" title="스마트 폴더">
           <span aria-hidden="true">🗂️</span>
-          <span class="visually-hidden">Open smart folders</span>
+          <span class="visually-hidden">스마트 폴더 열기</span>
         </button>
-      </div>
-
-      <form class="command" id="command-form">
-        <input
-          type="text"
-          name="command"
-          id="command-input"
-          placeholder="무엇을 도와드릴까요? 예: 2019년 8월 회의록 요약해줘"
-          autocomplete="off"
-        />
-        <button type="submit" class="icon submit" title="Run command">
-          <span aria-hidden="true">➤</span>
-          <span class="visually-hidden">Run command</span>
+        <form class="command" id="command-form">
+          <input
+            type="text"
+            id="command-input"
+            name="command"
+            placeholder="무엇을 도와드릴까요? 예: 회의록 요약해줘"
+            autocomplete="off"
+          />
+          <button class="icon" type="submit" title="명령 실행">
+            <span aria-hidden="true">➤</span>
+            <span class="visually-hidden">명령 실행</span>
+          </button>
+        </form>
+        <button class="icon" data-view="meeting-summary" title="회의 요약">
+          <span aria-hidden="true">📝</span>
+          <span class="visually-hidden">회의 요약 열기</span>
         </button>
-      </form>
-
-      <div class="toolbar__right">
-        <button class="icon" data-action="copy" title="Copy Latest Summary">
-          <span aria-hidden="true">📋</span>
-          <span class="visually-hidden">Copy latest summary</span>
+        <button class="icon" data-view="knowledge-results" title="지식 검색">
+          <span aria-hidden="true">🔎</span>
+          <span class="visually-hidden">지식 검색 열기</span>
         </button>
-        <button class="icon" data-action="settings" title="Open Settings">
+        <button class="icon" data-action="settings" title="설정">
           <span aria-hidden="true">⚙️</span>
-          <span class="visually-hidden">Open settings dialog</span>
-        </button>
-        <button class="icon close" title="Close">
-          <span aria-hidden="true">✖</span>
-          <span class="visually-hidden">Close toolbar</span>
+          <span class="visually-hidden">설정 열기</span>
         </button>
       </div>
-
-      <div class="status" role="status" aria-live="polite"></div>
     </div>
 
-    <aside class="smart-folders" id="smart-folders" hidden>
-      <header>
-        <h2>스마트 폴더</h2>
-        <button class="icon close" data-action="close-smart-folders" title="Close smart folders">
-          <span aria-hidden="true">✖</span>
-          <span class="visually-hidden">Close smart folders</span>
-        </button>
-      </header>
-      <ul class="smart-folders__list" id="smart-folder-list" role="list"></ul>
-      <footer>
-        <small>폴더를 선택하면 해당 범위 안에서 회의 요약/지식 검색을 수행합니다.</small>
-      </footer>
-    </aside>
+    <div class="panel-layer" id="panel-layer" aria-hidden="true">
+      <div class="panel" id="main-panel">
+        <header class="panel__header">
+          <div>
+            <h2 id="panel-title">Liquid Glass 패널</h2>
+            <p class="panel__subtitle" id="panel-subtitle">맥OS 스타일 패널</p>
+          </div>
+          <button class="icon close" id="close-panel" title="패널 닫기">
+            <span aria-hidden="true">✕</span>
+            <span class="visually-hidden">패널 닫기</span>
+          </button>
+        </header>
+        <div class="panel__content">
+          <section class="panel-view" id="view-smart-folders" hidden>
+            <h3>스마트 폴더</h3>
+            <ul class="smart-folders__list" id="smart-folder-list" role="list"></ul>
+            <p class="panel__note">선택한 폴더 범위에서 요약과 검색을 수행합니다.</p>
+          </section>
 
-    <aside class="meeting-summary" id="meeting-summary" hidden>
-      <header>
-        <div>
-          <h2>회의 요약</h2>
-          <p class="meeting-summary__folder"></p>
-        </div>
-        <button class="icon close" data-action="close-meeting-summary" title="Close meeting summary">
-          <span aria-hidden="true">✖</span>
-          <span class="visually-hidden">Close meeting summary</span>
-        </button>
-      </header>
-      <section class="meeting-summary__content">
-        <p class="meeting-summary__text">요약 내용이 여기에 표시됩니다.</p>
-        <h3>주요 하이라이트</h3>
-        <ul class="meeting-summary__highlights"></ul>
-        <h3>액션 아이템</h3>
-        <ul class="meeting-summary__actions"></ul>
-      </section>
-    </aside>
+          <section class="panel-view" id="view-meeting-summary" hidden>
+            <div class="meeting-summary">
+              <p class="meeting-summary__folder" id="meeting-summary-folder"></p>
+              <p class="meeting-summary__text" id="meeting-summary-text">회의 요약 결과가 여기에 표시됩니다.</p>
+              <h4>주요 하이라이트</h4>
+              <ul class="meeting-summary__highlights" id="meeting-summary-highlights"></ul>
+              <h4>액션 아이템</h4>
+              <ul class="meeting-summary__actions" id="meeting-summary-actions"></ul>
+            </div>
+          </section>
 
-    <aside class="knowledge-results" id="knowledge-results" hidden>
-      <header>
-        <div>
-          <h2>검색 결과</h2>
-          <p class="knowledge-results__folder"></p>
+          <section class="panel-view" id="view-knowledge-results" hidden>
+            <div class="knowledge-results">
+              <p class="knowledge-results__folder" id="knowledge-results-folder"></p>
+              <ul class="knowledge-results__list" id="knowledge-results-list"></ul>
+            </div>
+          </section>
+
+          <section class="panel-view" id="view-placeholder">
+            <p>맥OS 스타일 liquid glass 패널입니다.</p>
+            <p>아이콘을 선택해 패널 콘텐츠를 전환하세요.</p>
+          </section>
         </div>
-        <button class="icon close" data-action="close-knowledge-results" title="Close knowledge results">
-          <span aria-hidden="true">✖</span>
-          <span class="visually-hidden">Close knowledge results</span>
-        </button>
-      </header>
-      <section class="knowledge-results__content">
-        <ul class="knowledge-results__list"></ul>
-      </section>
-    </aside>
+      </div>
+    </div>
 
     <script src="renderer.js"></script>
   </body>
