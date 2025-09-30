@@ -27,6 +27,57 @@ const PathToolkit = {
 
 let windowRef;
 const SMART_FOLDER_CONFIG = path.join(__dirname, "..", "..", "core", "config", "smart_folders.json");
+const SMART_POLICY_DIR = path.join(__dirname, "..", "..", "core", "data_pipeline", "policies");
+
+let smartFolderWatcher;
+let smartPolicyWatcher;
+
+function setupSmartFolderWatchers(targetWindow) {
+  const pushUpdate = () => {
+    if (targetWindow && !targetWindow.isDestroyed()) {
+      targetWindow.webContents.send("smart-folders:changed");
+    }
+  };
+
+  if (!smartFolderWatcher) {
+    try {
+      smartFolderWatcher = fs.watch(SMART_FOLDER_CONFIG, { persistent: false }, () => {
+        pushUpdate();
+      });
+    } catch (err) {
+      console.warn("[SmartFolders] watcher setup failed", err?.message || err);
+    }
+  }
+
+  if (!smartPolicyWatcher) {
+    try {
+      smartPolicyWatcher = fs.watch(SMART_POLICY_DIR, { recursive: true, persistent: false }, () => {
+        pushUpdate();
+      });
+    } catch (err) {
+      console.warn("[SmartPolicies] watcher setup failed", err?.message || err);
+    }
+  }
+}
+
+function teardownSmartFolderWatchers() {
+  if (smartFolderWatcher) {
+    try {
+      smartFolderWatcher.close();
+    } catch (err) {
+      console.warn("[SmartFolders] watcher close failed", err?.message || err);
+    }
+    smartFolderWatcher = null;
+  }
+  if (smartPolicyWatcher) {
+    try {
+      smartPolicyWatcher.close();
+    } catch (err) {
+      console.warn("[SmartPolicies] watcher close failed", err?.message || err);
+    }
+    smartPolicyWatcher = null;
+  }
+}
 
 function readSmartFolders() {
   try {
@@ -86,6 +137,7 @@ function createWindow() {
   });
 
   windowRef = win;
+  setupSmartFolderWatchers(win);
   return win;
 }
 
@@ -97,6 +149,10 @@ app.whenReady().then(() => {
       createWindow();
     }
   });
+});
+
+app.on("before-quit", () => {
+  teardownSmartFolderWatchers();
 });
 
 ipcMain.on("toolbar:close", () => {
@@ -113,166 +169,192 @@ ipcMain.on("toolbar:close", () => {
 
 ipcMain.handle("run-meeting-agent", async (_event, payload) => {
   const { query, folder } = payload || {};
+  const folderContext = folder || {
+    label: "선택된 폴더",
+    path: "",
+    scope: "local",
+    policyPath: "",
+  };
 
   return new Promise((resolve) => {
-    const fallbackSummary = {
-      summary: "회의 요약 결과를 생성했습니다 (모의 데이터).",
-      actions: ["액션 아이템 A", "액션 아이템 B"],
-      folder,
-      query,
-    };
-
     try {
-      const mockScript = path.join(__dirname, "..", "..", "scripts", "pipeline", "mock_meeting_summary.py");
-      const child = spawn("python3", [mockScript, query, "--folder", folder?.path ?? "", "--json"], {
+      const scriptPath = path.join(__dirname, "..", "..", "scripts", "run_meeting_agent.py");
+      const args = [
+        scriptPath,
+        "--folder-path",
+        folderContext.path || "",
+        "--folder-label",
+        folderContext.label || "",
+        "--folder-scope",
+        folderContext.scope || "",
+        "--policy-path",
+        folderContext.policyPath || "",
+        "--query",
+        query || "",
+        "--output-json",
+      ];
+
+      const child = spawn("python3", args, {
         cwd: path.join(__dirname, "..", ".."),
         shell: false,
       });
 
       let stdout = "";
+      let stderr = "";
       child.stdout.on("data", (data) => {
         stdout += data.toString();
       });
+      child.stderr.on("data", (data) => {
+        stderr += data.toString();
+      });
 
-      child.on("close", () => {
+      const finalize = (exitCode) => {
+        let parsed = null;
         try {
-          const parsed = JSON.parse(stdout.trim() || "{}");
-          const normalizedFolder =
-            parsed && typeof parsed.folder === "object" && parsed.folder !== null
-              ? parsed.folder
-              : {
-                  label:
-                    folder?.label ||
-                    (typeof parsed.folder === "string" && parsed.folder.trim()
-                      ? parsed.folder.trim()
-                      : "선택된 폴더"),
-                  path:
-                    folder?.path ||
-                    (typeof parsed.folder === "string" ? parsed.folder : ""),
-                  scope: folder?.scope || "auto",
-                  policyPath: folder?.policyPath || "",
-                };
-          const normalized = {
-            ...parsed,
-            folder: normalizedFolder,
-            query: parsed.query || query,
-            highlights: Array.isArray(parsed.highlights) ? parsed.highlights : [],
-            actions: Array.isArray(parsed.actions) ? parsed.actions : [],
-          };
-          resolve({ ok: true, data: normalized, fallback: false });
+          parsed = JSON.parse(stdout.trim() || "{}");
         } catch (err) {
-          resolve({ ok: true, data: fallbackSummary, fallback: true, error: err?.message });
+          parsed = {
+            ok: false,
+            error: err?.message || "meeting agent 응답을 처리하지 못했습니다.",
+            data: null,
+          };
         }
+
+        const response = {
+          ok: Boolean(parsed?.ok) && exitCode === 0,
+          data: parsed?.data || null,
+          error: parsed?.error || (exitCode === 0 ? null : `meeting agent 종료 코드 ${exitCode}`),
+          stderr: stderr.trim() || null,
+          exitCode,
+          fallback: false,
+        };
+        resolve(response);
+      };
+
+      child.on("close", (code) => {
+        finalize(typeof code === "number" ? code : -1);
       });
 
       child.on("error", (err) => {
-        resolve({ ok: false, error: err.message, data: fallbackSummary, fallback: true });
+        resolve({
+          ok: false,
+          data: null,
+          error: err.message,
+          stderr: stderr.trim() || null,
+          exitCode: -1,
+          fallback: false,
+        });
       });
     } catch (err) {
-      resolve({ ok: false, error: err.message, data: fallbackSummary, fallback: true });
+      resolve({
+        ok: false,
+        data: null,
+        error: err.message,
+        stderr: null,
+        exitCode: -1,
+        fallback: false,
+      });
     }
   });
 });
 
 ipcMain.handle("run-knowledge-agent", async (_event, payload) => {
   const { query, folder } = payload || {};
+  const folderContext = folder || {
+    label: "선택된 폴더",
+    path: "",
+    scope: "local",
+    policyPath: "",
+  };
+
+  if (!query || !query.trim()) {
+    return {
+      ok: false,
+      data: null,
+      error: "검색할 내용을 입력해주세요.",
+      stderr: null,
+      exitCode: -1,
+      fallback: false,
+    };
+  }
 
   return new Promise((resolve) => {
-    const scriptPath = path.join(__dirname, "..", "..", "scripts", "pipeline", "infopilot.py");
-    const baseArgs = [
-      "chat",
-      "--model",
-      "data/topic_model.joblib",
-      "--corpus",
-      "data/corpus.parquet",
-      "--cache",
-      "data/cache",
-    ];
-    if (folder?.scope && folder.scope !== "auto") {
-      baseArgs.push("--scope", folder.scope);
-    }
-    if (folder?.policyPath) {
-      baseArgs.push("--policy", folder.policyPath);
-    }
-    const args = [...baseArgs, "--query", query, "--json"];
+    try {
+      const scriptPath = path.join(__dirname, "..", "..", "scripts", "run_knowledge_agent.py");
+      const args = [
+        scriptPath,
+        "--query",
+        query,
+        "--folder-path",
+        folderContext.path || "",
+        "--folder-label",
+        folderContext.label || "",
+        "--folder-scope",
+        folderContext.scope || "auto",
+        "--policy-path",
+        folderContext.policyPath || "",
+      ];
 
-    const child = spawn("python3", [scriptPath, ...args], {
-      cwd: path.join(__dirname, "..", ".."),
-      shell: false,
-    });
-
-    let stdout = "";
-    child.stdout.on("data", (data) => {
-      stdout += data.toString();
-    });
-
-    const handleMockFallback = (errorMessage) => {
-      const mockScript = path.join(__dirname, "..", "..", "scripts", "pipeline", "mock_knowledge_search.py");
-      const mockChild = spawn("python3", [mockScript, query, "--folder", folder?.path ?? "", "--json"], {
+      const child = spawn("python3", args, {
         cwd: path.join(__dirname, "..", ".."),
         shell: false,
       });
-      let mockStdout = "";
-      mockChild.stdout.on("data", (d) => {
-        mockStdout += d.toString();
+
+      let stdout = "";
+      let stderr = "";
+      child.stdout.on("data", (data) => {
+        stdout += data.toString();
       });
-      mockChild.on("close", () => {
+      child.stderr.on("data", (data) => {
+        stderr += data.toString();
+      });
+
+      const finalize = (exitCode) => {
+        let parsed;
         try {
-          const parsed = JSON.parse(mockStdout.trim());
-          resolve({
-            ok: true,
-            fallback: true,
-            error: errorMessage,
-            data: {
-              query,
-              folder,
-              items: Array.isArray(parsed.items)
-                ? parsed.items.map((hit) => ({
-                    title: hit.title,
-                    snippet: hit.snippet,
-                    path: hit.path,
-                    score: null,
-                  }))
-                : [],
-            },
-          });
+          parsed = JSON.parse(stdout.trim() || "{}");
         } catch (err) {
-          resolve({ ok: false, data: null, fallback: true, error: err?.message || errorMessage });
+          parsed = {
+            ok: false,
+            error: err?.message || "knowledge agent 응답을 처리하지 못했습니다.",
+            data: null,
+          };
         }
-      });
-      mockChild.on("error", (err) => {
-        resolve({ ok: false, data: null, fallback: true, error: err.message || errorMessage });
-      });
-    };
 
-    child.on("close", (code) => {
-      if (code !== 0) {
-        handleMockFallback(`infopilot chat exited with code ${code}`);
-        return;
-      }
-      try {
-        const parsed = JSON.parse(stdout.trim());
-        const normalized = {
-          query: parsed.query,
-          folder,
-          items: Array.isArray(parsed.results)
-            ? parsed.results.map((hit) => ({
-                title: hit.title || PathToolkit.baseName(hit.path),
-                snippet: hit.preview || hit.snippet || "",
-                path: hit.path,
-                score: hit.score,
-              }))
-            : [],
-        };
-        resolve({ ok: true, data: normalized, fallback: false });
-      } catch (err) {
-        handleMockFallback(err?.message || "JSON parse error");
-      }
-    });
+        resolve({
+          ok: Boolean(parsed?.ok) && exitCode === 0,
+          data: parsed?.data || null,
+          error: parsed?.error || (exitCode === 0 ? null : `knowledge agent 종료 코드 ${exitCode}`),
+          stderr: stderr.trim() || null,
+          exitCode,
+          fallback: false,
+        });
+      };
 
-    child.on("error", (err) => {
-      handleMockFallback(err.message);
-    });
+      child.on("close", (code) => {
+        finalize(typeof code === "number" ? code : -1);
+      });
+
+      child.on("error", (err) => {
+        resolve({
+          ok: false,
+          data: null,
+          error: err.message,
+          stderr: stderr.trim() || null,
+          exitCode: -1,
+          fallback: false,
+        });
+      });
+    } catch (err) {
+      resolve({
+        ok: false,
+        data: null,
+        error: err.message,
+        stderr: null,
+        exitCode: -1,
+        fallback: false,
+      });
+    }
   });
 });
 
@@ -298,6 +380,7 @@ ipcMain.handle("load-smart-folders", async () => {
 
 app.on("window-all-closed", () => {
   if (process.platform !== "darwin") {
+    teardownSmartFolderWatchers();
     app.quit();
   }
 });

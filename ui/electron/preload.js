@@ -13,6 +13,12 @@ contextBridge.exposeInMainWorld("toolbarAPI", {
   runKnowledge: (payload) => ipcRenderer.invoke("run-knowledge-agent", payload),
   openPath: (targetPath) => ipcRenderer.invoke("open-path", targetPath),
   loadSmartFolders: () => ipcRenderer.invoke("load-smart-folders"),
+  onSmartFoldersChanged: (callback) => {
+    if (typeof callback !== "function") {
+      return;
+    }
+    ipcRenderer.on("smart-folders:changed", () => callback());
+  },
 });
 
 window.addEventListener("DOMContentLoaded", () => {

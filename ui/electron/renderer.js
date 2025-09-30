@@ -181,9 +181,16 @@
           togglePanel(true, "meeting-summary");
           showStatus("회의 요약 결과를 확인하세요.");
         } else {
-          showStatus("회의 요약 중 오류가 발생했습니다.");
+          if (response?.stderr) {
+            console.error("[MeetingAgent] stderr:", response.stderr);
+          }
+          if (response?.error) {
+            console.error("[MeetingAgent] error:", response.error);
+          }
+          showStatus(response?.error || "회의 요약 중 오류가 발생했습니다.");
         }
       } catch (err) {
+        console.error("[MeetingAgent] unexpected error", err);
         showStatus("회의 요약 중 오류가 발생했습니다.");
       }
     }
@@ -209,9 +216,16 @@
           togglePanel(true, "knowledge-results");
           showStatus("검색 결과를 정리했습니다.");
         } else {
-          showStatus("지식 검색 중 오류가 발생했습니다.");
+          if (response?.stderr) {
+            console.error("[KnowledgeAgent] stderr:", response.stderr);
+          }
+          if (response?.error) {
+            console.error("[KnowledgeAgent] error:", response.error);
+          }
+          showStatus(response?.error || "지식 검색 중 오류가 발생했습니다.");
         }
       } catch (err) {
+        console.error("[KnowledgeAgent] unexpected error", err);
         showStatus("지식 검색 중 오류가 발생했습니다.");
       }
     }
@@ -490,4 +504,12 @@
   });
 
   loadSmartFolders().then(() => updatePlaceholder());
+
+  if (window.toolbarAPI && typeof window.toolbarAPI.onSmartFoldersChanged === "function") {
+    window.toolbarAPI.onSmartFoldersChanged(() => {
+      loadSmartFolders().then(() => {
+        showStatus("스마트 폴더 구성을 다시 불러왔습니다.");
+      });
+    });
+  }
 })();

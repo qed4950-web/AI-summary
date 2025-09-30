@@ -82,6 +82,14 @@ DECISION_KEYWORDS = {
     "zh": ["决定", "批准", "确认", "定案"],
 }
 
+HIGHLIGHT_KEYWORDS = {
+    "default": ["key", "highlight", "important", "summary", "note"],
+    "ko": ["핵심", "하이라이트", "중요", "요약", "결론", "중점"],
+    "en": ["key", "highlight", "important", "summary", "notable"],
+    "ja": ["重要", "ハイライト", "要点", "まとめ"],
+    "zh": ["重点", "亮点", "总结", "重要"]
+}
+
 HIGHLIGHT_FALLBACK = {
     "ko": "회의 주요 내용을 식별하지 못했습니다.",
     "en": "No key highlights detected.",
@@ -311,14 +319,26 @@ class MeetingPipeline:
         )
 
     def _collect_context_bundle(self, job: MeetingJobConfig) -> ContextBundle:
+        allowed_roots = {
+            job.audio_path.parent.resolve(strict=False),
+        }
+        for path in job.context_dirs:
+            try:
+                allowed_roots.add(path.resolve(strict=False))
+            except FileNotFoundError:
+                allowed_roots.add(path.expanduser().resolve(strict=False))
+
         try:
             bundle = self._context_adapter.collect(
                 job_audio=job.audio_path,
                 output_dir=job.output_dir,
                 extra_dirs=job.context_dirs,
+                allowed_roots=allowed_roots,
             )
             self._record_context(job.audio_path.stem, bundle)
             return bundle
+        except PermissionError:
+            raise
         except Exception as exc:  # pragma: no cover - defensive
             LOGGER.warning("context collection failed: %s", exc)
             return ContextBundle(summary_prompt=None, documents=[])
@@ -508,15 +528,11 @@ class MeetingPipeline:
 
     def _invoke_stt_backend(self, job: MeetingJobConfig) -> TranscriptionPayload:
         if self._stt is None:
-            LOGGER.warning(
-                "STT backend '%s' is not configured; using placeholder transcript",
-                self.stt_backend,
-            )
-            return TranscriptionPayload(
-                text="(transcription not available – STT backend disabled)",
-                language=job.language,
+            raise RuntimeError(
+                f"STT backend '{self.stt_backend}' is not configured or unavailable",
             )
 
+        chunk_exception: Optional[Exception] = None
         try:
             payload = self._stt.transcribe(
                 job.audio_path,
@@ -535,12 +551,14 @@ class MeetingPipeline:
                     if chunk_payload.text:
                         LOGGER.info("chunked STT fallback succeeded for %s", job.audio_path)
                         return self._postprocess_transcript(chunk_payload)
+                    raise RuntimeError("chunked STT fallback returned empty transcript")
                 except Exception as chunk_exc:  # pragma: no cover - diagnostics
+                    chunk_exception = chunk_exc
                     LOGGER.warning("chunked STT fallback failed: %s", chunk_exc)
-            return TranscriptionPayload(
-                text=f"(transcription failed: {exc})",
-                language=job.language,
-            )
+            failure = chunk_exception or exc
+            raise RuntimeError(
+                f"STT backend '{self.stt_backend}' failed to produce a transcript",
+            ) from failure
 
     def _transcribe_in_chunks(
         self,
@@ -572,7 +590,9 @@ class MeetingPipeline:
                 data = audio.read(frames_per_chunk)
                 if data.size == 0:
                     break
-                chunk_path = Path(tempfile.mkstemp(suffix=job.audio_path.suffix)[1])
+                fd, tmp_name = tempfile.mkstemp(suffix=job.audio_path.suffix)
+                os.close(fd)
+                chunk_path = Path(tmp_name)
                 try:
                     sf.write(str(chunk_path), data, samplerate)
                     chunk_payload = self._stt.transcribe(
@@ -742,23 +762,27 @@ class MeetingPipeline:
             return False
 
     def _extract_highlights(self, segments: Sequence[dict], language: str) -> List[dict]:
-        entries: List[dict] = []
+        scored: List[Tuple[float, dict]] = []
         for segment in segments:
             text = (segment.get("text") or "").strip()
             if not text:
                 continue
-            entries.append(
-                {
-                    "text": text,
-                    "ref": self._format_timestamp(segment.get("start")),
-                }
+            score = self._score_highlight(text, language)
+            if score <= 0:
+                continue
+            scored.append(
+                (
+                    score,
+                    {
+                        "text": text,
+                        "ref": self._format_timestamp(segment.get("start")),
+                    },
+                )
             )
-            if len(entries) >= 3:
-                break
 
-        if not entries:
-            return [{"text": self._fallback_message(language, HIGHLIGHT_FALLBACK)}]
-        return entries
+        scored.sort(key=lambda item: item[0], reverse=True)
+        top_entries = [entry for _score, entry in scored[:3]]
+        return top_entries
 
     def _extract_action_items(self, segments: Sequence[dict], language: str) -> List[dict]:
         keywords = self._keywords_for(language, ACTION_KEYWORDS)
@@ -774,30 +798,58 @@ class MeetingPipeline:
         keywords: Sequence[str],
         language: str,
     ) -> List[dict]:
-        collected: List[dict] = []
         lowered_keywords = [kw.lower() for kw in keywords]
+        scored: List[Tuple[float, dict]] = []
         for segment in segments:
             raw_text = segment.get("text")
             text = (raw_text or "").strip()
             if not text:
                 continue
             lowered = text.lower()
-            if any(keyword in lowered for keyword in lowered_keywords):
-                collected.append(
+            match_count = sum(lowered.count(keyword) for keyword in lowered_keywords)
+            if match_count == 0:
+                continue
+            score = self._score_segment(text, match_count)
+            scored.append(
+                (
+                    score,
                     {
                         "text": text,
                         "ref": self._format_timestamp(segment.get("start")),
-                    }
+                    },
                 )
-        if not collected:
-            fallback_segment = segments[0] if segments else {}
-            fallback_text = (fallback_segment.get("text") or self._fallback_message(language, GENERIC_FALLBACK)).strip()
-            entry = {"text": fallback_text}
-            ref = self._format_timestamp(fallback_segment.get("start")) if fallback_segment else None
-            if ref:
-                entry["ref"] = ref
-            collected.append(entry)
-        return collected
+            )
+
+        scored.sort(key=lambda item: item[0], reverse=True)
+        return [entry for _score, entry in scored[:5]]
+
+    def _score_highlight(self, text: str, language: str) -> float:
+        words = text.split()
+        if len(words) < 5:
+            return 0.0
+        score = min(len(words) / 6.0, 2.0)
+
+        lowered = text.lower()
+        highlight_keywords = self._keywords_for(language, HIGHLIGHT_KEYWORDS)
+        if any(keyword in lowered for keyword in highlight_keywords):
+            score += 1.2
+
+        if any(char.isdigit() for char in text):
+            score += 0.3
+
+        if any(punct in text for punct in ("?", "!")):
+            score += 0.2
+
+        return score
+
+    @staticmethod
+    def _score_segment(text: str, match_count: int) -> float:
+        words = text.split()
+        base = min(len(words) / 5.0, 2.0)
+        score = base + match_count
+        if any(char.isdigit() for char in text):
+            score += 0.2
+        return score
 
     def _build_summary_text(
         self,

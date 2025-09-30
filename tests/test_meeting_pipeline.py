@@ -208,8 +208,8 @@ def test_context_store_and_integrations_scaffolding(tmp_path: Path, monkeypatch)
     store_file = rag_store / f"{audio.stem}.jsonl"
     assert store_file.exists()
     lines = store_file.read_text(encoding="utf-8").splitlines()
-    assert any("\"type\": "summary"" in line for line in lines)
-    assert any("\"type\": "transcript"" in line for line in lines)
+    assert any('"type": "summary"' in line for line in lines)
+    assert any('"type": "transcript"' in line for line in lines)
     integration_file = integration_out / "action_items.json"
     assert integration_file.exists()
 
@@ -369,7 +369,7 @@ def test_collect_by_keywords_handles_missing_text(monkeypatch) -> None:
     assert collected[0]["text"].startswith("Follow up")
 
     fallback = pipeline._collect_by_keywords([{"speaker": "speaker_1"}], ["todo"], "ko")
-    assert fallback[0]["text"] == "관련 항목이 발견되지 않았습니다."
+    assert fallback == []
 
 
 @pytest.mark.full
@@ -419,6 +419,40 @@ def test_chunked_stt_fallback(monkeypatch, tmp_path: Path) -> None:
     metadata = json.loads((tmp_path / "metadata.json").read_text(encoding="utf-8"))
     assert metadata["cache"]["stt_backend"] == "whisper"
     assert chunk_calls["count"] == 1
+
+
+@pytest.mark.full
+def test_context_collection_rejects_out_of_scope(monkeypatch, tmp_path: Path) -> None:
+    scoped_dir = tmp_path / "scoped"
+    scoped_dir.mkdir()
+    audio = scoped_dir / "meeting.wav"
+    audio.write_bytes(b"audio")
+    transcript = scoped_dir / "meeting.wav.txt"
+    transcript.write_text("회의 내용", encoding="utf-8")
+
+    outside_dir = tmp_path.parent / "outside_context"
+    outside_dir.mkdir(exist_ok=True)
+
+    monkeypatch.setenv("MEETING_CONTEXT_PRE_DIR", str(outside_dir))
+
+    job = MeetingJobConfig(audio_path=audio, output_dir=tmp_path / "out", context_dirs=[scoped_dir])
+    pipeline = MeetingPipeline(stt_backend="placeholder", summary_backend="heuristic")
+
+    with pytest.raises(PermissionError):
+        pipeline.run(job)
+
+@pytest.mark.full
+def test_highlight_scoring_prefers_keyword_segments() -> None:
+    pipeline = MeetingPipeline(stt_backend="placeholder", summary_backend="heuristic")
+    segments = [
+        {"text": "안녕하세요", "start": 0.0},
+        {"text": "핵심 결론은 출시 일정을 6월로 조정한다는 것입니다.", "start": 1.0},
+        {"text": "회의가 종료되었습니다", "start": 2.0},
+    ]
+
+    highlights = pipeline._extract_highlights(segments, "ko")
+    assert highlights
+    assert highlights[0]["text"].startswith("핵심 결론")
 
 
 @pytest.mark.full

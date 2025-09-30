@@ -68,11 +68,18 @@ class MeetingContextAdapter:
         job_audio: Path,
         output_dir: Path,
         extra_dirs: Iterable[Path] | None = None,
+        allowed_roots: Iterable[Path] | None = None,
     ) -> ContextBundle:
         """Collect context documents and copy them into the meeting output."""
 
         attachments_dir = output_dir / "attachments"
         attachments_dir.mkdir(parents=True, exist_ok=True)
+
+        normalized_allowed: List[Path] = []
+        if allowed_roots:
+            normalized_allowed = [
+                root.expanduser().resolve(strict=False) for root in allowed_roots
+            ]
 
         directories: List[Path] = []
         directories.extend(self._pre_dirs)
@@ -87,8 +94,26 @@ class MeetingContextAdapter:
         if audio_dir not in directories and audio_dir.exists():
             directories.append(audio_dir)
 
-        collected: List[ContextDocument] = []
+        validated_directories: List[Path] = []
+        disallowed: List[Path] = []
         for directory in directories:
+            candidate = directory.expanduser().resolve(strict=False)
+            if normalized_allowed and not any(
+                candidate == root or candidate.is_relative_to(root)
+                for root in normalized_allowed
+            ):
+                disallowed.append(candidate)
+                continue
+            validated_directories.append(candidate)
+
+        if disallowed:
+            raise PermissionError(
+                "context directory outside allowed scope: "
+                + ", ".join(str(path) for path in disallowed)
+            )
+
+        collected: List[ContextDocument] = []
+        for directory in validated_directories:
             collected.extend(self._scan_directory(directory, attachments_dir, job_audio.stem))
 
         if not collected:
@@ -169,4 +194,3 @@ class MeetingContextAdapter:
         if len(text) > self._max_preview_chars:
             text = text[: self._max_preview_chars].rstrip() + "…"
         return text
-
