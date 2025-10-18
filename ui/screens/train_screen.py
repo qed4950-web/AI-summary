@@ -3,25 +3,27 @@ import customtkinter as ctk
 import os
 import pandas as pd
 import time
-import joblib
 import threading
 from pathlib import Path
 
 # Core logic and helpers
 from src.core.helpers import get_drives
 from src.config import (
-    EXCLUDE_DIRS, SUPPORTED_EXTS,
-    DATA_DIR, MODELS_DIR, CACHE_DIR,
-    CORPUS_PARQUET, FOUND_FILES_CSV, TOPIC_MODEL_PATH
+    EXCLUDE_DIRS,
+    SUPPORTED_EXTS,
+    DATA_DIR,
+    CACHE_DIR,
+    CORPUS_PARQUET,
+    FOUND_FILES_CSV,
+    TOPIC_MODEL_PATH,
 )
-from src.core.corpus import CorpusBuilder
+from core.data_pipeline.pipeline import TrainConfig, run_step2
 from src.core.indexing import run_indexing
 
 def _run_full_train_logic(exts_text, do_scan, log_callback, done_callback):
     try:
         log_callback("INFO: 필요 디렉토리 생성 중...")
         DATA_DIR.mkdir(parents=True, exist_ok=True)
-        MODELS_DIR.mkdir(parents=True, exist_ok=True)
         CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
         rows = None
@@ -39,41 +41,52 @@ def _run_full_train_logic(exts_text, do_scan, log_callback, done_callback):
                             if p_file.suffix.lower() in current_supported_exts:
                                 if not any(part in EXCLUDE_DIRS for part in p_file.parts):
                                     stat = p_file.stat()
-                                    file_list.append({'path': str(p_file), 'size': stat.st_size, 'mtime': stat.st_mtime})
-                        except (FileNotFoundError, PermissionError): continue
+                                    file_list.append(
+                                        {
+                                            'path': str(p_file),
+                                            'size': stat.st_size,
+                                            'mtime': stat.st_mtime,
+                                            'ext': p_file.suffix.lower(),
+                                        }
+                                    )
+                        except (FileNotFoundError, PermissionError):
+                            continue
             rows = file_list
             pd.DataFrame(rows).to_csv(FOUND_FILES_CSV, index=False, encoding="utf-8")
             log_callback(f"SUCCESS: 스캔 완료. {len(rows):,}개 파일 발견.")
 
-        log_callback("INFO: 텍스트 추출 및 코퍼스 생성 시작...")
-        if CORPUS_PARQUET.exists(): CORPUS_PARQUET.unlink()
-        
-        cb = CorpusBuilder(progress=True)
-        
         if rows is None and FOUND_FILES_CSV.exists():
             rows = pd.read_csv(FOUND_FILES_CSV).to_dict("records")
-        
-        if rows:
-            log_callback(f"INFO: {len(rows)}개 파일에서 텍스트를 추출합니다... (진행률은 콘솔 창에 표시됩니다)")
-            df_corpus = cb.build(rows)
-            cb.save(df_corpus, CORPUS_PARQUET)
-            log_callback("SUCCESS: 코퍼스 생성 완료.")
-        else:
-            log_callback("ERROR: 스캔된 파일이 없어 코퍼스를 생성할 수 없습니다.")
+
+        if not rows:
+            log_callback("ERROR: 처리할 파일 목록이 없습니다. 스캔을 먼저 수행하세요.")
             done_callback()
             return
 
-        log_callback("INFO: 벡터 인덱싱 시작... (진행률은 콘솔 창에 표시됩니다)")
-        if CORPUS_PARQUET.exists():
-            run_indexing(corpus_path=CORPUS_PARQUET, cache_dir=CACHE_DIR)
-            log_callback("SUCCESS: 인덱싱 완료.")
-        else:
-            log_callback("WARNING: 코퍼스 파일이 없어 인덱싱을 건너뜁니다.")
+        log_callback("INFO: 텍스트 추출 및 임베딩 학습을 실행합니다... (콘솔에 진행률 표시)")
+        for record in rows:
+            record.setdefault('ext', Path(record['path']).suffix.lower())
+        try:
+            cfg = TrainConfig(use_sentence_transformer=False)
+            run_step2(
+                rows,
+                out_corpus=CORPUS_PARQUET,
+                out_model=TOPIC_MODEL_PATH,
+                cfg=cfg,
+                use_tqdm=False,
+                translate=False,
+            )
+            log_callback("SUCCESS: 코퍼스와 토픽 모델 학습 완료.")
+        except Exception as exc:
+            log_callback(f"FATAL: 학습 단계에서 오류가 발생했습니다: {exc}")
+            done_callback()
+            return
 
-        log_callback("INFO: 학습 메타 정보 저장 중...")
-        meta = {"indexed_at": time.strftime("%Y-%m-%d %H:%M:%S")}
-        joblib.dump(meta, TOPIC_MODEL_PATH)
-        log_callback("🎉 SUCCESS: 모든 학습 과정 완료!")
+        log_callback("INFO: 벡터 인덱스를 재생성합니다... (잠시 기다려주세요)")
+        run_indexing(corpus_path=CORPUS_PARQUET, cache_dir=CACHE_DIR)
+        log_callback("SUCCESS: 인덱싱 완료.")
+
+        log_callback("🎉 SUCCESS: 모든 학습 과정이 완료되었습니다!")
 
     except Exception as e:
         log_callback(f"FATAL: 학습 중 오류 발생 - {e}")

@@ -8,7 +8,7 @@
 ### 진행 현황
 - [x] STT 모델/서비스 샘플 파이프라인 구조 마련 (`core/agents/meeting/`)
 - [x] 요약·액션 추출 로직과 정책 연동을 위한 데이터 모델/스토리지 뼈대 정의
-- [ ] 회의 로그 저장 포맷 정의 및 인덱싱 파이프라인 통합
+- [x] 회의 로그 저장 포맷 정의 및 인덱싱 파이프라인 통합
 - [ ] 작업 센터/알림 경로 프로토타입
 
 #### 2025-09-27 업데이트
@@ -20,6 +20,10 @@
 - 장시간 회의를 위해 `MEETING_STT_CHUNK_SECONDS` 기반 chunk STT 재시도 로직을 추가하고, 실패 시 자동으로 분할 전사를 수행하도록 보완.
 - 액션 아이템을 `tasks.json`, 회의 이벤트를 `meeting.ics`, 연동 정보를 `integrations.json`으로 출력해 캘린더/업무 도구에 곧바로 가져갈 수 있도록 구조화했습니다.
 
+#### 2025-10-17 점검
+- 회의 파이프라인 아티팩트는 `core/agents/meeting/pipeline.py`에서 JSON/ICS/Audit/Vector 로그까지 정리되어 있으나, 작업 센터로 전달하는 이벤트/알림 채널은 미구현 상태입니다.
+- 회의 품질 지표 및 피드백 큐는 생성되므로, Cycle 2의 작업 센터 MVP가 준비되는 즉시 연동 API를 설계해야 합니다.
+
 ### 산출물
 - 에이전트 모델/파이프라인: `core/agents/meeting/models.py`, `.../pipeline.py`
 - 기본 설정 템플릿: `config/meeting_agent.yaml`
@@ -27,5 +31,7 @@
 - 회귀 테스트: `tests/test_meeting_pipeline.py`
 
 ### 다음 단계 체크리스트
+- 회의 요약/알림을 Work Center 이벤트 버스로 전달하는 API 초안 구현 및 통합 테스트 작성
+- STT 품질 지표와 피드백 큐를 UI 대시보드와 연동할 데이터 모델 확정
 - Cycle 3 완료 후 STT 품질 검증/피드백, Cycle 4(사진 비서) 계획 조정
 - 주요 결정/리스크는 `docs/cycles/cycle_3.md`에 기록

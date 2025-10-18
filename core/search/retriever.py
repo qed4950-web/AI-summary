@@ -14,7 +14,8 @@ import weakref
 import importlib
 import calendar
 import hashlib
-from collections import deque
+import copy
+from collections import deque, OrderedDict
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from functools import lru_cache
@@ -62,6 +63,20 @@ try:
     import faiss  # type: ignore
 except Exception:
     faiss = None
+else:
+    if hasattr(faiss, "omp_set_num_threads"):
+        try:
+            requested = os.environ.get("FAISS_OMP_NUM_THREADS") or os.environ.get("OMP_NUM_THREADS")
+            threads = max(1, int(requested)) if requested else None
+        except Exception:
+            threads = None
+        if threads is None and sys.platform == "darwin":
+            threads = 1
+        if threads is not None:
+            try:
+                faiss.omp_set_num_threads(max(1, int(threads)))
+            except Exception:
+                pass
 
 try:
     from rank_bm25 import BM25Okapi
@@ -595,12 +610,12 @@ def _classify_query(
     metadata_filters: "MetadataFilters",
     requested_exts: Set[str],
 ) -> str:
-    tokens = _split_tokens((query or "").lower())
+    token_count = _token_count_lower(query)
     if metadata_filters.is_active() or requested_exts:
         return "narrow"
-    if len(tokens) <= 3:
+    if token_count <= 3:
         return "narrow"
-    if len(tokens) >= 10:
+    if token_count >= 12:
         return "broad"
     return "broad"
 
@@ -618,14 +633,15 @@ def _dynamic_search_params(
         requested_exts=requested_exts,
     )
     base_top_k = max(1, int(top_k))
+    token_count = _token_count_lower(query)
     if classification == "narrow":
         oversample = min(6, max(2, base_top_k))
-        rerank_depth = max(base_top_k * 2, 40)
+        rerank_depth = max(base_top_k * 2, 30 + (token_count * 2))
         fusion_depth = max(base_top_k * 2, base_top_k + 10)
     else:
-        oversample = min(10, max(3, base_top_k * 2))
-        rerank_depth = max(base_top_k * 3, 120)
-        fusion_depth = max(base_top_k * 3, base_top_k + 20)
+        oversample = min(12, max(3, base_top_k * 2))
+        rerank_depth = max(base_top_k * 3, 80 + (token_count * 3))
+        fusion_depth = max(base_top_k * 3, base_top_k + 25)
     return {
         "oversample": max(1, oversample),
         "rerank_depth": max(base_top_k, rerank_depth),
@@ -2579,6 +2595,85 @@ class CacheSignatureMonitor:
             self._stop_event.wait(self._interval)
 
 
+class QueryResultCache:
+    """Simple LRU cache for storing annotated search results."""
+
+    def __init__(self, max_entries: int = 128) -> None:
+        self.max_entries = max(1, int(max_entries or 1))
+        self._store: "OrderedDict[Any, Any]" = OrderedDict()
+
+    def get(self, key: Any) -> Optional[Any]:
+        try:
+            value = self._store.pop(key)
+        except KeyError:
+            return None
+        self._store[key] = value
+        return copy.deepcopy(value)
+
+    def set(self, key: Any, value: Any) -> None:
+        self._store[key] = copy.deepcopy(value)
+        self._store.move_to_end(key)
+        while len(self._store) > self.max_entries:
+            self._store.popitem(last=False)
+
+    def clear(self) -> None:
+        self._store.clear()
+
+
+class SemanticQueryCache:
+    """Stores query vectors and associated results for approximate reuse."""
+
+    def __init__(self, max_entries: int = 64, threshold: float = 0.97) -> None:
+        self.max_entries = max(1, int(max_entries or 1))
+        self.threshold = max(0.0, min(1.0, float(threshold)))
+        self._entries: List[Tuple[np.ndarray, Any]] = []
+
+    def match(self, vector: np.ndarray) -> Optional[Any]:
+        if not self._entries:
+            return None
+        try:
+            candidate = VectorIndex._normalize_vector(vector)
+        except Exception:
+            return None
+
+        best_idx: Optional[int] = None
+        best_score = self.threshold
+        for idx, (entry_vec, entry_payload) in enumerate(self._entries):
+            try:
+                score = float(np.dot(entry_vec, candidate))
+            except Exception:
+                continue
+            if score >= best_score:
+                best_idx = idx
+                best_score = score
+
+        if best_idx is None:
+            return None
+
+        entry_vec, entry_payload = self._entries.pop(best_idx)
+        self._entries.append((entry_vec, entry_payload))
+        return copy.deepcopy(entry_payload)
+
+    def store(self, vector: np.ndarray, payload: Any) -> None:
+        try:
+            normalised = VectorIndex._normalize_vector(vector)
+        except Exception:
+            return
+        self._entries.append((normalised, copy.deepcopy(payload)))
+        if len(self._entries) > self.max_entries:
+            self._entries.pop(0)
+
+    def clear(self) -> None:
+        self._entries.clear()
+
+    def set_threshold(self, new_threshold: float) -> None:
+        self.threshold = max(0.0, min(1.0, float(new_threshold)))
+
+
+def _token_count_lower(query: str) -> int:
+    return len(_split_tokens((query or "").lower()))
+
+
 class Retriever:
     def __init__(
         self,
@@ -2598,6 +2693,9 @@ class Retriever:
         auto_refresh: bool = True,
         refresh_interval: float = 1.5,
         refresh_stability_checks: int = 2,
+        result_cache_size: int = 128,
+        semantic_cache_size: int = 64,
+        semantic_cache_threshold: float = 0.97,
     ):
         self.model_path = Path(model_path)
         self.corpus_path = Path(corpus_path)
@@ -2629,6 +2727,18 @@ class Retriever:
         self._auto_refresh = bool(auto_refresh)
         self._refresh_interval = max(0.1, float(refresh_interval)) if refresh_interval else 0.0
         self._refresh_stability_checks = max(1, int(refresh_stability_checks))
+
+        self._result_cache = QueryResultCache(result_cache_size)
+        self._semantic_cache = None
+        if semantic_cache_size > 0 and semantic_cache_threshold > 0.0:
+            self._semantic_cache = SemanticQueryCache(semantic_cache_size, semantic_cache_threshold)
+        self._semantic_cache_initial_threshold = semantic_cache_threshold
+        self._cache_stats = {
+            "result_hits": 0,
+            "result_misses": 0,
+            "semantic_hits": 0,
+            "semantic_misses": 0,
+        }
 
         if self._auto_refresh and self._refresh_interval > 0.0:
             self._cache_monitor = CacheSignatureMonitor(
@@ -2691,6 +2801,15 @@ class Retriever:
         session: Optional[SessionState] = None,
         use_ann: Optional[bool] = None,
     ) -> List[Dict[str, Any]]:
+        cache_key: Optional[Tuple[str, int, bool, float]] = None
+        result_cache = getattr(self, "_result_cache", None)
+        if session is None and result_cache is not None:
+            cache_key = self._make_cache_key(query, top_k)
+            cached = result_cache.get(cache_key)
+            if cached is not None:
+                self._record_cache_event("result", hit=True)
+                return cached
+
         index = self._ensure_index()
         if index is None:
             return []
@@ -2757,8 +2876,24 @@ class Retriever:
         if use_rerank:
             search_top_k = max(search_top_k, effective_rerank_depth)
             search_oversample = max(1, min(oversample, 2))
-        adaptive_lex_weight = self._dynamic_lexical_weight(query_tokens)
+        adaptive_lex_weight = self._dynamic_lexical_weight(query_tokens, filters_active=metadata_filters.is_active())
         self._last_lexical_weight = adaptive_lex_weight
+        semantic_cache = getattr(self, "_semantic_cache", None)
+        semantic_cached: Optional[List[Dict[str, Any]]] = None
+        can_use_semantic_cache = (
+            session is None
+            and semantic_cache is not None
+            and q_vector is not None
+            and not metadata_filters.is_active()
+            and not requested_exts
+        )
+
+        if can_use_semantic_cache:
+            semantic_cached = semantic_cache.match(q_vector)
+            if semantic_cached is not None:
+                self._record_cache_event("semantic", hit=True)
+                return self._return_cached(cache_key, semantic_cached, session)
+
         if hasattr(index, "configure_ann"):
             ann_ef = max(32, search_top_k * max(1, search_oversample))
             try:
@@ -2776,7 +2911,7 @@ class Retriever:
         )
         filtered_hits = _apply_metadata_filters(raw_hits, metadata_filters)
         if not filtered_hits:
-            return []
+            return self._return_cached(cache_key, [], session)
 
         lexical_limit = max(top_k, 1)
         if use_rerank and effective_rerank_depth:
@@ -2795,7 +2930,7 @@ class Retriever:
             mmr_limit = max(top_k, min(len(lexical_ranking), fusion_depth))
             mmr_candidates = lexical_ranking[:mmr_limit]
             final_hits = _mmr(index, mmr_candidates, q_vector, top_k)
-            return _annotate_hits(
+            annotated = _annotate_hits(
                 final_hits,
                 desired_exts=requested_exts,
                 raw_query_tokens=raw_query_tokens_set,
@@ -2803,13 +2938,18 @@ class Retriever:
                 metadata_filters=metadata_filters,
                 lexical_weight=adaptive_lex_weight,
             )
+            if can_use_semantic_cache and semantic_cache is not None and q_vector is not None:
+                semantic_cache.store(q_vector, annotated)
+                self._record_cache_event("semantic", hit=False)
+            self._record_cache_event("result", hit=False)
+            return self._return_cached(cache_key, annotated, session)
 
         reranker = self._ensure_reranker()
         if reranker is None:
             mmr_limit = max(top_k, min(len(lexical_ranking), fusion_depth))
             mmr_candidates = lexical_ranking[:mmr_limit]
             final_hits = _mmr(index, mmr_candidates, q_vector, top_k)
-            return _annotate_hits(
+            annotated = _annotate_hits(
                 final_hits,
                 desired_exts=requested_exts,
                 raw_query_tokens=raw_query_tokens_set,
@@ -2817,6 +2957,11 @@ class Retriever:
                 metadata_filters=metadata_filters,
                 lexical_weight=adaptive_lex_weight,
             )
+            if can_use_semantic_cache and semantic_cache is not None and q_vector is not None:
+                semantic_cache.store(q_vector, annotated)
+                self._record_cache_event("semantic", hit=False)
+            self._record_cache_event("result", hit=False)
+            return self._return_cached(cache_key, annotated, session)
 
         reranked = reranker.rerank(
             query,
@@ -2854,7 +2999,7 @@ class Retriever:
         mmr_pool_size = max(top_k * 2, fusion_depth)
         mmr_candidates = fused_candidates[:mmr_pool_size]
         final_hits = _mmr(index, mmr_candidates, q_vector, top_k)
-        return _annotate_hits(
+        annotated = _annotate_hits(
             final_hits,
             desired_exts=requested_exts,
             raw_query_tokens=raw_query_tokens_set,
@@ -2862,6 +3007,86 @@ class Retriever:
             metadata_filters=metadata_filters,
             lexical_weight=adaptive_lex_weight,
         )
+        if can_use_semantic_cache and semantic_cache is not None and q_vector is not None:
+            semantic_cache.store(q_vector, annotated)
+            self._record_cache_event("semantic", hit=False)
+        self._record_cache_event("result", hit=False)
+        return self._return_cached(cache_key, annotated, session)
+
+    def _make_cache_key(self, query: str, top_k: int) -> Tuple[str, int, bool, float]:
+        normalized = (query or "").strip().lower()
+        return (
+            normalized,
+            max(1, int(top_k or 1)),
+            bool(getattr(self, "use_rerank", False)),
+            round(float(getattr(self, "base_lexical_weight", 0.0) or 0.0), 3),
+        )
+
+    def _return_cached(
+        self,
+        cache_key: Optional[Tuple[str, int, bool, float]],
+        hits: List[Dict[str, Any]],
+        session: Optional[SessionState],
+    ) -> List[Dict[str, Any]]:
+        result_cache = getattr(self, "_result_cache", None)
+        if cache_key is not None and session is None and result_cache is not None:
+            result_cache.set(cache_key, hits)
+        return hits
+
+    def _record_cache_event(self, kind: str, hit: bool) -> None:
+        stats = getattr(self, "_cache_stats", None)
+        if stats is None:
+            return
+        key = f"{kind}_{'hits' if hit else 'misses'}"
+        if key not in stats:
+            stats[key] = 0
+        stats[key] += 1
+        total = stats.get("result_hits", 0) + stats.get("result_misses", 0)
+        if total > 0 and total % 100 == 0:
+            logger.debug(
+                "cache stats: result_hit_rate=%.2f semantic_hit_rate=%.2f (total=%d)",
+                stats.get("result_hits", 0) / max(1, total),
+                stats.get("semantic_hits", 0) / max(1, stats.get("semantic_hits", 0) + stats.get("semantic_misses", 0)),
+                total,
+            )
+        if kind == "semantic":
+            semantic_total = stats.get("semantic_hits", 0) + stats.get("semantic_misses", 0)
+            if semantic_total and semantic_total % 200 == 0:
+                self._auto_tune_caches(semantic_total)
+
+    def _auto_tune_caches(self, semantic_total: int) -> None:
+        stats = getattr(self, "_cache_stats", None)
+        if stats is None:
+            return
+        semantic_cache = getattr(self, "_semantic_cache", None)
+        if semantic_cache is None:
+            return
+        hits = stats.get("semantic_hits", 0)
+        misses = stats.get("semantic_misses", 0)
+        total = hits + misses
+        if total == 0:
+            return
+        hit_rate = hits / float(total)
+        current_threshold = getattr(semantic_cache, "threshold", self._semantic_cache_initial_threshold)
+        target = current_threshold
+        if hit_rate < 0.15:
+            target = max(0.80, current_threshold - 0.02)
+        elif hit_rate < 0.3:
+            target = max(0.85, current_threshold - 0.01)
+        elif hit_rate > 0.65:
+            target = min(0.995, current_threshold + 0.01)
+        elif hit_rate > 0.5:
+            target = min(0.99, current_threshold + 0.005)
+
+        if abs(target - current_threshold) >= 1e-4:
+            semantic_cache.set_threshold(target)
+            logger.info(
+                "semantic cache threshold tuned from %.3f to %.3f (hit_rate=%.2f, samples=%d)",
+                current_threshold,
+                target,
+                hit_rate,
+                total,
+            )
 
     def _ensure_reranker(self) -> Optional[CrossEncoderReranker]:
         if not getattr(self, "use_rerank", False):
@@ -2881,7 +3106,7 @@ class Retriever:
             self._reranker = None
         return getattr(self, "_reranker", None)
 
-    def _dynamic_lexical_weight(self, query_tokens: Optional[List[str]]) -> float:
+    def _dynamic_lexical_weight(self, query_tokens: Optional[List[str]], *, filters_active: bool = False) -> float:
         base = max(0.0, float(getattr(self, "base_lexical_weight", 0.0)))
         if base <= 0.0:
             return 0.0
@@ -2890,6 +3115,8 @@ class Retriever:
         distinct = len({tok for tok in query_tokens if tok})
         if distinct <= 2:
             return min(0.75, max(base, 0.45))
+        if filters_active:
+            return min(0.85, max(base, 0.35))
         if distinct >= 8:
             return max(0.15, min(base, 0.30))
         return base
@@ -3100,6 +3327,12 @@ class Retriever:
         current: Tuple[float, float, float],
     ) -> None:
         self._cache_signature = current
+        result_cache = getattr(self, "_result_cache", None)
+        if result_cache is not None:
+            result_cache.clear()
+        semantic_cache = getattr(self, "_semantic_cache", None)
+        if semantic_cache is not None:
+            semantic_cache.clear()
         try:
             self.index_manager.clear()
             loaded = self.index_manager.ensure_loaded()

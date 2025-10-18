@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Iterable, List
+from typing import Iterable, List, Optional
+
+from core.agents.taskgraph import TaskContext, TaskGraph
 
 from core.utils import get_logger
 
@@ -25,19 +27,51 @@ class PhotoPipeline:
             self.embedding_backend,
             self.tag_backend,
         )
+        context = TaskContext(pipeline=self, job=job)
+        graph = TaskGraph("photo_pipeline")
+        graph.add_stage("scan", self._stage_scan)
+        graph.add_stage("analyse", self._stage_analyse, dependencies=("scan",))
+        graph.add_stage("persist", self._stage_persist, dependencies=("analyse",))
+
+        graph.run(context)
+        for event in context.stage_status():
+            LOGGER.info(
+                "photo pipeline stage: %s status=%s",
+                event.get("stage"),
+                event.get("status"),
+            )
+        recommendation: Optional[PhotoRecommendation] = context.get("recommendation")
+        if recommendation is None:
+            raise RuntimeError("photo pipeline did not produce a recommendation")
+        LOGGER.info("photo pipeline finished: report=%s", recommendation.report_path)
+        return recommendation
+
+    # TaskGraph stages
+    def _stage_scan(self, context: TaskContext) -> None:
+        job: PhotoJobConfig = context.job
         photos = self._scan(job.roots)
+        context.set("photos", photos)
+
+    def _stage_analyse(self, context: TaskContext) -> None:
+        photos: List[PhotoAsset] = context.get("photos") or []
         tagged = self._tag(photos)
         dedup_groups = self._deduplicate(tagged)
         best = self._pick_best(tagged)
+        job: PhotoJobConfig = context.job
         recommendation = PhotoRecommendation(
             best_shots=best,
             duplicates=dedup_groups,
             similar_groups=dedup_groups,
             report_path=job.output_dir / "photo_report.json",
         )
+        context.set("recommendation", recommendation)
+
+    def _stage_persist(self, context: TaskContext) -> None:
+        job: PhotoJobConfig = context.job
+        recommendation: PhotoRecommendation = context.get("recommendation")
+        if recommendation is None:
+            raise RuntimeError("photo pipeline persistence stage requires recommendation")
         self._persist(job, recommendation)
-        LOGGER.info("photo pipeline finished: report=%s", recommendation.report_path)
-        return recommendation
 
     def _scan(self, roots: Iterable[Path]) -> List[PhotoAsset]:
         assets: List[PhotoAsset] = []

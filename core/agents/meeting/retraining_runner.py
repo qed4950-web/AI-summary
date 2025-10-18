@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from .retraining import QueueEntry, process_next
+from .retraining_taskgraph import RetrainingTaskGraphRunner
 
 LOGGER = logging.getLogger(__name__)
 
@@ -198,7 +199,8 @@ def run_once(
     Returns True if an entry was claimed and processed; False otherwise.
     """
 
-    return process_next(handler, base_dir=base_dir)
+    runner = RetrainingTaskGraphRunner(handler=handler, base_dir=base_dir)
+    return runner.run_once()
 
 
 def run_many(
@@ -209,15 +211,8 @@ def run_many(
 ) -> int:
     """Process multiple queue entries until exhausted or reaching limit."""
 
-    processed = 0
-    while True:
-        if max_runs is not None and processed >= max_runs:
-            break
-        did_process = process_next(handler, base_dir=base_dir)
-        if not did_process:
-            break
-        processed += 1
-    return processed
+    runner = RetrainingTaskGraphRunner(handler=handler, base_dir=base_dir)
+    return runner.run_many(max_runs=max_runs)
 
 
 def watch_queue(

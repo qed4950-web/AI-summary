@@ -1,7 +1,9 @@
 import customtkinter as ctk
+import json
 import sys
+from datetime import datetime
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Optional
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
@@ -14,6 +16,8 @@ from ui.screens.train_screen import TrainScreen
 from ui.screens.update_screen import UpdateScreen
 from ui.screens.meeting_screen import MeetingScreen
 from ui.screens.photo_screen import PhotoScreen
+from ui.screens.work_center import WorkCenterScreen
+from ui.smart_folder_context import SmartFolderContext
 
 
 class App(ctk.CTk):
@@ -21,6 +25,7 @@ class App(ctk.CTk):
 
     NAV_DEFS = (
         ("home", "홈 대시보드"),
+        ("work_center", "작업 센터"),
         ("chat", "지식·검색"),
         ("train", "전체 학습"),
         ("update", "증분 업데이트"),
@@ -36,6 +41,9 @@ class App(ctk.CTk):
         self.minsize(1100, 720)
         self.is_task_running = False
         self.active_frame_key: str = "home"
+        self.smart_folder_context: Optional[SmartFolderContext] = None
+        self.work_center_events_path = REPO_ROOT / "data" / "work_center" / "events.jsonl"
+        self.work_center_events_path.parent.mkdir(parents=True, exist_ok=True)
 
         self.grid_rowconfigure(1, weight=1)
         self.grid_columnconfigure(1, weight=1)
@@ -113,6 +121,7 @@ class App(ctk.CTk):
 
         self.frames: Dict[str, ctk.CTkFrame] = {
             "home": HomeScreen(self.content_container, app=self, corner_radius=0, fg_color="transparent"),
+            "work_center": WorkCenterScreen(self.content_container, app=self, corner_radius=0, fg_color="transparent"),
             "chat": ChatScreen(self.content_container, app=self, corner_radius=0, fg_color="transparent"),
             "train": TrainScreen(
                 self.content_container,
@@ -147,6 +156,8 @@ class App(ctk.CTk):
                 fg_color="transparent",
             ),
         }
+
+        self.set_smart_folder_context(None)
 
         # --- Status bar ---
         self.status_var = ctk.StringVar(value="Ready.")
@@ -197,6 +208,7 @@ class App(ctk.CTk):
         self.active_frame_key = name
         header_texts = {
             "home": ("대시보드", "현재 상태를 확인하고 주요 작업으로 이동하세요."),
+            "work_center": ("작업 센터", "스마트 폴더 컨텍스트와 비서 기능을 한 화면에서 관리하세요."),
             "chat": ("지식·검색 비서", "학습된 문서를 대상으로 의미 검색을 수행합니다."),
             "train": ("전체 학습", "새로운 코퍼스를 만들고 인덱스를 재구축합니다."),
             "update": ("증분 업데이트", "변경된 파일만 빠르게 반영합니다."),
@@ -235,6 +247,44 @@ class App(ctk.CTk):
             self.status_var.set(status_message)
         else:
             self.status_var.set("작업이 완료되었습니다.")
+
+    # ------------------------------------------------------------------
+    # Smart folder context helpers
+    # ------------------------------------------------------------------
+    def set_smart_folder_context(self, context: Optional[SmartFolderContext]) -> None:
+        self.smart_folder_context = context
+        for frame in self.frames.values():
+            handler = getattr(frame, "on_smart_folder_update", None)
+            if callable(handler):
+                handler(context)
+
+    def emit_work_center_event(
+        self,
+        event_type: str,
+        payload: Dict[str, object],
+        *,
+        context: Optional[SmartFolderContext] = None,
+    ) -> None:
+        record_context = context or self.smart_folder_context
+        record = {
+            "timestamp": datetime.utcnow().isoformat(),
+            "type": event_type,
+            "payload": payload,
+            "context": {
+                "folder_id": record_context.folder_id if record_context else None,
+                "folder_label": record_context.label if record_context else None,
+            },
+        }
+        try:
+            with self.work_center_events_path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+        except Exception:
+            pass
+
+        for frame in self.frames.values():
+            handler = getattr(frame, "on_work_center_event", None)
+            if callable(handler):
+                handler(record)
 
 
 if __name__ == "__main__":

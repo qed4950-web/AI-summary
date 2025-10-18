@@ -119,6 +119,7 @@ def _make_stub_retriever() -> Retriever:
     retr.index_manager = StubIndexManager(simple_index)
     retr.index = simple_index  # 편의상 노출 (기존 테스트 호환)
     retr.search_wait_timeout = 0.0
+    retr._result_cache = None
     return retr
 
 

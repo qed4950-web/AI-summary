@@ -330,6 +330,31 @@ def _token_chunk_spans(text: str, *, min_tokens: int, max_tokens: int) -> List[T
     return spans
 
 
+def _adaptive_chunk_window(text: str, base_min: int, base_max: int) -> Tuple[int, int]:
+    base_min = max(16, int(base_min))
+    base_max = max(base_min + 16, int(base_max))
+    approx_tokens = len(_TOKEN_REGEX.findall(text)) or max(1, len(text) // 4)
+
+    if approx_tokens <= base_max:
+        min_tokens = max(16, int(base_min * 0.5))
+        max_tokens = max(min_tokens + 24, int(base_max * 0.75))
+        return min_tokens, max_tokens
+
+    if approx_tokens <= base_max * 3:
+        return base_min, base_max
+
+    scale = min(2.0, approx_tokens / float(base_max * 3))
+    min_tokens = int(base_min * (1.0 + (scale * 0.5)))
+    max_tokens = int(base_max * (1.0 + (scale * 0.5)))
+    min_tokens = max(base_min, min(min_tokens, 320))
+    max_tokens = max(min_tokens + 32, min(1200, max_tokens))
+    remainder = approx_tokens - max_tokens
+    if remainder and remainder < min_tokens:
+        adjustment = min_tokens - remainder
+        max_tokens = max(min_tokens + 32, max_tokens - adjustment)
+    return min_tokens, max_tokens
+
+
 def _apply_uniform_chunks(
     df: "pd.DataFrame",
     *,
@@ -344,7 +369,8 @@ def _apply_uniform_chunks(
 
     for record in records:
         base_text = str(record.get("text") or "")
-        spans = _token_chunk_spans(base_text, min_tokens=min_tokens, max_tokens=max_tokens)
+        adaptive_min, adaptive_max = _adaptive_chunk_window(base_text, min_tokens, max_tokens)
+        spans = _token_chunk_spans(base_text, min_tokens=adaptive_min, max_tokens=adaptive_max)
         if not spans:
             new_rec = dict(record)
             new_rec["chunk_id"] = 1

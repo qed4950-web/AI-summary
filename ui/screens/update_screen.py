@@ -46,9 +46,16 @@ def _run_update_index_logic(log_callback, done_callback):
                     try:
                         p_file = Path(root) / file
                         if p_file.suffix.lower() in SUPPORTED_EXTS:
-                             if not any(part in EXCLUDE_DIRS for part in p_file.parts):
-                                stat = p_file.stat()
-                                current_files_list.append({'path': str(p_file), 'size': stat.st_size, 'mtime': stat.st_mtime})
+                                if not any(part in EXCLUDE_DIRS for part in p_file.parts):
+                                    stat = p_file.stat()
+                                    current_files_list.append(
+                                        {
+                                            'path': str(p_file),
+                                            'size': stat.st_size,
+                                            'mtime': stat.st_mtime,
+                                            'ext': p_file.suffix.lower(),
+                                        }
+                                    )
                     except (FileNotFoundError, PermissionError): continue
         current_df = pd.DataFrame(current_files_list)
         log_callback(f"SUCCESS: PC 스캔 완료. ({len(current_df)}개 파일 발견)")
@@ -66,7 +73,18 @@ def _run_update_index_logic(log_callback, done_callback):
         log_callback(f"INFO: 신규 {len(new_files_info)}개, 수정 {len(modified_files_info)}개, 삭제 {len(deleted_paths)}개")
 
         # 4. 코퍼스 업데이트
-        files_to_process = new_files_info + modified_files_info
+        def _with_ext(records):
+            enriched = []
+            for record in records:
+                path = record.get('path')
+                try:
+                    ext = Path(path).suffix.lower()
+                except Exception:
+                    ext = ''
+                enriched.append({**record, 'ext': ext})
+            return enriched
+
+        files_to_process = _with_ext(new_files_info + modified_files_info)
         new_extracted_df = pd.DataFrame()
         if files_to_process:
             log_callback(f"INFO: {len(files_to_process)}개 파일 텍스트 추출 중... (진행률은 콘솔 창에 표시됩니다)")

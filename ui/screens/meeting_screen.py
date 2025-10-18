@@ -4,9 +4,10 @@ import os
 import subprocess
 import sys
 import threading
+import time
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Dict, List, Optional
 
 import customtkinter as ctk
 from tkinter import filedialog
@@ -18,6 +19,8 @@ from core.agents.meeting.pipeline import (
     get_backend_diagnostics,
 )
 from src.config import MEETING_OUTPUT_DIR
+from ui.smart_folder_context import SmartFolderContext
+from ui.policy_cache import get_policy_engine
 
 
 DEFAULT_STREAM_INTERVAL = 60.0
@@ -46,9 +49,10 @@ class MeetingScreen(ctk.CTkFrame):
         self.streaming_session: Optional[StreamingMeetingSession] = None
         self.streaming_job: Optional[MeetingJobConfig] = None
         self.streaming_log_path: Optional[Path] = None
+        self.active_context: Optional[SmartFolderContext] = None
 
         self.grid_columnconfigure(0, weight=1)
-        self.grid_rowconfigure(3, weight=1)
+        self.grid_rowconfigure(4, weight=1)
 
         self.title_label = ctk.CTkLabel(
             self,
@@ -65,8 +69,16 @@ class MeetingScreen(ctk.CTkFrame):
         )
         self.subtitle_label.grid(row=1, column=0, padx=16, pady=(0, 12), sticky="w")
 
+        self.context_hint_label = ctk.CTkLabel(
+            self,
+            text="📁 스마트 폴더: 전체 사용 가능",
+            font=ctk.CTkFont(size=12),
+            text_color=("#4f4f4f", "#cfcfcf"),
+        )
+        self.context_hint_label.grid(row=2, column=0, padx=16, pady=(0, 8), sticky="w")
+
         self.form_frame = ctk.CTkFrame(self)
-        self.form_frame.grid(row=2, column=0, padx=16, pady=12, sticky="ew")
+        self.form_frame.grid(row=3, column=0, padx=16, pady=12, sticky="ew")
         self.form_frame.grid_columnconfigure(0, weight=0)
         self.form_frame.grid_columnconfigure(1, weight=1)
 
@@ -321,8 +333,11 @@ class MeetingScreen(ctk.CTkFrame):
             state="disabled",
             font=ctk.CTkFont(family="monospace"),
         )
-        self.log_textbox.grid(row=3, column=0, padx=16, pady=(0, 16), sticky="nsew")
+        self.log_textbox.grid(row=4, column=0, padx=16, pady=(0, 16), sticky="nsew")
         self.append_log("회의 요약을 실행할 파일을 선택하세요.", reset=True)
+
+        self._last_pipeline_info: Dict[str, object] = {}
+        self.streaming_started_at: Optional[float] = None
 
     # ------------------------------------------------------------------
     # UI helpers
@@ -339,6 +354,88 @@ class MeetingScreen(ctk.CTkFrame):
 
         self.after(0, _update)
 
+    def on_smart_folder_update(self, context: Optional[SmartFolderContext]) -> None:
+        self.active_context = context
+        if context and context.path:
+            if not self.output_dir_var.get().strip():
+                self.output_dir_var.set(str(context.path))
+        if context:
+            placeholder_source = context.policy or context.label
+        else:
+            placeholder_source = None
+        placeholder = placeholder_source or "스마트 폴더 정책 태그 (선택)"
+        try:
+            self.policy_entry.configure(placeholder_text=placeholder)
+        except Exception:
+            if not self.policy_var.get() and context:
+                self.policy_var.set(context.label)
+        if context and not self.policy_var.get() and context.policy:
+            self.policy_var.set(context.policy)
+        self._apply_context_constraints()
+
+    def _apply_context_constraints(self) -> None:
+        allowed = self._context_allows_meeting()
+        if self.active_context is None:
+            hint = "📁 스마트 폴더: 전체 사용 가능"
+        else:
+            parts = [f"📁 스마트 폴더: {self.active_context.label}"]
+            if self.active_context.path:
+                parts.append(f"· {self.active_context.path_display}")
+            parts.append("(허용)" if allowed else "(제한됨)")
+            hint = " ".join(parts)
+        self.context_hint_label.configure(text=hint)
+
+        if allowed:
+            self.live_mode_switch.configure(state="normal")
+            if not self.is_running:
+                self.run_button.configure(state="normal")
+        else:
+            self.run_button.configure(state="disabled")
+            self.live_mode_switch.configure(state="disabled")
+            self.live_add_button.configure(state="disabled")
+            self.live_finalize_button.configure(state="disabled")
+
+    def _context_allows_meeting(self) -> bool:
+        if self.active_context is None:
+            return True
+        allowed = self.active_context.allows_agent("meeting")
+        engine = get_policy_engine()
+        if allowed and engine.has_policies and self.active_context.path is not None:
+            try:
+                allowed = engine.allows(self.active_context.path, agent="meeting")
+            except Exception:
+                allowed = False
+        return allowed
+
+    def _on_pipeline_error(self) -> None:
+        self.run_button.configure(state="normal", text=self._default_run_button_label())
+        self._apply_context_constraints()
+
+    def _resolve_policy_tag(self) -> Optional[str]:
+        explicit = self.policy_var.get().strip()
+        if explicit:
+            return explicit
+        if self.active_context is None:
+            return None
+        return self.active_context.policy or self.active_context.folder_id
+
+    def _meeting_context_dirs(self) -> List[Path]:
+        if self.active_context and self.active_context.path:
+            return [self.active_context.path]
+        return []
+
+    @staticmethod
+    def _path_within(target: Path, root: Path) -> bool:
+        try:
+            target_resolved = target.resolve()
+            root_resolved = root.resolve()
+        except Exception:
+            target_resolved = target
+            root_resolved = root
+        if target_resolved == root_resolved:
+            return True
+        return root_resolved in target_resolved.parents
+
     def browse_audio(self) -> None:
         file_path = filedialog.askopenfilename(
             title="회의 파일 선택",
@@ -354,6 +451,7 @@ class MeetingScreen(ctk.CTkFrame):
         directory = filedialog.askdirectory(title="출력 폴더 선택")
         if directory:
             self.output_dir_var.set(directory)
+        self._apply_context_constraints()
 
     def refresh_backend_status(self) -> None:
         try:
@@ -433,6 +531,10 @@ class MeetingScreen(ctk.CTkFrame):
     # Pipeline execution
     # ------------------------------------------------------------------
     def start_meeting_job(self) -> None:
+        if not self._context_allows_meeting():
+            self.append_log("⚠️ 선택한 스마트 폴더에서는 회의 비서를 사용할 수 없습니다.")
+            return
+
         if self.live_mode_var.get() == 1:
             if self.streaming_session is not None:
                 self.append_log("⚠️ 이미 실시간 세션이 진행 중입니다.")
@@ -455,14 +557,31 @@ class MeetingScreen(ctk.CTkFrame):
             self.append_log("⚠️ 선택한 파일을 찾을 수 없습니다.")
             return
 
+        context_path = self.active_context.path if self.active_context and self.active_context.path else None
+        if context_path:
+            try:
+                context_path.mkdir(parents=True, exist_ok=True)
+            except Exception as exc:
+                self.append_log(f"⚠️ 스마트 폴더 경로를 준비할 수 없습니다: {exc}")
+                return
+
         output_root_text = self.output_dir_var.get().strip()
         if output_root_text:
             output_dir = Path(output_root_text)
+            if context_path is not None:
+                if not self._path_within(output_dir, context_path):
+                    self.append_log("⚠️ 출력 폴더는 선택한 스마트 폴더 경로 내부여야 합니다.")
+                    return
         else:
             timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
             safe_name = audio_path.stem or "meeting"
-            output_dir = MEETING_OUTPUT_DIR / safe_name / timestamp
-        output_dir.mkdir(parents=True, exist_ok=True)
+            base_root = context_path if context_path is not None else MEETING_OUTPUT_DIR
+            output_dir = base_root / safe_name / timestamp
+        try:
+            output_dir.mkdir(parents=True, exist_ok=True)
+        except Exception as exc:
+            self.append_log(f"⚠️ 출력 폴더를 생성할 수 없습니다: {exc}")
+            return
 
         diarize = self.diarize_switch.get() == 1
         speaker_count = None
@@ -473,13 +592,15 @@ class MeetingScreen(ctk.CTkFrame):
                 self.append_log("⚠️ 화자 수는 숫자로 입력해주세요.")
                 return
 
+        policy_tag = self._resolve_policy_tag()
         job = MeetingJobConfig(
             audio_path=audio_path,
             output_dir=output_dir,
             language=self.language_option.get(),
             diarize=diarize,
             speaker_count=speaker_count,
-            policy_tag=self.policy_var.get().strip() or None,
+            policy_tag=policy_tag,
+            context_dirs=self._meeting_context_dirs(),
         )
 
         backend_display = self._describe_backend_choice()
@@ -497,8 +618,10 @@ class MeetingScreen(ctk.CTkFrame):
         self.open_folder_button.configure(state="disabled")
         self.run_button.configure(state="disabled", text="처리 중...")
         self.start_task_callback("⏳ 회의 요약을 실행 중입니다...")
+        self._apply_context_constraints()
 
         pipeline = self._build_pipeline()
+        self.streaming_started_at = None
         thread = threading.Thread(target=self._run_pipeline, args=(pipeline, job), daemon=True)
         thread.start()
 
@@ -527,25 +650,44 @@ class MeetingScreen(ctk.CTkFrame):
             if download:
                 stt_options["download_root"] = download
 
-        return MeetingPipeline(stt_backend=backend, stt_options=stt_options)
+        pipeline = MeetingPipeline(stt_backend=backend, stt_options=stt_options)
+        resource_info = getattr(pipeline, "_resource_info", {})
+        self._last_pipeline_info = {
+            "stt_backend": pipeline.stt_backend,
+            "summary_backend": getattr(pipeline, "summary_backend", None),
+            "resources": resource_info,
+        }
+        return pipeline
 
     def _run_pipeline(self, pipeline: MeetingPipeline, job: MeetingJobConfig) -> None:
+        started_at = time.time()
         try:
             summary = pipeline.run(job)
+            duration = max(time.time() - started_at, 0.0)
+            metrics = {
+                "duration_seconds": duration,
+                "mode": "batch",
+            }
             self._handle_summary_completion(
                 summary,
                 job,
                 headline="✅ 회의 요약이 완료되었습니다!",
                 completion_message="✅ 회의 요약이 완료되었습니다.",
+                metrics=metrics,
             )
         except Exception as exc:  # pragma: no cover - GUI feedback
             self.append_log(f"❌ 회의 요약 중 오류가 발생했습니다: {exc}")
-            self.after(0, lambda: self.run_button.configure(state="normal", text=self._default_run_button_label()))
+            self.after(0, self._on_pipeline_error)
             self.after(0, lambda: self.end_task_callback("❌ 회의 요약 중 오류가 발생했습니다."))
         finally:
             self.is_running = False
+            self.after(0, self._apply_context_constraints)
 
     def start_streaming_session(self) -> None:
+        if not self._context_allows_meeting():
+            self.append_log("⚠️ 선택한 스마트 폴더에서는 회의 비서를 사용할 수 없습니다.")
+            return
+
         try:
             interval_str = self.live_interval_var.get().strip()
             if interval_str:
@@ -565,12 +707,24 @@ class MeetingScreen(ctk.CTkFrame):
             audio_path = Path(audio_path_text)
             safe_name = audio_path.stem or safe_name
 
+        context_path = self.active_context.path if self.active_context and self.active_context.path else None
+        if context_path:
+            try:
+                context_path.mkdir(parents=True, exist_ok=True)
+            except Exception as exc:
+                self.append_log(f"⚠️ 스마트 폴더 경로를 준비할 수 없습니다: {exc}")
+                return
+
         output_root_text = self.output_dir_var.get().strip()
         if output_root_text:
             output_dir = Path(output_root_text)
+            if context_path is not None and not self._path_within(output_dir, context_path):
+                self.append_log("⚠️ 출력 폴더는 선택한 스마트 폴더 경로 내부여야 합니다.")
+                return
         else:
             timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-            output_dir = MEETING_OUTPUT_DIR / safe_name / timestamp
+            base_root = context_path if context_path is not None else MEETING_OUTPUT_DIR
+            output_dir = base_root / safe_name / timestamp
 
         try:
             output_dir.mkdir(parents=True, exist_ok=True)
@@ -624,6 +778,7 @@ class MeetingScreen(ctk.CTkFrame):
         self.streaming_log_path = events_log
         self.is_running = True
         self.last_output_dir = output_dir
+        self.streaming_started_at = time.time()
 
         backend_display = self._describe_backend_choice()
         self.append_log(
@@ -644,6 +799,7 @@ class MeetingScreen(ctk.CTkFrame):
         self.live_status_label.configure(text="발화를 추가하면 요약이 업데이트됩니다.")
         self.live_textbox.delete("1.0", "end")
         self.start_task_callback("🟢 실시간 요약 세션이 활성화되었습니다.")
+        self._apply_context_constraints()
 
     def add_live_segment(self) -> None:
         if self.streaming_session is None or self.streaming_job is None:
@@ -751,28 +907,43 @@ class MeetingScreen(ctk.CTkFrame):
         self.streaming_job = None
         self.streaming_log_path = None
         self.is_running = False
+        started = self.streaming_started_at
+        self.streaming_started_at = None
 
         self.live_add_button.configure(state="disabled")
         self.live_finalize_button.configure(state="disabled")
         self.live_status_label.configure(text="실시간 세션을 시작하면 요약이 여기에 표시됩니다.")
+
+        metrics: Optional[Dict[str, object]] = None
+        if started is not None:
+            metrics = {
+                "duration_seconds": max(time.time() - started, 0.0),
+                "mode": "streaming",
+            }
+        else:
+            metrics = {"mode": "streaming"}
 
         self._handle_summary_completion(
             summary,
             job,
             headline="✅ 실시간 요약이 완료되었습니다!",
             completion_message="✅ 실시간 요약이 완료되었습니다.",
+            metrics=metrics,
         )
+        self._apply_context_constraints()
 
     def _handle_streaming_error(self, exc: Exception) -> None:
         self.streaming_session = None
         self.streaming_job = None
         self.streaming_log_path = None
         self.is_running = False
+        self.streaming_started_at = None
 
         self.live_add_button.configure(state="disabled")
         self.live_finalize_button.configure(state="disabled")
         self.live_status_label.configure(text="실시간 세션을 시작하면 요약이 여기에 표시됩니다.")
-        self.run_button.configure(state="normal", text=self._default_run_button_label())
+        self.run_button.configure(text=self._default_run_button_label())
+        self._apply_context_constraints()
 
         self.append_log(f"❌ 실시간 요약 중 오류가 발생했습니다: {exc}")
         self.end_task_callback("❌ 실시간 요약 중 오류가 발생했습니다.")
@@ -784,6 +955,7 @@ class MeetingScreen(ctk.CTkFrame):
         *,
         headline: str,
         completion_message: str,
+        metrics: Optional[Dict[str, object]] = None,
     ) -> None:
         lines = [
             headline,
@@ -814,6 +986,32 @@ class MeetingScreen(ctk.CTkFrame):
         else:
             lines.append("- (없음)")
 
+        payload = {
+            "output_dir": str(job.output_dir),
+            "highlights": highlights,
+            "action_items": actions,
+            "decisions": decisions,
+        }
+        if job.policy_tag:
+            payload["policy_tag"] = job.policy_tag
+        diagnostics: Dict[str, object] = dict(self._last_pipeline_info or {})
+        if metrics:
+            if "mode" in metrics:
+                payload.setdefault("mode", metrics["mode"])
+            diagnostics.update(metrics)
+        if diagnostics:
+            payload["diagnostics"] = diagnostics
+        payload["policy_enforced"] = get_policy_engine().has_policies
+        if hasattr(self.app, "emit_work_center_event"):
+            try:
+                self.app.emit_work_center_event(
+                    "meeting.summary.completed",
+                    payload,
+                    context=self.active_context,
+                )
+            except Exception:
+                pass
+
         if summary.raw_summary:
             lines.append("")
             lines.append("자동 요약:")
@@ -824,7 +1022,8 @@ class MeetingScreen(ctk.CTkFrame):
 
         def _update_controls() -> None:
             self.open_folder_button.configure(state="normal")
-            self.run_button.configure(state="normal", text=self._default_run_button_label())
+            self.run_button.configure(text=self._default_run_button_label())
+            self._apply_context_constraints()
             self.end_task_callback(completion_message)
 
         self.after(0, _update_controls)

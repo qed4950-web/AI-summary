@@ -8,9 +8,11 @@ from __future__ import annotations
 import re
 import time
 import threading
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Dict, Any, Optional, Set, Tuple
+from typing import Dict, Any, Optional, Set, Tuple, List
+import textwrap
 
 from core.data_pipeline.policies.engine import PolicyEngine
 from core.search.retriever import (
@@ -22,6 +24,8 @@ from core.search.retriever import (
 
 _PREVIEW_TOKEN_PATTERN = re.compile(r"(?u)(?:[가-힣]{1,}|[A-Za-z0-9]{2,})")
 from .translation_cache import TranslationCache
+from .prompting import ChatTurn, MemoryStore, PromptManager, ToolRouter
+from .llm_client import create_llm_client, LLMClient, LLMClientError
 
 try:
     from deep_translator import GoogleTranslator
@@ -64,12 +68,6 @@ class Spinner:
 # 대화 상태
 # ──────────────────────────
 @dataclass
-class ChatTurn:
-    role: str
-    text: str
-    hits: List[Dict[str, Any]] = field(default_factory=list)
-
-@dataclass
 class LNPChat:
     model_path: Path
     corpus_path: Path
@@ -89,10 +87,13 @@ class LNPChat:
     policy_engine: Optional[PolicyEngine] = None
     policy_scope: str = "auto"  # auto|policy|global
     policy_agent: str = "knowledge_search"
+    llm_backend: Optional[str] = field(default_factory=lambda: os.getenv("LNPCHAT_LLM_BACKEND"))
+    llm_model: str = field(default_factory=lambda: os.getenv("LNPCHAT_LLM_MODEL", "llama3"))
+    llm_host: str = field(default_factory=lambda: os.getenv("LNPCHAT_LLM_HOST", ""))
+    llm_options: Dict[str, str] = field(default_factory=dict)
 
     retr: Optional[Retriever] = field(init=False, default=None)
     translator: Optional[Any] = field(init=False, default=None)
-    history: List[ChatTurn] = field(init=False, default_factory=list)
     ready_done: bool = field(init=False, default=False)
     translation_cache: Optional[TranslationCache] = field(init=False, default=None)
     preview_translator: Optional[Any] = field(init=False, default=None)
@@ -102,6 +103,31 @@ class LNPChat:
     last_query_text: str = field(init=False, default="")
     last_hits: List[Dict[str, Any]] = field(init=False, default_factory=list)
     _policy_effective: bool = field(init=False, default=False)
+    memory: MemoryStore = field(init=False)
+    prompt_manager: PromptManager = field(init=False)
+    tool_router: ToolRouter = field(init=False)
+    llm_client: Optional[LLMClient] = field(init=False, default=None)
+
+    def __post_init__(self) -> None:
+        self.memory = MemoryStore(capacity=20)
+        self.prompt_manager = PromptManager(self.memory, tokenizer=_split_tokens)
+        self.tool_router = ToolRouter()
+        self.llm_client = self._init_llm_client()
+
+    def _init_llm_client(self) -> Optional[LLMClient]:
+        backend = (self.llm_backend or "").strip()
+        if not backend:
+            return None
+        try:
+            return create_llm_client(
+                backend,
+                model=self.llm_model or "llama3",
+                host=self.llm_host or "",
+                options=self.llm_options or {},
+            )
+        except LLMClientError as exc:
+            print(f"⚠️ 로컬 LLM 초기화 실패: {exc}")
+            return None
 
     # 초기화: Retriever 및 번역기 준비
     def ready(self, rebuild: bool = False):
@@ -234,73 +260,13 @@ class LNPChat:
         return terms
 
     def _rewrite_query(self, query: str, tokens: Set[str]) -> Tuple[str, bool]:
-        if not self.last_query_text:
-            return query, False
-
-        lowered_tokens = {tok.lower() for tok in tokens if tok}
-        if not lowered_tokens:
-            lowered_tokens = set(_split_tokens(query))
-        pronoun_markers = {
-            "그",
-            "그거",
-            "그것",
-            "그문서",
-            "그파일",
-            "해당",
-            "이전",
-            "앞",
-            "방금",
-            "previous",
-            "earlier",
-            "above",
-            "that",
-            "those",
-        }
-        last_tokens = {tok.lower() for tok in _split_tokens(self.last_query_text)}
-        follow_markers = {
-            "추가",
-            "또",
-            "다른",
-            "같은",
-            "비슷",
-            "관련",
-            "계속",
-            "이어",
-            "더",
-        }
-        follow_token = bool(lowered_tokens & (pronoun_markers | follow_markers))
-        disjoint_from_last = last_tokens.isdisjoint(lowered_tokens)
-        type_markers = {
-            "pdf",
-            "ppt",
-            "pptx",
-            "doc",
-            "docx",
-            "hwp",
-            "xls",
-            "xlsx",
-            "csv",
-            "파일",
-            "문서",
-            "자료",
-            "형식",
-            "버전",
-        }
-        type_followup = disjoint_from_last and len(lowered_tokens) <= 4 and bool(lowered_tokens & type_markers)
-
-        if follow_token and disjoint_from_last and not type_followup and len(lowered_tokens) > 2:
-            follow_token = False
-
-        if not (follow_token or type_followup):
-            return query, False
-
         context_terms = self._extract_context_terms()
-        pieces: List[str] = [query]
-        if context_terms:
-            pieces.append(" ".join(context_terms))
-        pieces.append(self.last_query_text)
-        rewritten = " ".join(piece for piece in pieces if piece).strip()
-        return (rewritten or query), True
+        return self.prompt_manager.rewrite_query(
+            query,
+            tokens,
+            last_query=self.last_query_text or self.memory.last_user_text(),
+            context_terms=context_terms,
+        )
 
     def _augment_translations(self, hits: List[Dict[str, Any]]) -> None:
         if not (self.show_translation and hits):
@@ -389,6 +355,12 @@ class LNPChat:
         if used_context:
             print(f"  (이전 질문 맥락을 반영해 '{contextual_query}'로 검색합니다.)")
 
+        action = self.tool_router.select_action(
+            query,
+            use_translation=bool(self.translator),
+            policy_active=bool(effective_policy),
+            llm_available=self.llm_client is not None,
+        )
         query_for_search = contextual_query
         if self.translator:
             try:
@@ -419,13 +391,17 @@ class LNPChat:
                 self.index_reasons.clear()
 
         # 히스토리 적재 (원본 query 기준)
-        self.history.append(ChatTurn(role="user", text=query))
+        self.memory.add_turn(role="user", text=query)
         filtered_hits, filtered_count = self._apply_policy_scope(hits)
         self.last_hits = filtered_hits
         self.last_query_text = contextual_query
 
         self._augment_translations(filtered_hits)
         hits = filtered_hits
+
+        llm_summary = None
+        if hits and action == "search_and_summarize" and self.llm_client is not None:
+            llm_summary = self._summarize_hits(query, hits)
 
         # 답변 생성(원본 query 기준)
         policy_note = ""
@@ -515,13 +491,61 @@ class LNPChat:
                 )
 
         answer = "\n".join(answer_lines)
-        self.history.append(ChatTurn(role="assistant", text=answer, hits=hits))
+        if llm_summary:
+            composed = [llm_summary.strip(), ""]
+            composed.extend(answer_lines)
+            answer = "\n".join(composed)
+        self.memory.add_turn(role="assistant", text=answer, hits=hits)
 
-        return {
+        result = {
             "answer": answer,
             "hits": hits,
             "suggestions": self._suggest_followups(query, hits),
         }
+        if llm_summary:
+            result["llm_summary"] = llm_summary
+        return result
+
+    def _summarize_hits(self, query: str, hits: List[Dict[str, Any]]) -> Optional[str]:
+        client = self.llm_client
+        if client is None:
+            return None
+        context_blocks: List[str] = []
+        for idx, hit in enumerate(hits[:3], start=1):
+            path_label = str(hit.get("path") or "")
+            ext_label = str(hit.get("ext") or "")
+            preview = str(hit.get("preview") or "").strip()
+            snippet = preview[:400]
+            block = textwrap.dedent(
+                f"""
+                {idx}. 경로: {path_label} [{ext_label}]
+                   요약: {snippet}
+                """
+            ).strip()
+            context_blocks.append(block)
+        if not context_blocks:
+            return None
+        prompt = textwrap.dedent(
+            f"""
+            사용자 질문: {query}
+
+            검색 결과 요약:
+            {os.linesep.join(context_blocks)}
+
+            위 정보를 근거로 질문에 명확하고 간결하게 답변해주세요.
+            핵심 근거를 bullet 형식으로 제시하고, 부족한 정보가 있으면 추가 조사 필요성을 언급하세요.
+            """
+        ).strip()
+        system_prompt = "You are a helpful assistant that summarises enterprise documents in Korean."
+        try:
+            summary = client.generate(prompt, system=system_prompt, timeout=30.0).strip()
+        except LLMClientError as exc:
+            print(f"⚠️ 로컬 LLM 응답 실패: {exc}")
+            return None
+        except Exception as exc:
+            print(f"⚠️ 로컬 LLM 예외: {exc}")
+            return None
+        return summary or None
 
     def _resolve_policy_engine(self) -> Optional[PolicyEngine]:
         engine = self.policy_engine

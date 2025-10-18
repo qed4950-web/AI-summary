@@ -72,6 +72,7 @@ python scripts/infopilot.py pipeline --corpus data/corpus.parquet --model data/c
   - `MEETING_SUMMARY_MODEL`: 요약 기본 모델 경로(예: fine-tuned KoBART 체크포인트). 지정하지 않으면 기본값 `gogamza/kobart-base-v2`.
   - 선택 옵션: `MEETING_RETRAIN_OUTPUT_DIR`, `MEETING_AUDIT_LOG`, `MEETING_MASK_PII`, `MEETING_SAVE_TRANSCRIPT` 등.
 - 런처 실행 후 **회의 비서** 탭에서 작업하면 `summary.json`, `action_items.json`, `meeting.ics`, `analytics/dashboard.json` 등이 생성되고, UI와 `/api/meeting/dashboard`에서 결과를 확인할 수 있습니다.
+- LNPChat에서 로컬 LLM(예: Ollama)을 사용하려면 `docs/guides/local_llm.md`를 참고하세요.
 - 재학습을 돌리고 싶다면 아래 순서로 진행하세요.
   1. 회의 실행 후 각 회의 디렉터리에 생성된 `analytics/training_queue.jsonl`을 통합합니다.
      ```powershell

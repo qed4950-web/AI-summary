@@ -15,6 +15,12 @@
 - CLI 정책/스코프 연동: `infopilot.py`
 - 정책 적용 대화 세션: `core/conversation/lnp_chat.py`
 
+#### 2025-10-17 점검
+- 작업 센터 대시보드는 아직 구현 전(`ui/screens/home_screen.py`), `docs/ux/improvements.md`의 요구 사항을 기반으로 MVP 설계 필요.
+- 정책 컨텍스트/스코프 노출은 CLI(`core/conversation/lnp_chat.py`)에서만 제공되므로, UI(chat 화면)에 동일 기능을 이식하는 작업이 남아 있음.
+
 ### 다음 단계 체크리스트
+- Work Center MVP 화면(`ui/screens/work_center.py` 가칭) 설계 및 정책 스코프/컨텍스트 노출 구현
+- LLM/프론트엔드 정책 준수 테스트와 QA 시나리오 작성
 - Cycle 2 완료 후 사용자 피드백 세션 및 Cycle 3(회의 비서) 준비
 - 문서화: `docs/cycles/cycle_2.md`에 주요 결정/이슈 기록

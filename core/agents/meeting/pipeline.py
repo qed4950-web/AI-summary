@@ -21,6 +21,8 @@ except ImportError:  # pragma: no cover - optional
 if load_dotenv is not None:
     load_dotenv()
 
+from core.agents.taskgraph import TaskGraph, TaskContext
+
 from .analytics import MeetingAnalyticsRecorder
 from .audit import MeetingAuditLogger
 from .context_adapter import ContextBundle, MeetingContextAdapter
@@ -228,23 +230,12 @@ class MeetingPipeline:
     ) -> "StreamingMeetingSession":
         return StreamingMeetingSession(self, job, update_interval=update_interval)
 
-    def run(self, job: MeetingJobConfig) -> MeetingSummary:
-        self._maybe_prepare_on_device_model()
-        workflow = MeetingWorkflowEngine(job.output_dir, enable_resume=job.enable_resume)
-        LOGGER.info(
-            "meeting pipeline start: audio=%s backend=%s policy=%s",
-            job.audio_path,
-            self.stt_backend,
-            job.policy_tag,
-        )
-        cached_summary = self._load_cache(job)
-        if cached_summary is not None and not job.enable_resume:
-            LOGGER.info(
-                "meeting pipeline cache hit: audio=%s summary_backend=%s",
-                job.audio_path,
-                self.summary_backend,
-            )
-            return cached_summary
+    # ------------------------------------------------------------------
+    # TaskGraph stages
+    # ------------------------------------------------------------------
+    def _stage_transcription(self, context: TaskContext) -> None:
+        job: MeetingJobConfig = context.job
+        workflow: MeetingWorkflowEngine = context.extras["workflow"]
 
         transcript: Optional[MeetingTranscriptionResult] = None
         if not workflow.should_run("transcription"):
@@ -254,8 +245,19 @@ class MeetingPipeline:
             workflow.store_transcription(transcript)
             workflow.mark_completed("transcription")
 
+        context.set("transcript", transcript)
+
+    def _stage_summary(self, context: TaskContext) -> None:
+        job: MeetingJobConfig = context.job
+        workflow: MeetingWorkflowEngine = context.extras["workflow"]
+        transcript: MeetingTranscriptionResult = context.get("transcript")
+
+        if transcript is None:
+            raise RuntimeError("meeting pipeline summary stage requires transcript")
+
         context_bundle: Optional[ContextBundle] = None
         summary: Optional[MeetingSummary] = None
+
         if not workflow.should_run("summary"):
             summary = workflow.load_summary()
             if summary is not None:
@@ -285,11 +287,77 @@ class MeetingPipeline:
                 if not summary.context:
                     summary.context = context_bundle.summary_prompt
 
+        context.set("context_bundle", context_bundle)
+        context.set("summary", summary)
+
+    def _stage_finalise(self, context: TaskContext) -> None:
+        job: MeetingJobConfig = context.job
+        workflow: MeetingWorkflowEngine = context.extras["workflow"]
+        transcript: MeetingTranscriptionResult = context.get("transcript")
+        summary: MeetingSummary = context.get("summary")
+        context_bundle: Optional[ContextBundle] = context.get("context_bundle")
+
+        if summary is None or transcript is None:
+            raise RuntimeError("meeting pipeline stages produced no summary or transcript")
+
+        if context_bundle and context_bundle.documents and not summary.attachments.get("context"):
+            summary.attachments["context"] = [
+                {
+                    "name": doc.target_name,
+                    "kind": doc.kind,
+                    "path": f"attachments/{doc.target_name}",
+                    "preview": doc.preview,
+                }
+                for doc in context_bundle.documents
+            ]
+
         if self._mask_pii_enabled:
             self._mask_sensitive_content(transcription=transcript, summary=summary)
         self._sync_action_items(job, summary)
         self._persist(job, transcript, summary)
         workflow.mark_completed("persistence")
+        context.set("result", summary)
+
+    def run(self, job: MeetingJobConfig) -> MeetingSummary:
+        self._maybe_prepare_on_device_model()
+        workflow = MeetingWorkflowEngine(job.output_dir, enable_resume=job.enable_resume)
+        LOGGER.info(
+            "meeting pipeline start: audio=%s backend=%s policy=%s",
+            job.audio_path,
+            self.stt_backend,
+            job.policy_tag,
+        )
+        cached_summary = self._load_cache(job)
+        if cached_summary is not None and not job.enable_resume:
+            LOGGER.info(
+                "meeting pipeline cache hit: audio=%s summary_backend=%s",
+                job.audio_path,
+                self.summary_backend,
+            )
+            return cached_summary
+        context = TaskContext(pipeline=self, job=job)
+        context.extras["workflow"] = workflow
+
+        graph = TaskGraph("meeting_pipeline")
+        graph.add_stage("transcription", self._stage_transcription)
+        graph.add_stage("summary", self._stage_summary, dependencies=("transcription",))
+        graph.add_stage("finalise", self._stage_finalise, dependencies=("summary",))
+
+        graph.run(context)
+        for event in context.stage_status():
+            started = event.get("started_at")
+            finished = event.get("finished_at")
+            status = event.get("status")
+            message = f"stage={event['stage']} status={status}"
+            if started and finished:
+                message += f" started={started} finished={finished}"
+            if status == "failed" and event.get("error"):
+                message += f" error={event['error']}"
+            LOGGER.info("meeting pipeline stage: %s", message)
+
+        summary: MeetingSummary = context.get("summary")
+        if summary is None:
+            raise RuntimeError("meeting pipeline did not produce a summary")
         LOGGER.info("meeting pipeline finished: saved=%s", summary.transcript_path.parent)
         return summary
 
