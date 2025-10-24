@@ -14,6 +14,13 @@ LOGGER = get_logger("conversation.orchestrator")
 MEETING_KEYWORDS = {"meeting", "회의", "녹음", "회의록", "transcribe", "transcription"}
 PHOTO_KEYWORDS = {"사진", "photo", "이미지", "앨범", "gallery"}
 
+COMMAND_PREFIXES = {
+    "/search": "document_search",
+    "/doc": "document_search",
+    "/meeting": "meeting_summary",
+    "/photo": "photo_manager",
+}
+
 
 DEFAULT_SYSTEM_PROMPT = """You are InfoPilot Orchestrator. Choose which specialised agent
 should handle the user's request.
@@ -44,8 +51,8 @@ Agents:
    - Only choose this agent when the user talks about photos/images/albums.
 
 If you are unsure or the request is a general question, ALWAYS choose agent="document_search"
-with an empty context. Do not ask follow-up questions unless the user clearly requests
-meeting transcription or photo processing.
+with an empty context. Only choose other agents when the user explicitly uses the dedicated
+command (e.g. "/meeting", "/photo") or very clearly references those tasks.
 
 Respond ONLY with a single compact JSON object matching exactly:
 {"agent": "<agent-name or follow_up>", "reason": "<short reason>", "context": {...}}
@@ -95,17 +102,38 @@ class AssistantOrchestrator:
 
     def handle(self, query: str, extra_context: Optional[Dict[str, object]] = None) -> OrchestratorResponse:
         self._history.append({"role": "user", "content": query})
-        agent_name, context = self._select_agent(query, extra_context or {})
+
+        command_agent, normalized_query, command_context = self._detect_command(query)
+        base_context: Dict[str, object] = dict(extra_context or {})
+        if command_context:
+            base_context.update(command_context)
+
+        query_for_agent = normalized_query
+
+        if command_agent:
+            agent_name = command_agent
+            context = base_context
+            missing_reason = self._missing_context_reason(agent_name, context)
+            if missing_reason:
+                self._last_reason = missing_reason
+                message = self._default_follow_up_message(missing_reason)
+                self._history.append({"role": "assistant", "content": message})
+                LOGGER.info(
+                    "command follow-up requested: agent=%s reason=%s",
+                    agent_name,
+                    missing_reason,
+                )
+                return OrchestratorResponse(message=message, agent="follow_up", reason=missing_reason)
+            self._last_reason = "command"
+        else:
+            agent_name, context = self._select_agent(query, base_context)
+
+            query_for_agent = query
 
         if agent_name == "follow_up":
             message = context.get("message")
             if not message:
-                if self._last_reason == "needs_audio":
-                    message = "회의 오디오 파일 경로를 알려주세요."
-                elif self._last_reason == "needs_roots":
-                    message = "사진이 들어 있는 폴더 경로를 알려주세요."
-                else:
-                    message = "추가 정보가 필요합니다."
+                message = self._default_follow_up_message(self._last_reason)
             context["message"] = message
             self._history.append({"role": "assistant", "content": message})
             LOGGER.info(
@@ -124,7 +152,7 @@ class AssistantOrchestrator:
             context_keys,
         )
         try:
-            result = agent.run(AgentRequest(query=query, context=context))
+            result = agent.run(AgentRequest(query=query_for_agent, context=context))
             response_text = result.content.strip() or "결과가 없습니다."
             self._history.append({"role": "assistant", "content": response_text})
             metadata_keys = list(result.metadata.keys()) if isinstance(result.metadata, dict) else []
@@ -165,6 +193,31 @@ class AssistantOrchestrator:
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+    @staticmethod
+    def _default_follow_up_message(reason: Optional[str]) -> str:
+        if reason == "needs_audio":
+            return "회의 오디오 파일 경로를 알려주세요."
+        if reason == "needs_roots":
+            return "사진이 들어 있는 폴더 경로를 알려주세요."
+        return "추가 정보가 필요합니다."
+
+    def _detect_command(self, query: str) -> tuple[Optional[str], str, Dict[str, object]]:
+        stripped = query.lstrip()
+        lower = stripped.lower()
+        for prefix, agent in COMMAND_PREFIXES.items():
+            if lower.startswith(prefix):
+                remainder = stripped[len(prefix) :].strip()
+                context: Dict[str, object] = {}
+                if agent == "photo_manager" and remainder:
+                    roots = [part.strip() for part in remainder.split(",") if part.strip()]
+                    if roots:
+                        context["roots"] = roots
+                if agent == "meeting_summary" and remainder:
+                    # Allow quick audio path specification
+                    context["audio_path"] = remainder
+                return agent, remainder or query, context
+        return None, query, {}
+
     def _select_agent(self, query: str, extra_context: Dict[str, object]) -> tuple[str, Dict[str, object]]:
         if self._llm_client is None:
             decision = self._heuristic_route(query, extra_context)
@@ -281,20 +334,6 @@ class AssistantOrchestrator:
     # Heuristic routing when LLM is unavailable
     # ------------------------------------------------------------------
     def _heuristic_route(self, query: str, extra_context: Dict[str, object]) -> tuple[str, Dict[str, object], Optional[str]]:
-        if self._text_contains_keywords(query, MEETING_KEYWORDS):
-            context = dict(extra_context)
-            reason = self._missing_context_reason("meeting_summary", context)
-            if reason:
-                return "follow_up", {"reason": reason}, reason
-            return "meeting_summary", context, "heuristic_meeting"
-
-        if self._text_contains_keywords(query, PHOTO_KEYWORDS):
-            context = dict(extra_context)
-            reason = self._missing_context_reason("photo_manager", context)
-            if reason:
-                return "follow_up", {"reason": reason}, reason
-            return "photo_manager", context, "heuristic_photo"
-
         return "document_search", dict(extra_context), "heuristic_document"
 
     def _missing_context_reason(self, agent: str, context: Dict[str, object]) -> Optional[str]:

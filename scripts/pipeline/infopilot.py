@@ -1179,6 +1179,7 @@ def cmd_chat(args):
         return
 
     print("\n💬 InfoPilot Chat 모드입니다. (종료하려면 'exit' 또는 '종료' 입력)")
+    print("   명령어: /search <질문>, /meeting, /photo")
     while True:
         try:
             query = input("질문> ").strip()

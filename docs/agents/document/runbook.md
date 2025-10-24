@@ -48,6 +48,8 @@ python scripts/run_knowledge_agent.py \
 
 정책 기반 검색을 테스트하려면 `--folder-path`, `--policy-path` 인자를 함께 전달하세요.
 
+> 대화형 모드에서는 `/search <질문>` 명령어를 사용해 문서 비서를 명시적으로 호출할 수 있습니다.
+
 ## 4. 트러블슈팅
 
 - **모델/코퍼스 누락**: 위 명령으로 존재 여부를 먼저 확인한 뒤, `docs/agents/document/architecture.md`의 “주석 사항”을 참고해 재학습을 수행합니다.

@@ -39,3 +39,5 @@ python scripts/run_meeting_agent.py \
 | `MEETING_SAVE_TRANSCRIPT` | `1`이면 `transcript.json`을 생성 |
 
 환경 변수 변경 후에는 CLI 혹은 UI를 재시작하여 설정이 반영되었는지 확인합니다.
+
+> 대화형 모드에서 회의 비서를 호출하려면 `/meeting` 명령어를 입력하고 안내에 따라 오디오 파일 경로를 제공하세요.

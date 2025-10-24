@@ -29,6 +29,8 @@ Roadmap v3는 제품 기획 문서(`docs/plan/product_alignment.md`)와 동일�
 4. **테스트·운영 체계 강화**  
    - `docs/plan/product_alignment.md`의 체크리스트에 맞춰 자동/수동 테스트를 정비  
    - 결과는 `results/` 폴더에 축적하고 KPI 스냅샷 자동화를 완료
+5. **명령어 중심 UX 가이드 정착**  
+   - `/search`, `/meeting`, `/photo` 명령어 안내를 UI·문서에 명시하고, 기본 대화는 문답에만 집중하도록 유지
 
 ## 참고 문서
 - `docs/plan/product_alignment.md`: 제품 정렬 가이드, 캐시/정책/테스트 지침
