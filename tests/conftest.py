@@ -38,8 +38,8 @@ if "JOBLIB_TEMP_FOLDER" not in os.environ:
     os.environ["JOBLIB_TEMP_FOLDER"] = str(joblib_tmp)
     atexit.register(shutil.rmtree, joblib_tmp, True)
 
-from backend.api.app_factory import create_app
-from backend.api.settings import Settings
+from core.api.app_factory import create_app
+from core.api.settings import Settings
 
 
 class StubRetriever:

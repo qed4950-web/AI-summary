@@ -147,8 +147,9 @@ class ToolRouter:
 
         lowered = trimmed.lower()
         keywords_summary = {
-            "요약", "정리", "정리해줘", "설명", "핵심", "한줄", "결론",
-            "summarize", "summary", "explain", "tl;dr", "overview",
+            "요약", "정리", "정리해줘", "설명", "설명해줘", "핵심", "한줄", "결론",
+            "말해줘", "알려줘", "소개해줘",
+            "summarize", "summary", "explain", "tell me", "tl;dr", "overview",
         }
         keywords_list = {"목록", "리스트", "파일", "문서", "보여줘", "검색"}
 

@@ -39,13 +39,39 @@ class TaskGraph:
         self._stages: List[TaskStage] = []
         self._stage_lookup: Dict[str, TaskStage] = {}
 
-    def add_stage(self, name: str, handler: Callable[[TaskContext], None], *, dependencies: Optional[Iterable[str]] = None) -> None:
+    def add_stage(
+        self,
+        name: str,
+        handler: Callable[[TaskContext], None],
+        *,
+        dependencies: Optional[Iterable[str]] = None,
+    ) -> None:
         stage = TaskStage(name=name, handler=handler, dependencies=tuple(dependencies or ()))
         self._stages.append(stage)
         self._stage_lookup[name] = stage
 
     def run(self, context: TaskContext) -> None:
         completed: Dict[str, bool] = {}
+        progress_cb: Optional[Callable[[Dict[str, Any]], None]] = context.extras.get("progress_callback")
+        cancel_event = context.extras.get("cancel_event")
+
+        def _emit(event_payload: Dict[str, Any]) -> None:
+            if not progress_cb:
+                return
+            try:
+                progress_cb(dict(event_payload))
+            except Exception:
+                # Progress callbacks must never break task execution.
+                pass
+
+        def _cancelled() -> bool:
+            return bool(
+                cancel_event
+                and hasattr(cancel_event, "is_set")
+                and callable(getattr(cancel_event, "is_set"))
+                and cancel_event.is_set()
+            )
+
         for stage in self._stages:
             if stage.dependencies and not all(completed.get(dep) for dep in stage.dependencies):
                 missing = [dep for dep in stage.dependencies if not completed.get(dep)]
@@ -56,14 +82,33 @@ class TaskGraph:
                 "started_at": datetime.utcnow().isoformat(),
             }
             context.record_event(event)
+            _emit(event)
+
+            if _cancelled():
+                event["status"] = "cancelled"
+                event["finished_at"] = datetime.utcnow().isoformat()
+                _emit(event)
+                raise TaskCancelled(f"task '{self.name}' cancelled before '{stage.name}'")
+
             try:
                 stage.handler(context)
             except Exception as exc:
-                event["status"] = "failed"
+                if isinstance(exc, TaskCancelled):
+                    event["status"] = "cancelled"
+                else:
+                    event["status"] = "failed"
+                    event["error"] = str(exc)
                 event["finished_at"] = datetime.utcnow().isoformat()
-                event["error"] = str(exc)
+                _emit(event)
                 raise
             else:
                 event["status"] = "completed"
                 event["finished_at"] = datetime.utcnow().isoformat()
                 completed[stage.name] = True
+                _emit(event)
+
+
+class TaskCancelled(RuntimeError):
+    """Raised when a TaskGraph execution is cancelled by the caller."""
+
+    pass

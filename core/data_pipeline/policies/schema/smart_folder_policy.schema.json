@@ -69,6 +69,26 @@
         }
       },
       "additionalProperties": false
+    },
+    "id": {
+      "type": "string",
+      "description": "Optional policy identifier"
+    },
+    "label": {
+      "type": "string",
+      "description": "Display label for UI"
+    },
+    "type": {
+      "type": "string",
+      "description": "Folded policy type metadata"
+    },
+    "scope": {
+      "type": "string",
+      "description": "Scope hint for UI integrations"
+    },
+    "policy": {
+      "type": "string",
+      "description": "Legacy policy tag metadata"
     }
   },
   "additionalProperties": false

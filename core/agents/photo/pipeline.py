@@ -2,9 +2,9 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Iterable, List, Optional
+from typing import Any, Callable, Dict, Iterable, List, Optional
 
-from core.agents.taskgraph import TaskContext, TaskGraph
+from core.agents.taskgraph import TaskCancelled, TaskContext, TaskGraph
 
 from core.utils import get_logger
 
@@ -19,8 +19,16 @@ class PhotoPipeline:
     def __init__(self, *, embedding_backend: str = "placeholder", tag_backend: str = "vision-api") -> None:
         self.embedding_backend = embedding_backend
         self.tag_backend = tag_backend
+        self._cancel_event: Optional[Any] = None
+        self._last_events: List[Dict[str, Any]] = []
 
-    def run(self, job: PhotoJobConfig) -> PhotoRecommendation:
+    def run(
+        self,
+        job: PhotoJobConfig,
+        *,
+        progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+        cancel_event: Optional[Any] = None,
+    ) -> PhotoRecommendation:
         LOGGER.info(
             "photo pipeline start: roots=%s embed=%s tag=%s",
             ",".join(str(r) for r in job.roots),
@@ -28,13 +36,24 @@ class PhotoPipeline:
             self.tag_backend,
         )
         context = TaskContext(pipeline=self, job=job)
+        if progress_callback:
+            context.extras["progress_callback"] = progress_callback
+        if cancel_event:
+            context.extras["cancel_event"] = cancel_event
+        self._cancel_event = cancel_event
         graph = TaskGraph("photo_pipeline")
         graph.add_stage("scan", self._stage_scan)
         graph.add_stage("analyse", self._stage_analyse, dependencies=("scan",))
         graph.add_stage("persist", self._stage_persist, dependencies=("analyse",))
 
-        graph.run(context)
-        for event in context.stage_status():
+        try:
+            graph.run(context)
+        finally:
+            self._cancel_event = None
+
+        events = context.stage_status()
+        self._last_events = events
+        for event in events:
             LOGGER.info(
                 "photo pipeline stage: %s status=%s",
                 event.get("stage"),
@@ -46,13 +65,19 @@ class PhotoPipeline:
         LOGGER.info("photo pipeline finished: report=%s", recommendation.report_path)
         return recommendation
 
+    def last_events(self) -> List[Dict[str, Any]]:
+        """Return TaskGraph events captured during the last run."""
+        return list(self._last_events)
+
     # TaskGraph stages
     def _stage_scan(self, context: TaskContext) -> None:
+        self._ensure_not_cancelled()
         job: PhotoJobConfig = context.job
         photos = self._scan(job.roots)
         context.set("photos", photos)
 
     def _stage_analyse(self, context: TaskContext) -> None:
+        self._ensure_not_cancelled()
         photos: List[PhotoAsset] = context.get("photos") or []
         tagged = self._tag(photos)
         dedup_groups = self._deduplicate(tagged)
@@ -67,6 +92,7 @@ class PhotoPipeline:
         context.set("recommendation", recommendation)
 
     def _stage_persist(self, context: TaskContext) -> None:
+        self._ensure_not_cancelled()
         job: PhotoJobConfig = context.job
         recommendation: PhotoRecommendation = context.get("recommendation")
         if recommendation is None:
@@ -80,6 +106,7 @@ class PhotoPipeline:
                 LOGGER.warning("photo root missing: %s", root)
                 continue
             for path in root.rglob("*"):
+                self._ensure_not_cancelled()
                 if path.suffix.lower() not in {".jpg", ".jpeg", ".png", ".heic"}:
                     continue
                 assets.append(PhotoAsset(path=path, tags=[]))
@@ -121,3 +148,13 @@ class PhotoPipeline:
             "policy_tag": job.policy_tag,
         }
         recommendation.report_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def _ensure_not_cancelled(self) -> None:
+        if (
+            self._cancel_event
+            and hasattr(self._cancel_event, "is_set")
+            and callable(getattr(self._cancel_event, "is_set"))
+            and self._cancel_event.is_set()
+        ):
+            LOGGER.info("photo pipeline cancelled by user request")
+            raise TaskCancelled("photo pipeline cancelled")

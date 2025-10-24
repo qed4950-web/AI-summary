@@ -34,11 +34,21 @@ class SmartFolderPolicy:
 
     @classmethod
     def from_dict(cls, data: Dict[str, object], *, base: Path) -> "SmartFolderPolicy":
-        if "path" not in data or not data.get("path"):
+        if "path" not in data:
             raise ValueError("Smart folder policy requires a 'path' key")
-        raw_path = Path(str(data.get("path")))
-        if not raw_path.is_absolute():
-            raw_path = base / raw_path
+        raw_path_value = data.get("path")
+        raw_path_str = str(raw_path_value or "").strip()
+        policy_type = str(data.get("type") or "").lower()
+
+        if not raw_path_str:
+            if policy_type == "global":
+                raw_path = resolve_repo_root()
+            else:
+                raise ValueError("Smart folder policy requires a non-empty 'path' for non-global entries")
+        else:
+            raw_path = Path(raw_path_str).expanduser()
+            if not raw_path.is_absolute():
+                raw_path = base / raw_path
         normalized_path = _normalize_path(raw_path)
         agents = frozenset(str(item) for item in data.get("agents", []) or [])
         security = dict(data.get("security", {}) or {})

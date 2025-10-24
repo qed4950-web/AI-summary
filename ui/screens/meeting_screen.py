@@ -18,12 +18,14 @@ from core.agents.meeting.pipeline import (
     StreamingMeetingSession,
     get_backend_diagnostics,
 )
-from src.config import MEETING_OUTPUT_DIR
+from ui.utils import MEETING_OUTPUT_DIR
 from ui.smart_folder_context import SmartFolderContext
 from ui.policy_cache import get_policy_engine
+from ui.settings_manager import SettingsManager
 
 
 DEFAULT_STREAM_INTERVAL = 60.0
+SETTINGS_PATH = Path(__file__).resolve().parents[2] / "data" / "ui_settings.json"
 
 
 class MeetingScreen(ctk.CTkFrame):
@@ -37,11 +39,15 @@ class MeetingScreen(ctk.CTkFrame):
 
         self.is_running = False
         self.last_output_dir: Optional[Path] = None
-        self.stt_backend_var = ctk.StringVar(value="auto")
-        self.stt_model_var = ctk.StringVar()
-        self.stt_device_var = ctk.StringVar()
-        self.stt_compute_var = ctk.StringVar()
-        self.stt_download_var = ctk.StringVar()
+        self.settings = SettingsManager(SETTINGS_PATH.resolve())
+        self._stt_traces_registered = False
+        stt_prefs = self._load_stt_preferences()
+
+        self.stt_backend_var = ctk.StringVar(value=stt_prefs["backend"])
+        self.stt_model_var = ctk.StringVar(value=stt_prefs["model"])
+        self.stt_device_var = ctk.StringVar(value=stt_prefs["device"])
+        self.stt_compute_var = ctk.StringVar(value=stt_prefs["compute"])
+        self.stt_download_var = ctk.StringVar(value=stt_prefs["download_dir"])
         self.live_mode_var = ctk.IntVar(value=0)
         self.live_interval_var = ctk.StringVar(value=str(int(DEFAULT_STREAM_INTERVAL)))
         self.live_speaker_var = ctk.StringVar()
@@ -150,7 +156,7 @@ class MeetingScreen(ctk.CTkFrame):
             command=self.on_stt_backend_change,
             width=130,
         )
-        self.stt_backend_menu.set("auto")
+        self.stt_backend_menu.set(stt_prefs["backend"])
         self.stt_backend_menu.grid(row=0, column=0, padx=(0, 12), sticky="w")
 
         advanced_row = ctk.CTkFrame(stt_row, fg_color="transparent")
@@ -191,11 +197,17 @@ class MeetingScreen(ctk.CTkFrame):
 
         help_label = ctk.CTkLabel(
             stt_row,
-            text="auto=환경 설정, whisper=faster-whisper, off=비활성화",
+            text="auto=환경 변수 사용, whisper=faster-whisper (CPU 실행 시 느릴 수 있습니다). 설정 값은 자동 저장됩니다.",
             font=ctk.CTkFont(size=11),
             text_color=("#636363", "#bdbdbd"),
+            wraplength=420,
+            justify="left",
         )
         help_label.grid(row=2, column=0, columnspan=2, pady=(6, 0), sticky="w")
+
+        self._update_stt_entry_states()
+        self._register_stt_traces()
+        self._persist_stt_preferences()
 
         diag_row = ctk.CTkFrame(self.form_frame, fg_color="transparent")
         diag_row.grid(row=4, column=1, padx=12, pady=(0, 8), sticky="ew")
@@ -213,7 +225,7 @@ class MeetingScreen(ctk.CTkFrame):
             command=self.refresh_backend_status,
         ).grid(row=0, column=1, padx=(12, 0))
 
-        self.on_stt_backend_change("auto")
+        self.on_stt_backend_change(stt_prefs["backend"])
         self.refresh_backend_status()
 
         # Diarisation controls
@@ -511,21 +523,8 @@ class MeetingScreen(ctk.CTkFrame):
             self.run_button.configure(text=self._default_run_button_label())
 
     def on_stt_backend_change(self, _: str) -> None:
-        backend = self.stt_backend_var.get()
-        is_whisper = backend == "whisper"
-        state = "normal" if is_whisper else "disabled"
-        for entry in (
-            self.stt_model_entry,
-            self.stt_device_entry,
-            self.stt_compute_entry,
-            self.stt_download_entry,
-        ):
-            entry.configure(state=state)
-        if not is_whisper:
-            self.stt_model_var.set("")
-            self.stt_device_var.set("")
-            self.stt_compute_var.set("")
-            self.stt_download_var.set("")
+        self._update_stt_entry_states()
+        self._persist_stt_preferences()
 
     # ------------------------------------------------------------------
     # Pipeline execution
@@ -624,6 +623,73 @@ class MeetingScreen(ctk.CTkFrame):
         self.streaming_started_at = None
         thread = threading.Thread(target=self._run_pipeline, args=(pipeline, job), daemon=True)
         thread.start()
+
+    def _register_stt_traces(self) -> None:
+        if getattr(self, "_stt_traces_registered", False):
+            return
+        self.stt_backend_var.trace_add("write", self._on_stt_var_change)
+        for var in (
+            self.stt_model_var,
+            self.stt_device_var,
+            self.stt_compute_var,
+            self.stt_download_var,
+        ):
+            var.trace_add("write", self._on_stt_var_change)
+        self._stt_traces_registered = True
+
+    def _on_stt_var_change(self, *_: object) -> None:
+        self._persist_stt_preferences()
+
+    def _update_stt_entry_states(self) -> None:
+        backend = self.stt_backend_var.get()
+        is_whisper = backend == "whisper"
+        state = "normal" if is_whisper else "disabled"
+        for entry in (
+            self.stt_model_entry,
+            self.stt_device_entry,
+            self.stt_compute_entry,
+            self.stt_download_entry,
+        ):
+            entry.configure(state=state)
+
+    def _persist_stt_preferences(self) -> None:
+        payload = {
+            "backend": self.stt_backend_var.get(),
+            "model": self.stt_model_var.get().strip(),
+            "device": self.stt_device_var.get().strip(),
+            "compute": self.stt_compute_var.get().strip(),
+            "download_dir": self.stt_download_var.get().strip(),
+        }
+        self.settings.set(payload, "agents", "meeting", "stt")
+
+        backend = payload["backend"]
+        if not backend or backend == "auto":
+            os.environ.pop("MEETING_STT_BACKEND", None)
+        elif backend == "off":
+            os.environ["MEETING_STT_BACKEND"] = "placeholder"
+        else:
+            os.environ["MEETING_STT_BACKEND"] = backend
+
+        self._sync_optional_env("MEETING_STT_MODEL", payload["model"], backend == "whisper")
+        self._sync_optional_env("MEETING_STT_DEVICE", payload["device"], backend == "whisper")
+        self._sync_optional_env("MEETING_STT_COMPUTE", payload["compute"], backend == "whisper")
+        self._sync_optional_env("MEETING_STT_MODEL_DIR", payload["download_dir"], backend == "whisper")
+
+    def _sync_optional_env(self, key: str, value: str, enabled: bool) -> None:
+        if enabled and value:
+            os.environ[key] = value
+        else:
+            os.environ.pop(key, None)
+
+    def _load_stt_preferences(self) -> Dict[str, str]:
+        prefs = self.settings.get("agents", "meeting", "stt", default={}) or {}
+        return {
+            "backend": str(prefs.get("backend") or "auto"),
+            "model": str(prefs.get("model") or ""),
+            "device": str(prefs.get("device") or ""),
+            "compute": str(prefs.get("compute") or ""),
+            "download_dir": str(prefs.get("download_dir") or ""),
+        }
 
     def _build_pipeline(self) -> MeetingPipeline:
         backend_choice = self.stt_backend_var.get()

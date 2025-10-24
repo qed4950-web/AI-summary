@@ -2,11 +2,10 @@
 from __future__ import annotations
 
 import argparse
-import json
 import logging
 import os
 from pathlib import Path
-from typing import Iterable, Set, Tuple
+from typing import Iterable
 
 import torch
 from datasets import Dataset
@@ -17,6 +16,8 @@ from transformers import (
     Seq2SeqTrainingArguments,
 )
 
+from core.agents.meeting.dataset_loader import load_transcript_summary_pairs
+
 try:  # Optional dependency; gracefully handle absence.
     from dotenv import set_key
 except ImportError:  # pragma: no cover - optional
@@ -26,134 +27,9 @@ except ImportError:  # pragma: no cover - optional
 LOGGER = logging.getLogger("meeting_summariser_train")
 
 
-def _summary_files(base_dir: Path) -> Iterable[Path]:
-    seen: Set[Path] = set()
-    for path in base_dir.rglob("*"):
-        if not path.is_file():
-            continue
-        if path.stem.lower() != "summary":
-            continue
-        resolved = path.resolve()
-        if resolved in seen:
-            continue
-        seen.add(resolved)
-        yield path
-
-
-def _find_transcript(summary_file: Path) -> Path | None:
-    for candidate in summary_file.parent.iterdir():
-        if not candidate.is_file():
-            continue
-        if candidate.stem.lower() == "transcript":
-            return candidate
-    return None
-
-
-def _stringify_summary(raw_summary) -> str:
-    """Normalise nested summary payloads into a single string."""
-
-    def _collect_from_sequence(values) -> list[str]:
-        collected: list[str] = []
-        for item in values:
-            text = _stringify_summary(item)
-            if text:
-                collected.append(text)
-        return collected
-
-    if raw_summary is None:
-        return ""
-
-    if isinstance(raw_summary, str):
-        return raw_summary.strip()
-
-    if isinstance(raw_summary, (list, tuple, set)):
-        return " ".join(_collect_from_sequence(raw_summary)).strip()
-
-    if isinstance(raw_summary, dict):
-        preferred_keys = (
-            "generated_text",
-            "summary_text",
-            "summary",
-            "text",
-        )
-        structured_keys = (
-            "highlights",
-            "action_items",
-            "decisions",
-            "discussion_points",
-        )
-
-        candidates: list[str] = []
-
-        for key in preferred_keys:
-            value = raw_summary.get(key)
-            if value is None:
-                continue
-            text = _stringify_summary(value)
-            if text:
-                candidates.append(text)
-
-        for key in structured_keys:
-            value = raw_summary.get(key)
-            if value is None:
-                continue
-            text = _stringify_summary(value)
-            if text:
-                candidates.append(text)
-
-        if not candidates:
-            for value in raw_summary.values():
-                text = _stringify_summary(value)
-                if text:
-                    candidates.append(text)
-
-        return " ".join(candidates).strip()
-
-    return str(raw_summary).strip()
-
-
-def _load_pairs(base_dir: Path) -> Tuple[list[str], list[str]]:
-    transcripts: list[str] = []
-    summaries: list[str] = []
-
-    for summary_file in _summary_files(base_dir):
-        transcript_file = _find_transcript(summary_file)
-        if transcript_file is None:
-            continue
-
-        transcript = transcript_file.read_text(encoding="utf-8").strip()
-        if not transcript:
-            continue
-
-        summary_text = summary_file.read_text(encoding="utf-8").strip()
-        if not summary_text:
-            continue
-
-        try:
-            summary_payload = json.loads(summary_text)
-        except json.JSONDecodeError:
-            summary_payload = summary_text
-
-        if isinstance(summary_payload, dict):
-            raw_summary = summary_payload.get("summary", summary_payload)
-        else:
-            raw_summary = summary_payload
-
-        target = _stringify_summary(raw_summary)
-
-        if not target:
-            continue
-
-        transcripts.append(transcript)
-        summaries.append(target)
-
-    return transcripts, summaries
-
-
 def _prepare_dataset(base_dir: Path) -> Dataset:
-    transcripts, summaries = _load_pairs(base_dir)
-    if not transcripts:
-        raise RuntimeError(f"No transcript/summary pairs found under {base_dir}")
+    transcripts, summaries = load_transcript_summary_pairs(base_dir)
+    LOGGER.info("Prepared %s transcript/summary pairs from %s", len(transcripts), base_dir)
 
     dataset = Dataset.from_dict({"text": transcripts, "summary": summaries})
     return dataset
@@ -182,7 +58,12 @@ def _preprocess_fn(tokenizer, max_source_len: int, max_target_len: int):
 
 def _build_argparser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--input-dir", required=True, type=Path, help="Directory with transcript.txt and summary.json pairs")
+    parser.add_argument(
+        "--input-dir",
+        required=True,
+        type=Path,
+        help="Directory containing transcript/summary pairs or supported archives (ZIP/JSON).",
+    )
     parser.add_argument("--model-name", default=os.getenv("MEETING_SUMMARY_MODEL", "gogamza/kobart-base-v2"))
     parser.add_argument("--output-dir", default=Path("./summariser_ft"), type=Path)
     parser.add_argument("--max-source-length", type=int, default=512)

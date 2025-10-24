@@ -9,15 +9,15 @@ from __future__ import annotations
 
 import os
 import sys
-from pathlib import Path
 from typing import Iterable, List
 
+from core.config.paths import CACHE_DIR, CORPUS_PATH, DATA_DIR, TOPIC_MODEL_PATH
 
-DATA_DIR = Path("data")
+
 DEFAULT_SCAN_CSV = DATA_DIR / "found_files.csv"
-DEFAULT_CORPUS = DATA_DIR / "corpus.parquet"
-DEFAULT_MODEL = DATA_DIR / "topic_model.joblib"
-DEFAULT_CACHE = Path("index_cache")
+DEFAULT_CORPUS = CORPUS_PATH
+DEFAULT_MODEL = TOPIC_MODEL_PATH
+DEFAULT_CACHE = CACHE_DIR
 
 
 def run_infopilot(argv: Iterable[str]) -> None:

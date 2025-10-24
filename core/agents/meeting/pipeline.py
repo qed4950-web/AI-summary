@@ -9,7 +9,7 @@ import tempfile
 from collections import Counter
 from datetime import timedelta
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from core.utils import get_logger
 
@@ -21,7 +21,7 @@ except ImportError:  # pragma: no cover - optional
 if load_dotenv is not None:
     load_dotenv()
 
-from core.agents.taskgraph import TaskGraph, TaskContext
+from core.agents.taskgraph import TaskGraph, TaskContext, TaskCancelled
 
 from .analytics import MeetingAnalyticsRecorder
 from .audit import MeetingAuditLogger
@@ -221,6 +221,8 @@ class MeetingPipeline:
         self._integration_config: Optional[IntegrationConfig] = load_provider_config()
         self._on_device_loader = OnDeviceModelLoader.from_env()
         self._audit_logger = MeetingAuditLogger.from_env()
+        self._cancel_event: Optional[Any] = None
+        self._last_events: List[Dict[str, Any]] = []
 
     def start_streaming(
         self,
@@ -234,6 +236,7 @@ class MeetingPipeline:
     # TaskGraph stages
     # ------------------------------------------------------------------
     def _stage_transcription(self, context: TaskContext) -> None:
+        self._ensure_not_cancelled()
         job: MeetingJobConfig = context.job
         workflow: MeetingWorkflowEngine = context.extras["workflow"]
 
@@ -248,6 +251,7 @@ class MeetingPipeline:
         context.set("transcript", transcript)
 
     def _stage_summary(self, context: TaskContext) -> None:
+        self._ensure_not_cancelled()
         job: MeetingJobConfig = context.job
         workflow: MeetingWorkflowEngine = context.extras["workflow"]
         transcript: MeetingTranscriptionResult = context.get("transcript")
@@ -291,6 +295,7 @@ class MeetingPipeline:
         context.set("summary", summary)
 
     def _stage_finalise(self, context: TaskContext) -> None:
+        self._ensure_not_cancelled()
         job: MeetingJobConfig = context.job
         workflow: MeetingWorkflowEngine = context.extras["workflow"]
         transcript: MeetingTranscriptionResult = context.get("transcript")
@@ -318,7 +323,13 @@ class MeetingPipeline:
         workflow.mark_completed("persistence")
         context.set("result", summary)
 
-    def run(self, job: MeetingJobConfig) -> MeetingSummary:
+    def run(
+        self,
+        job: MeetingJobConfig,
+        *,
+        progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+        cancel_event: Optional[Any] = None,
+    ) -> MeetingSummary:
         self._maybe_prepare_on_device_model()
         workflow = MeetingWorkflowEngine(job.output_dir, enable_resume=job.enable_resume)
         LOGGER.info(
@@ -337,14 +348,25 @@ class MeetingPipeline:
             return cached_summary
         context = TaskContext(pipeline=self, job=job)
         context.extras["workflow"] = workflow
+        if progress_callback:
+            context.extras["progress_callback"] = progress_callback
+        if cancel_event:
+            context.extras["cancel_event"] = cancel_event
+        self._cancel_event = cancel_event
 
         graph = TaskGraph("meeting_pipeline")
         graph.add_stage("transcription", self._stage_transcription)
         graph.add_stage("summary", self._stage_summary, dependencies=("transcription",))
         graph.add_stage("finalise", self._stage_finalise, dependencies=("summary",))
 
-        graph.run(context)
-        for event in context.stage_status():
+        try:
+            graph.run(context)
+        finally:
+            self._cancel_event = None
+
+        events = context.stage_status()
+        self._last_events = events
+        for event in events:
             started = event.get("started_at")
             finished = event.get("finished_at")
             status = event.get("status")
@@ -360,6 +382,20 @@ class MeetingPipeline:
             raise RuntimeError("meeting pipeline did not produce a summary")
         LOGGER.info("meeting pipeline finished: saved=%s", summary.transcript_path.parent)
         return summary
+
+    def last_events(self) -> List[Dict[str, Any]]:
+        """Return the most recent TaskGraph stage events."""
+        return list(self._last_events)
+
+    def _ensure_not_cancelled(self) -> None:
+        if (
+            self._cancel_event
+            and hasattr(self._cancel_event, "is_set")
+            and callable(getattr(self._cancel_event, "is_set"))
+            and self._cancel_event.is_set()
+        ):
+            LOGGER.info("meeting pipeline cancelled by user request")
+            raise TaskCancelled("meeting pipeline cancelled")
 
     # ---------------------------------------------------------------------
     # Stage 1: Speech-to-text or transcript loading

@@ -7,8 +7,8 @@ import threading
 from pathlib import Path
 
 # Core logic and helpers
-from src.core.helpers import get_drives
-from src.config import (
+from ui.utils import (
+    get_drives,
     EXCLUDE_DIRS,
     SUPPORTED_EXTS,
     DATA_DIR,
@@ -16,9 +16,9 @@ from src.config import (
     CORPUS_PARQUET,
     FOUND_FILES_CSV,
     TOPIC_MODEL_PATH,
+    rebuild_index,
 )
 from core.data_pipeline.pipeline import TrainConfig, run_step2
-from src.core.indexing import run_indexing
 
 def _run_full_train_logic(exts_text, do_scan, log_callback, done_callback):
     try:
@@ -83,7 +83,7 @@ def _run_full_train_logic(exts_text, do_scan, log_callback, done_callback):
             return
 
         log_callback("INFO: 벡터 인덱스를 재생성합니다... (잠시 기다려주세요)")
-        run_indexing(corpus_path=CORPUS_PARQUET, cache_dir=CACHE_DIR)
+        rebuild_index(corpus_path=CORPUS_PARQUET, cache_dir=CACHE_DIR)
         log_callback("SUCCESS: 인덱싱 완료.")
 
         log_callback("🎉 SUCCESS: 모든 학습 과정이 완료되었습니다!")

@@ -14,8 +14,8 @@ from core.search.retriever import (
     SessionState,
     VectorIndex,
 )
-from backend.api.app_factory import create_app
-from backend.api import session as session_registry
+from core.api.app_factory import create_app
+from core.api import session as session_registry
 
 
 @pytest.mark.smoke

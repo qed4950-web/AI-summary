@@ -15,6 +15,7 @@ from typing import Dict, Any, Optional, Set, Tuple, List
 import textwrap
 
 from core.data_pipeline.policies.engine import PolicyEngine
+from core.config.paths import MODELS_DIR
 from core.search.retriever import (
     Retriever,
     SessionState,
@@ -23,6 +24,32 @@ from core.search.retriever import (
 )  # Step3 검색기 재사용
 
 _PREVIEW_TOKEN_PATTERN = re.compile(r"(?u)(?:[가-힣]{1,}|[A-Za-z0-9]{2,})")
+_GREETINGS = {
+    "안녕",
+    "안녕하세요",
+    "안뇽",
+    "하이",
+    "ㅎㅇ",
+    "hi",
+    "hello",
+    "hey",
+    "good morning",
+    "good afternoon",
+    "good evening",
+}
+
+
+def _ensure_offline_transformers() -> None:
+    base_dir = MODELS_DIR / "sentence_transformers"
+    if not base_dir.exists():
+        return
+    os.environ.setdefault("SENTENCE_TRANSFORMERS_HOME", str(base_dir))
+    os.environ.setdefault("HF_HOME", str(base_dir))
+    os.environ.setdefault("HF_HUB_OFFLINE", "1")
+    os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+
+
+_ensure_offline_transformers()
 from .translation_cache import TranslationCache
 from .prompting import ChatTurn, MemoryStore, PromptManager, ToolRouter
 from .llm_client import create_llm_client, LLMClient, LLMClientError
@@ -74,7 +101,7 @@ class LNPChat:
     cache_dir: Path = Path("./index_cache")
     topk: int = 5
     translate: bool = False  # 기본은 다국어 Sentence-BERT로 번역 없이 처리
-    rerank: bool = True
+    rerank: bool = False
     rerank_model: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
     rerank_depth: int = 80
     rerank_batch_size: int = 16
@@ -107,6 +134,7 @@ class LNPChat:
     prompt_manager: PromptManager = field(init=False)
     tool_router: ToolRouter = field(init=False)
     llm_client: Optional[LLMClient] = field(init=False, default=None)
+    pending_search: Optional[Dict[str, Any]] = field(init=False, default=None)
 
     def __post_init__(self) -> None:
         self.memory = MemoryStore(capacity=20)
@@ -118,36 +146,56 @@ class LNPChat:
         backend = (self.llm_backend or "").strip()
         if not backend:
             return None
+        def _env_flag(name: str, *, default: bool) -> bool:
+            raw = os.getenv(name)
+            if raw is None:
+                return default
+            raw = raw.strip().lower()
+            if raw in {"0", "false", "no", "off"}:
+                return False
+            if raw in {"1", "true", "yes", "on"}:
+                return True
+            return default
+        require_llm = _env_flag("LNPCHAT_REQUIRE_LLM", default=True)
+        health_timeout = os.getenv("LNPCHAT_LLM_HEALTH_TIMEOUT", "").strip()
         try:
-            return create_llm_client(
+            health_timeout_s = float(health_timeout) if health_timeout else 20.0
+        except ValueError:
+            health_timeout_s = 20.0
+        health_timeout_s = max(1.0, health_timeout_s)
+        try:
+            client = create_llm_client(
                 backend,
                 model=self.llm_model or "llama3",
                 host=self.llm_host or "",
                 options=self.llm_options or {},
             )
         except LLMClientError as exc:
+            if require_llm:
+                raise SystemExit(f"LLM 백엔드 '{backend}' 초기화에 실패했습니다: {exc}") from exc
             print(f"⚠️ 로컬 LLM 초기화 실패: {exc}")
             return None
+        if require_llm:
+            health_prompt = os.getenv("LNPCHAT_LLM_HEALTH_PROMPT", "ping")
+            system_prompt = "You are a health check responder. Reply briefly."
+            try:
+                client.generate(
+                    health_prompt,
+                    system=system_prompt,
+                    timeout=health_timeout_s,
+                )
+            except LLMClientError as exc:
+                raise SystemExit(f"LLM 백엔드 '{backend}'가 {health_timeout_s:.0f}s 내에 응답하지 않습니다: {exc}") from exc
+            except Exception as exc:
+                raise SystemExit(f"LLM 백엔드 '{backend}'에 연결하는 중 오류가 발생했습니다: {exc}") from exc
+        return client
 
     # 초기화: Retriever 및 번역기 준비
     def ready(self, rebuild: bool = False):
         spin = Spinner(prefix="인덱스 준비")
         spin.start()
         try:
-            self.retr = Retriever(
-                model_path=self.model_path,
-                corpus_path=self.corpus_path,
-                cache_dir=self.cache_dir,
-                use_rerank=self.rerank,
-                rerank_model=self.rerank_model,
-                rerank_depth=self.rerank_depth,
-                rerank_batch_size=self.rerank_batch_size,
-                rerank_device=self.rerank_device,
-                rerank_min_score=self.rerank_min_score,
-                lexical_weight=self.lexical_weight,
-                min_similarity=self.min_similarity,
-            )
-            self.retr.ready(rebuild=rebuild, wait=False)
+            self.retr = self._build_retriever(use_rerank=self.rerank, rebuild=rebuild)
             if self.translate:
                 if GoogleTranslator is None:
                     print("\n⚠️ 경고: 'deep-translator' 라이브러리를 찾을 수 없어 번역 기능이 비활성화됩니다.")
@@ -168,6 +216,36 @@ class LNPChat:
             spin.stop()
         index_ready = self.retr.wait_until_ready(timeout=0.1)
         self._report_index_status(index_ready)
+
+    def _build_retriever(self, *, use_rerank: bool, rebuild: bool) -> Retriever:
+        attempt_args = dict(
+            model_path=self.model_path,
+            corpus_path=self.corpus_path,
+            cache_dir=self.cache_dir,
+            use_rerank=use_rerank,
+            rerank_model=self.rerank_model,
+            rerank_depth=self.rerank_depth,
+            rerank_batch_size=self.rerank_batch_size,
+            rerank_device=self.rerank_device,
+            rerank_min_score=self.rerank_min_score,
+            lexical_weight=self.lexical_weight,
+            min_similarity=self.min_similarity,
+        )
+        try:
+            retr = Retriever(**attempt_args)
+            retr.ready(rebuild=rebuild, wait=False)
+            return retr
+        except RuntimeError as exc:
+            message = str(exc).lower()
+            meta_issue = "meta tensor" in message or "to_empty" in message
+            if not meta_issue or not use_rerank:
+                raise
+            print("⚠️ CrossEncoder 로드 실패로 재정렬 기능을 비활성화하고 다시 시도합니다.")
+            self.rerank = False
+            attempt_args["use_rerank"] = False
+            retr = Retriever(**attempt_args)
+            retr.ready(rebuild=rebuild, wait=False)
+            return retr
 
     def _ensure_preview_translator(self):
         if not self.show_translation:
@@ -347,6 +425,56 @@ class LNPChat:
             self.ready(rebuild=False)
         k = topk or self.topk
         query_tokens = {tok.lower() for tok in _split_tokens(query) if tok}
+        consent_ack: Optional[str] = None
+        stored_action: Optional[str] = None
+        log_user_query = True
+
+        if self.pending_search:
+            if self._is_affirmative(query_tokens):
+                confirmation = query.strip()
+                if confirmation:
+                    self.memory.add_turn(role="user", text=confirmation)
+                stored = self.pending_search
+                self.pending_search = None
+                query = stored.get("query", query)
+                k = stored.get("topk", k)
+                query_tokens = {tok.lower() for tok in _split_tokens(query) if tok}
+                stored_action = stored.get("action", "search")
+                consent_ack = "네, 관련 문서를 찾아볼게요."
+                log_user_query = False  # 원본 질문은 이미 기록됨
+            elif self._is_negative(query_tokens):
+                self.pending_search = None
+                response = "알겠습니다. 문서 검색은 생략할게요."
+                self.memory.add_turn(role="user", text=query)
+                self.memory.add_turn(role="assistant", text=response)
+                return {
+                    "answer": response,
+                    "hits": [],
+                    "suggestions": ["다른 질문을 해보세요."],
+                }
+            else:
+                self.pending_search = None
+
+        if self.llm_client is None and self._is_small_talk(query_tokens):
+            friendly_answer = self._small_talk_reply(query)
+            self.memory.add_turn(role="user", text=query)
+            self.memory.add_turn(role="assistant", text=friendly_answer)
+            return {
+                "answer": friendly_answer,
+                "hits": [],
+                "suggestions": ["문서를 검색하려면 궁금한 내용을 조금 더 구체적으로 적어 주세요."],
+            }
+        if self.llm_client is not None and self._is_small_talk(query_tokens):
+            llm_reply = self._llm_chat_reply(query, mode="small_talk")
+            if llm_reply:
+                self.memory.add_turn(role="user", text=query)
+                self.memory.add_turn(role="assistant", text=llm_reply)
+                return {
+                    "answer": llm_reply,
+                    "hits": [],
+                    "suggestions": [],
+                    "llm_summary": llm_reply,
+                }
         effective_policy = self._resolve_policy_engine()
         self._policy_effective = bool(effective_policy)
 
@@ -355,12 +483,37 @@ class LNPChat:
         if used_context:
             print(f"  (이전 질문 맥락을 반영해 '{contextual_query}'로 검색합니다.)")
 
-        action = self.tool_router.select_action(
-            query,
-            use_translation=bool(self.translator),
-            policy_active=bool(effective_policy),
-            llm_available=self.llm_client is not None,
-        )
+        if stored_action is not None:
+            action = stored_action
+        else:
+            action = self.tool_router.select_action(
+                query,
+                use_translation=bool(self.translator),
+                policy_active=bool(effective_policy),
+                llm_available=self.llm_client is not None,
+            )
+
+        if (
+            stored_action is None
+            and self.llm_client is not None
+            and self.pending_search is None
+            and self._should_request_search_consent(action)
+        ):
+            dialogue = self._llm_chat_reply(query, mode="dialogue")
+            if not dialogue:
+                dialogue = "요청을 이해했어요."
+            consent_prompt = (
+                f"{dialogue.strip()}\n\n📂 관련 문서를 더 찾아볼까요? (네/응/Yes 또는 아니오/No)"
+            )
+            self.pending_search = {"query": query, "action": action, "topk": k}
+            self.memory.add_turn(role="user", text=query)
+            self.memory.add_turn(role="assistant", text=consent_prompt)
+            return {
+                "answer": consent_prompt,
+                "hits": [],
+                "suggestions": ["네", "아니오"],
+            }
+
         query_for_search = contextual_query
         if self.translator:
             try:
@@ -391,7 +544,8 @@ class LNPChat:
                 self.index_reasons.clear()
 
         # 히스토리 적재 (원본 query 기준)
-        self.memory.add_turn(role="user", text=query)
+        if log_user_query:
+            self.memory.add_turn(role="user", text=query)
         filtered_hits, filtered_count = self._apply_policy_scope(hits)
         self.last_hits = filtered_hits
         self.last_query_text = contextual_query
@@ -407,7 +561,10 @@ class LNPChat:
         policy_note = ""
         if self._policy_effective and filtered_count:
             policy_note = f" (정책으로 {filtered_count}건 제외)"
-        answer_lines = [f"‘{query}’에 대한 추천 문서 Top {len(hits)} (검색 {dt:.2f}s){policy_note}:"]
+        answer_lines: List[str] = []
+        if consent_ack:
+            answer_lines.append(consent_ack)
+        answer_lines.append(f"‘{query}’에 대한 추천 문서 Top {len(hits)} (검색 {dt:.2f}s){policy_note}:")
         for i, h in enumerate(hits, 1):
             semantic_pct = _similarity_to_percent(h.get("vector_similarity"))
             overall_pct = _similarity_to_percent(h.get("similarity", h.get("vector_similarity")))
@@ -472,6 +629,14 @@ class LNPChat:
             if translation_text:
                 answer_lines.append(f"   번역({self.translation_lang}): {translation_text}")
         if not hits:
+            llm_fallback = self._llm_chat_reply(query, mode="no_hits") if self.llm_client else None
+            if llm_fallback:
+                fallback_lines = [llm_fallback, ""]
+                if consent_ack:
+                    fallback_lines.insert(0, consent_ack)
+                answer_lines = fallback_lines
+            elif consent_ack:
+                answer_lines = [consent_ack, ""]
             answer_lines.append("관련 문서를 찾지 못했습니다. 표현을 바꿔보거나 더 구체적으로 적어주세요.")
             if not self.index_loaded:
                 answer_lines.append("현재 인덱스를 사용할 수 없어 검색이 제한됩니다:")
@@ -505,6 +670,71 @@ class LNPChat:
         if llm_summary:
             result["llm_summary"] = llm_summary
         return result
+
+    @staticmethod
+    def _is_small_talk(tokens: set[str]) -> bool:
+        if not tokens:
+            return False
+        if len(tokens) > 5:
+            return False
+        normalized = {token.strip("!?.") for token in tokens}
+        return any(token in _GREETINGS for token in normalized)
+
+    @staticmethod
+    def _small_talk_reply(query: str) -> str:
+        stripped = query.strip()
+        if stripped:
+            return f"안녕하세요! '{stripped}'에 대해 도와드릴 내용이 있으면 말씀해 주세요."
+        return "안녕하세요! 궁금한 내용을 알려주시면 관련 정보를 찾아 드릴게요."
+
+    @staticmethod
+    def _is_affirmative(tokens: Set[str]) -> bool:
+        positives = {"응", "네", "예", "맞아", "좋아", "yes", "y", "sure", "ok", "그래", "ㅇㅋ", "넵"}
+        return any(token in positives for token in tokens)
+
+    @staticmethod
+    def _is_negative(tokens: Set[str]) -> bool:
+        negatives = {"아니", "아니오", "no", "n", "싫어", "괜찮아", "아냐", "안돼", "안해", "노"}
+        return any(token in negatives for token in tokens)
+
+    @staticmethod
+    def _should_request_search_consent(action: str) -> bool:
+        return action in {"search", "search_and_summarize"}
+
+    def _llm_chat_reply(self, query: str, *, mode: str) -> Optional[str]:
+        client = self.llm_client
+        if client is None:
+            return None
+        if mode == "small_talk":
+            system_prompt = (
+                "You are InfoPilot's conversational assistant. Reply in Korean, be concise and friendly. "
+                "Answer the user's request directly without asking for documents."
+            )
+            prompt = query.strip()
+        elif mode == "no_hits":
+            system_prompt = (
+                "You are InfoPilot's assistant. No matching documents were found for the user query. "
+                "Provide a brief helpful reply in Korean using general knowledge, and optionally suggest "
+                "how the user might rephrase the question. Do not mention unavailable features."
+            )
+            prompt = query.strip()
+        elif mode == "dialogue":
+            system_prompt = (
+                "You are InfoPilot's assistant. Provide a concise, friendly reply in Korean addressing the user's request. "
+                "Do not mention document search. Keep the response within two sentences."
+            )
+            prompt = query.strip()
+        else:
+            return None
+        try:
+            reply = client.generate(prompt, system=system_prompt, timeout=30.0).strip()
+        except LLMClientError as exc:
+            print(f"⚠️ 로컬 LLM 응답 실패({mode}): {exc}")
+            return None
+        except Exception as exc:
+            print(f"⚠️ 로컬 LLM 예외({mode}): {exc}")
+            return None
+        return reply or None
 
     def _summarize_hits(self, query: str, hits: List[Dict[str, Any]]) -> Optional[str]:
         client = self.llm_client

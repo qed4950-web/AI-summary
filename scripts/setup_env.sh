@@ -6,6 +6,11 @@ root_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 cd "$root_dir"
 
+if [ ! -f .env ] && [ -f .env.example ]; then
+  cp .env.example .env
+  echo "Created .env from .env.example. Update values as needed." >&2
+fi
+
 if [ ! -d .venv ]; then
   "$python_bin" -m venv .venv
 fi

@@ -1,14 +1,14 @@
 import customtkinter as ctk
 from typing import Dict
 
-from src.config import (
-    CORPUS_PARQUET,
-    TOPIC_MODEL_PATH,
+from ui.utils import (
     DATA_DIR,
     MODELS_DIR,
     CACHE_DIR,
+    CORPUS_PARQUET,
+    TOPIC_MODEL_PATH,
+    have_all_artifacts,
 )
-from src.core.helpers import have_all_artifacts
 
 
 class HomeScreen(ctk.CTkFrame):

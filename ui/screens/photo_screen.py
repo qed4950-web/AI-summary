@@ -13,7 +13,7 @@ from tkinter import filedialog
 
 from core.agents.photo.models import PhotoJobConfig
 from core.agents.photo.pipeline import PhotoPipeline
-from src.config import PHOTO_OUTPUT_DIR
+from ui.utils import PHOTO_OUTPUT_DIR
 
 
 class PhotoScreen(ctk.CTkFrame):

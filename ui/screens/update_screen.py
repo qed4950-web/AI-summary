@@ -9,14 +9,20 @@ import threading
 from pathlib import Path
 
 # Core logic and helpers
-from src.core.helpers import get_drives, have_all_artifacts
-from src.config import (
-    EXCLUDE_DIRS, SUPPORTED_EXTS,
-    DATA_DIR, MODELS_DIR, CACHE_DIR,
-    CORPUS_PARQUET, FOUND_FILES_CSV, TOPIC_MODEL_PATH
+from ui.utils import (
+    get_drives,
+    have_all_artifacts,
+    EXCLUDE_DIRS,
+    SUPPORTED_EXTS,
+    DATA_DIR,
+    MODELS_DIR,
+    CACHE_DIR,
+    CORPUS_PARQUET,
+    FOUND_FILES_CSV,
+    TOPIC_MODEL_PATH,
+    CorpusBuilder,
+    rebuild_index,
 )
-from src.core.corpus import CorpusBuilder
-from src.core.indexing import run_indexing
 
 def _run_update_index_logic(log_callback, done_callback):
     try:
@@ -105,7 +111,7 @@ def _run_update_index_logic(log_callback, done_callback):
         # 5. 인덱스 재생성
         if CORPUS_PARQUET.exists() and not pd.read_parquet(CORPUS_PARQUET).empty:
             log_callback("INFO: 벡터 인덱스 재생성 중... (진행률은 콘솔 창에 표시됩니다)")
-            run_indexing(corpus_path=CORPUS_PARQUET, cache_dir=CACHE_DIR)
+            rebuild_index(corpus_path=CORPUS_PARQUET, cache_dir=CACHE_DIR)
             log_callback("SUCCESS: 인덱스 재생성 완료.")
         else:
             log_callback("WARNING: 코퍼스가 비어있어 인덱싱을 건너뜁니다.")

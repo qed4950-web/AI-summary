@@ -14,6 +14,8 @@ from pathlib import Path
 from dataclasses import dataclass
 from typing import Optional, Dict, Any, List, Tuple, Union, Set
 
+from core.data_pipeline.custom_metadata import get_metadata_for_path
+
 import numpy as np
 
 # ---- 선택 의존성(있으면 사용) ----
@@ -456,8 +458,10 @@ def _metadata_text(
     mtime: Optional[float] = None,
     ctime: Optional[float] = None,
     owner: Optional[str] = None,
+    extra: Optional[str] = None,
 ) -> str:
     tokens: List[str] = []
+    extra_clean: Optional[str] = None
     if path:
         try:
             p = Path(path)
@@ -496,6 +500,10 @@ def _metadata_text(
     if owner:
         tokens.append(str(owner))
         tokens.extend(_split_tokens(str(owner)))
+    if extra:
+        extra_clean = TextCleaner.clean(str(extra))
+        if extra_clean:
+            tokens.extend(_split_tokens(extra_clean))
 
     seen = set()
     normalized: List[str] = []
@@ -506,7 +514,10 @@ def _metadata_text(
         if cleaned not in seen:
             seen.add(cleaned)
             normalized.append(cleaned)
-    return " ".join(normalized)
+    metadata_text = " ".join(normalized)
+    if extra_clean:
+        return f"{metadata_text}\n{extra_clean}" if metadata_text else extra_clean
+    return metadata_text
 
 
 def _compose_model_text(base_text: str, metadata: str) -> str:
@@ -577,6 +588,10 @@ def _prepare_text_frame(df: "pd.DataFrame") -> "pd.DataFrame":
         owners = owners.fillna("").astype(str)
 
     base_texts = df["text"].tolist()
+    extra_texts = [
+        get_metadata_for_path(str(paths.iat[idx]))
+        for idx in range(len(df))
+    ]
     metadata_list = [
         _metadata_text(
             paths.iat[idx],
@@ -586,6 +601,7 @@ def _prepare_text_frame(df: "pd.DataFrame") -> "pd.DataFrame":
             mtime=mtimes.iat[idx],
             ctime=ctimes.iat[idx],
             owner=owners.iat[idx],
+            extra=extra_texts[idx],
         )
         for idx in range(len(df))
     ]
@@ -1266,7 +1282,22 @@ class SentenceBertModel:
         self.cfg = cfg
         self.model_name = cfg.embedding_model or DEFAULT_EMBED_MODEL
         print(f"🧠 Sentence-BERT 준비: {self.model_name}", flush=True)
-        self._encoder = SentenceTransformer(self.model_name)
+        try:
+            self._encoder = SentenceTransformer(self.model_name)
+        except (RuntimeError, NotImplementedError) as exc:
+            message = str(exc).lower()
+            meta_issue = "meta tensor" in message or "to_empty" in message
+            if meta_issue:
+                print("⚠️ SentenceTransformer 로드 실패 → CPU 강제 시도", flush=True)
+                try:
+                    self._encoder = SentenceTransformer(self.model_name, device="cpu")
+                except Exception as inner_exc:
+                    raise RuntimeError(
+                        "SentenceTransformer 초기화에 실패했습니다.\n"
+                        "PyTorch를 README 권장 버전(torch 2.3.0, torchvision 0.18.0, torchaudio 2.3.0)으로 재설치해 주세요."
+                    ) from inner_exc
+            else:
+                raise
         self.embedding_dim = int(self._encoder.get_sentence_embedding_dimension())
         self.cluster_model: Optional[MiniBatchKMeans] = None
         self.cluster_labels_: Optional[np.ndarray] = None

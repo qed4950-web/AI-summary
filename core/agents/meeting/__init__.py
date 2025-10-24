@@ -1,5 +1,6 @@
 """Meeting agent primitives and pipelines."""
 
+from .agent import MeetingAgent, MeetingAgentConfig
 from .models import (
     MeetingJobConfig,
     MeetingTranscriptionResult,
@@ -13,6 +14,8 @@ __all__ = [
     "MeetingTranscriptionResult",
     "MeetingSummary",
     "StreamingSummarySnapshot",
+    "MeetingAgent",
+    "MeetingAgentConfig",
     "MeetingPipeline",
     "StreamingMeetingSession",
 ]

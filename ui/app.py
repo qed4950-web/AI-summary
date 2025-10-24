@@ -3,7 +3,7 @@ import json
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Callable, Dict, Optional
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
@@ -12,6 +12,7 @@ if str(REPO_ROOT) not in sys.path:
 # Import screen modules
 from ui.screens.home_screen import HomeScreen
 from ui.screens.chat_screen import ChatScreen
+from ui.screens.conversation_screen import ConversationScreen
 from ui.screens.train_screen import TrainScreen
 from ui.screens.update_screen import UpdateScreen
 from ui.screens.meeting_screen import MeetingScreen
@@ -25,8 +26,9 @@ class App(ctk.CTk):
 
     NAV_DEFS = (
         ("home", "홈 대시보드"),
-        ("work_center", "작업 센터"),
+        ("conversation", "대화 비서"),
         ("chat", "지식·검색"),
+        ("work_center", "작업 센터"),
         ("train", "전체 학습"),
         ("update", "증분 업데이트"),
         ("meeting", "회의 비서"),
@@ -119,11 +121,12 @@ class App(ctk.CTk):
         self.content_container.grid_rowconfigure(0, weight=1)
         self.content_container.grid_columnconfigure(0, weight=1)
 
-        self.frames: Dict[str, ctk.CTkFrame] = {
-            "home": HomeScreen(self.content_container, app=self, corner_radius=0, fg_color="transparent"),
-            "work_center": WorkCenterScreen(self.content_container, app=self, corner_radius=0, fg_color="transparent"),
-            "chat": ChatScreen(self.content_container, app=self, corner_radius=0, fg_color="transparent"),
-            "train": TrainScreen(
+        self.frame_factories: Dict[str, Callable[[], ctk.CTkFrame]] = {
+            "home": lambda: HomeScreen(self.content_container, app=self, corner_radius=0, fg_color="transparent"),
+            "conversation": lambda: ConversationScreen(self.content_container, app=self, corner_radius=0, fg_color="transparent"),
+            "chat": lambda: ChatScreen(self.content_container, app=self, corner_radius=0, fg_color="transparent"),
+            "work_center": lambda: WorkCenterScreen(self.content_container, app=self, corner_radius=0, fg_color="transparent"),
+            "train": lambda: TrainScreen(
                 self.content_container,
                 app=self,
                 start_task_callback=self.start_task,
@@ -131,7 +134,7 @@ class App(ctk.CTk):
                 corner_radius=0,
                 fg_color="transparent",
             ),
-            "update": UpdateScreen(
+            "update": lambda: UpdateScreen(
                 self.content_container,
                 app=self,
                 start_task_callback=self.start_task,
@@ -139,7 +142,7 @@ class App(ctk.CTk):
                 corner_radius=0,
                 fg_color="transparent",
             ),
-            "meeting": MeetingScreen(
+            "meeting": lambda: MeetingScreen(
                 self.content_container,
                 app=self,
                 start_task_callback=self.start_task,
@@ -147,7 +150,7 @@ class App(ctk.CTk):
                 corner_radius=0,
                 fg_color="transparent",
             ),
-            "photos": PhotoScreen(
+            "photos": lambda: PhotoScreen(
                 self.content_container,
                 app=self,
                 start_task_callback=self.start_task,
@@ -156,7 +159,7 @@ class App(ctk.CTk):
                 fg_color="transparent",
             ),
         }
-
+        self.frames: Dict[str, ctk.CTkFrame] = {}
         self.set_smart_folder_context(None)
 
         # --- Status bar ---
@@ -186,7 +189,7 @@ class App(ctk.CTk):
             self.status_var.set("⚙️ 작업이 완료될 때까지 다른 화면으로 이동할 수 없습니다.")
             return
 
-        if name not in self.frames:
+        if name not in self.frames and name not in self.frame_factories:
             raise KeyError(f"Unknown frame: {name}")
 
         # Hide previous frame
@@ -201,13 +204,14 @@ class App(ctk.CTk):
 
 
         # Show requested frame
-        frame = self.frames[name]
+        frame = self._get_or_create_frame(name)
         frame.grid(row=0, column=0, sticky="nsew")
 
         # Update header text
         self.active_frame_key = name
         header_texts = {
             "home": ("대시보드", "현재 상태를 확인하고 주요 작업으로 이동하세요."),
+            "conversation": ("대화 비서", "자연어로 질문하고 LLM 요약을 받아보세요."),
             "work_center": ("작업 센터", "스마트 폴더 컨텍스트와 비서 기능을 한 화면에서 관리하세요."),
             "chat": ("지식·검색 비서", "학습된 문서를 대상으로 의미 검색을 수행합니다."),
             "train": ("전체 학습", "새로운 코퍼스를 만들고 인덱스를 재구축합니다."),
@@ -228,7 +232,7 @@ class App(ctk.CTk):
     # ------------------------------------------------------------------
     # Long running task coordination
     # ------------------------------------------------------------------
-    def start_task(self, status_message: str | None = None) -> None:
+    def start_task(self, status_message: Optional[str] = None) -> None:
         """Disable navigation when a long task starts."""
         self.is_task_running = True
         for button in self.nav_buttons.values():
@@ -238,7 +242,7 @@ class App(ctk.CTk):
         else:
             self.status_var.set("⏳ 작업이 진행 중입니다...")
 
-    def end_task(self, status_message: str | None = None) -> None:
+    def end_task(self, status_message: Optional[str] = None) -> None:
         """Re-enable navigation once the long task ends."""
         self.is_task_running = False
         for button in self.nav_buttons.values():
@@ -285,6 +289,21 @@ class App(ctk.CTk):
             handler = getattr(frame, "on_work_center_event", None)
             if callable(handler):
                 handler(record)
+
+    def _get_or_create_frame(self, name: str) -> ctk.CTkFrame:
+        frame = self.frames.get(name)
+        if frame is not None:
+            return frame
+        factory = self.frame_factories.get(name)
+        if factory is None:
+            raise KeyError(f"Unknown frame factory: {name}")
+        frame = factory()
+        self.frames[name] = frame
+        if self.smart_folder_context is not None:
+            handler = getattr(frame, "on_smart_folder_update", None)
+            if callable(handler):
+                handler(self.smart_folder_context)
+        return frame
 
 
 if __name__ == "__main__":

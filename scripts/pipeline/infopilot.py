@@ -12,6 +12,7 @@ import time
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+import os
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Set, Tuple
 
 ROOT_DIR = Path(__file__).resolve().parents[2]
@@ -47,12 +48,17 @@ except Exception:
     Observer = None
 
 
+HISTORY_PATH = Path.home() / ".infopilot" / "agent_history.json"
+MAX_AGENT_HISTORY = 5
+
+
 # 모듈 임포트
 from core.config.paths import (
     CACHE_DIR,
     CORPUS_PATH,
     DATA_DIR,
     TOPIC_MODEL_PATH,
+    MODELS_DIR,
 )
 from core.data_pipeline.filefinder import FileFinder
 from core.data_pipeline.policies.engine import PolicyEngine, SmartFolderPolicy
@@ -67,7 +73,10 @@ from core.data_pipeline.pipeline import (
 )
 from core.infra.scheduler import JobScheduler, ScheduleSpec, ScheduledJob
 from core.infra.models import ModelManager
-from core.conversation.lnp_chat import LNPChat
+from core.agents.document import DocumentAgent, DocumentAgentConfig
+from core.agents.meeting import MeetingAgent
+from core.agents.photo import PhotoAgent
+from core.conversation.orchestrator import AssistantOrchestrator
 from core.search.retriever import (
     VectorIndex,
     MODEL_TEXT_COLUMN,
@@ -76,12 +85,66 @@ from core.search.retriever import (
 
 
 KNOWLEDGE_AGENT = "knowledge_search"
-DEFAULT_POLICY_PATH = Path("./config/smart_folders.json")
+DEFAULT_POLICY_PATH = Path("./core/config/smart_folders.json")
 DEFAULT_FOUND_FILES = DATA_DIR / "found_files.csv"
 DEFAULT_SCHEDULED_ROOT = DATA_DIR / "scheduled"
 
 _POLICY_CACHE: Dict[Path, PolicyEngine] = {}
 _SENTENCE_ENCODER_MANAGER: Optional[ModelManager] = None
+
+
+def _load_agent_history() -> Dict[str, List[str]]:
+    try:
+        payload = json.loads(HISTORY_PATH.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            return {"meeting_audio": [], "photo_roots": []}
+        meeting = [str(item) for item in payload.get("meeting_audio", []) if isinstance(item, str)]
+        photo = [str(item) for item in payload.get("photo_roots", []) if isinstance(item, str)]
+        return {
+            "meeting_audio": meeting[:MAX_AGENT_HISTORY],
+            "photo_roots": photo[:MAX_AGENT_HISTORY],
+        }
+    except Exception:
+        return {"meeting_audio": [], "photo_roots": []}
+
+
+def _save_agent_history(history: Dict[str, List[str]]) -> None:
+    try:
+        HISTORY_PATH.parent.mkdir(parents=True, exist_ok=True)
+        HISTORY_PATH.write_text(json.dumps(history, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _remember_agent_history(kind: str, values: Iterable[str]) -> None:
+    if kind not in {"meeting_audio", "photo_roots"}:
+        return
+    history = _load_agent_history()
+    original = history.get(kind, [])
+    merged: List[str] = []
+    for value in values:
+        normalised = str(Path(value).expanduser())
+        if normalised and normalised not in merged:
+            merged.append(normalised)
+    for existing in original:
+        if existing not in merged:
+            merged.append(existing)
+    history[kind] = merged[:MAX_AGENT_HISTORY]
+    _save_agent_history(history)
+
+
+def _configure_offline_transformers() -> None:
+    """Ensure HuggingFace-dependent components run offline when weights exist locally."""
+    base_dir = MODELS_DIR / "sentence_transformers"
+    if not base_dir.exists():
+        return
+    os.environ.setdefault("SENTENCE_TRANSFORMERS_HOME", str(base_dir))
+    os.environ.setdefault("HF_HOME", str(base_dir))
+    os.environ.setdefault("HF_HUB_OFFLINE", "1")
+    os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+
+
+_configure_offline_transformers()
 
 
 NORMALIZED_ALIASES = {
@@ -101,6 +164,9 @@ def _get_sentence_encoder_manager() -> ModelManager:
         def _load(model_name: str):
             if SentenceTransformer is None:
                 raise RuntimeError("sentence-transformers 패키지가 필요합니다. pip install sentence-transformers")
+            local_dir = MODELS_DIR / "sentence_transformers" / model_name
+            if local_dir.exists():
+                return SentenceTransformer(str(local_dir))
             return SentenceTransformer(model_name)
 
         _SENTENCE_ENCODER_MANAGER = ModelManager(loader=_load)
@@ -916,6 +982,22 @@ def cmd_pipeline(args):
 def cmd_chat(args):
     """대화형 검색 모드 (LNPChat 사용)"""
     policy_engine = _load_policy_engine(getattr(args, "policy", None))
+    def _env_or_arg(name: str, default: Optional[str] = None) -> Optional[str]:
+        value = getattr(args, name, None)
+        if value:
+            value = str(value).strip()
+            if value:
+                return value
+        env_name = f"LNPCHAT_{name.upper()}"
+        env_value = os.getenv(env_name)
+        if env_value is None:
+            return default
+        env_value = env_value.strip()
+        return env_value or default
+
+    llm_backend = _env_or_arg("llm_backend")
+    llm_model = _env_or_arg("llm_model", default="llama3")
+    llm_host = _env_or_arg("llm_host", default="")
     auto_trained = _ensure_chat_artifacts(
         scan_csv=Path(args.scan_csv),
         corpus=Path(args.corpus),
@@ -925,28 +1007,134 @@ def cmd_chat(args):
         policy_engine=policy_engine,
     )
 
-    # LNPChat 클래스 인스턴스 생성 및 준비
-    chat_session = LNPChat(
-        model_path=Path(args.model),
-        corpus_path=Path(args.corpus),
-        cache_dir=Path(args.cache),
-        topk=args.topk,
-        translate=args.translate, # 번역 옵션 전달
-        rerank=args.rerank,
-        rerank_model=args.rerank_model,
-        rerank_depth=args.rerank_depth,
-        rerank_batch_size=args.rerank_batch_size,
-        rerank_device=args.rerank_device or None,
-        rerank_min_score=args.rerank_min_score,
-        lexical_weight=args.lexical_weight,
-        show_translation=args.show_translation,
-        translation_lang=args.translation_lang,
-        min_similarity=args.min_similarity,
-        policy_engine=policy_engine if policy_engine and policy_engine.has_policies else policy_engine,
-        policy_scope=(getattr(args, "scope", "auto") or "auto").lower(),
-        policy_agent=KNOWLEDGE_AGENT,
+    document_agent = DocumentAgent(
+        DocumentAgentConfig(
+            model_path=Path(args.model),
+            corpus_path=Path(args.corpus),
+            cache_dir=Path(args.cache),
+            topk=args.topk,
+            translate=args.translate,
+            rerank=args.rerank,
+            rerank_model=args.rerank_model,
+            rerank_depth=args.rerank_depth,
+            rerank_batch_size=args.rerank_batch_size,
+            rerank_device=args.rerank_device or None,
+            rerank_min_score=args.rerank_min_score,
+            lexical_weight=args.lexical_weight,
+            show_translation=args.show_translation,
+            translation_lang=args.translation_lang,
+            min_similarity=args.min_similarity,
+            llm_backend=llm_backend,
+            llm_model=llm_model,
+            llm_host=llm_host,
+            llm_options={},
+            policy_engine=policy_engine if policy_engine and policy_engine.has_policies else policy_engine,
+            policy_scope=(getattr(args, "scope", "auto") or "auto").lower(),
+            policy_agent=KNOWLEDGE_AGENT,
+            rebuild_index=auto_trained,
+        )
     )
-    chat_session.ready(rebuild=auto_trained)
+    meeting_agent = MeetingAgent()
+    photo_agent = PhotoAgent()
+
+    orchestrator = AssistantOrchestrator(
+        [document_agent, meeting_agent, photo_agent],
+        llm_client=document_agent.llm_client,
+    )
+
+    def _print_response(resp: "OrchestratorResponse") -> None:
+        prefix = f"[{resp.agent}] " if resp.agent else ""
+        print(prefix + resp.message)
+        if resp.suggestions:
+            print("\n💡 이런 질문은 어떠세요?")
+            for suggestion in resp.suggestions:
+                print(f"   - {suggestion}")
+
+    def _cli_progress_handler(agent_label: str) -> Callable[[Dict[str, Any]], None]:
+        def _handler(event: Dict[str, Any]) -> None:
+            stage = event.get("stage")
+            status = event.get("status")
+            prefix = f"[{agent_label}]"
+            if status == "running":
+                print(f"{prefix} ▶ {stage} 시작")
+            elif status == "completed":
+                print(f"{prefix} ✅ {stage} 완료")
+            elif status == "failed":
+                error = event.get("error")
+                print(f"{prefix} ❌ {stage} 실패: {error}")
+            elif status == "cancelled":
+                print(f"{prefix} ⛔ {stage} 취소")
+        return _handler
+
+    def _prompt_follow_up(reason: Optional[str], message: str) -> Optional[Dict[str, object]]:
+        print(message)
+        history = _load_agent_history()
+        if reason == "needs_audio":
+            recent = history.get("meeting_audio", [])
+            if recent:
+                print("\n📁 최근 사용한 오디오 파일:")
+                for idx, item in enumerate(recent, start=1):
+                    print(f"  {idx}. {item}")
+            prompt = "회의 요약을 실행하려면 오디오 파일 전체 경로를 입력하거나 번호를 선택하세요> "
+            raw = input(prompt).strip()
+            if not raw:
+                print("⚠️ 경로를 입력하지 않아 요청을 취소했습니다.")
+                return None
+            if raw.isdigit():
+                index = int(raw) - 1
+                if 0 <= index < len(recent):
+                    audio_path = recent[index]
+                else:
+                    print("⚠️ 번호가 유효하지 않아 요청을 취소했습니다.")
+                    return None
+            else:
+                audio_path = raw
+            _remember_agent_history("meeting_audio", [audio_path])
+            return {"audio_path": audio_path, "enable_resume": True}
+        if reason == "needs_roots":
+            recent = history.get("photo_roots", [])
+            if recent:
+                print("\n📸 최근 사용한 사진 폴더:")
+                for idx, item in enumerate(recent, start=1):
+                    print(f"  {idx}. {item}")
+            prompt = "사진 폴더 경로를 입력하거나 번호(여러 개는 콤마)로 선택하세요> "
+            raw = input(prompt).strip()
+            if not raw:
+                print("⚠️ 경로를 입력하지 않아 요청을 취소했습니다.")
+                return None
+            roots: List[str] = []
+            for token in [part.strip() for part in raw.split(",") if part.strip()]:
+                if token.isdigit():
+                    index = int(token) - 1
+                    if 0 <= index < len(recent):
+                        roots.append(recent[index])
+                    else:
+                        print(f"⚠️ 번호 {token}가 유효하지 않아 무시합니다.")
+                else:
+                    roots.append(token)
+            if not roots:
+                print("⚠️ 유효한 경로가 없어 요청을 취소했습니다.")
+                return None
+            _remember_agent_history("photo_roots", roots)
+            return {"roots": roots}
+        extra = input("추가 정보를 입력하세요> ").strip()
+        if not extra:
+            print("⚠️ 추가 정보를 입력하지 않아 요청을 취소했습니다.")
+            return None
+        return {"details": extra}
+
+    def _resolve_follow_up(original_query: str, initial_response: "OrchestratorResponse") -> "OrchestratorResponse":
+        response = initial_response
+        while response.agent == "follow_up":
+            follow_context = _prompt_follow_up(response.reason, response.message)
+            if not follow_context:
+                break
+            if response.reason == "needs_audio":
+                follow_context.setdefault("__progress_callback", _cli_progress_handler("회의 비서"))
+            elif response.reason == "needs_roots":
+                follow_context.setdefault("__progress_callback", _cli_progress_handler("사진 비서"))
+            response = orchestrator.handle(original_query, follow_context)
+        return response
 
     single_query = getattr(args, "query", None)
     json_mode = bool(getattr(args, "json", False))
@@ -954,15 +1142,24 @@ def cmd_chat(args):
         raise SystemExit("--json 옵션은 --query와 함께 사용해야 합니다.")
 
     if single_query:
-        result = chat_session.ask(single_query)
+        response = orchestrator.handle(single_query)
+        if response.agent == "follow_up" and not json_mode:
+            response = _resolve_follow_up(single_query, response)
         if json_mode:
+            metadata = response.metadata if isinstance(response.metadata, dict) else {}
             payload = {
                 "query": single_query,
-                "answer": result.get("answer"),
-                "suggestions": result.get("suggestions", []),
+                "answer": response.message,
+                "agent": response.agent,
+                "reason": response.reason,
+                "metadata": metadata,
+                "suggestions": response.suggestions or [],
                 "results": [],
             }
-            for hit in result.get("hits", [])[: args.topk]:
+            if response.agent == "follow_up":
+                metadata["follow_up"] = response.reason
+            hits = response.metadata.get("hits", []) if isinstance(response.metadata, dict) else []
+            for hit in hits[: args.topk]:
                 payload["results"].append(
                     {
                         "title": Path(str(hit.get("path") or "")).name,
@@ -978,12 +1175,7 @@ def cmd_chat(args):
                 )
             print(json.dumps(payload, ensure_ascii=False))
         else:
-            print(result.get("answer", ""))
-            suggestions = result.get("suggestions") or []
-            if suggestions:
-                print("\n💡 이런 질문은 어떠세요?")
-                for s in suggestions:
-                    print(f"   - {s}")
+            _print_response(response)
         return
 
     print("\n💬 InfoPilot Chat 모드입니다. (종료하려면 'exit' 또는 '종료' 입력)")
@@ -998,14 +1190,10 @@ def cmd_chat(args):
         if query.lower() in {"exit", "quit", "종료"}:
             print("👋 종료합니다.")
             break
-        
-        # LNPChat의 ask 메소드 호출
-        result = chat_session.ask(query)
-        print(result["answer"])
-        if result.get("suggestions"):
-            print("\n💡 이런 질문은 어떠세요?")
-            for s in result["suggestions"]:
-                print(f"   - {s}")
+
+        response = orchestrator.handle(query)
+        response = _resolve_follow_up(query, response)
+        _print_response(response)
         print("-" * 80)
 
 

@@ -1,0 +1,31 @@
+{
+  "results": [
+    {
+      "name": "default-miniLM",
+      "count": 3,
+      "init_seconds": 4.33,
+      "k": 5,
+      "precision@k": 0.0,
+      "recall@k": 0.0,
+      "ndcg@k": 0.0
+    },
+    {
+      "name": "miniLM-high-threshold",
+      "count": 3,
+      "init_seconds": 3.85,
+      "k": 5,
+      "precision@k": 0.0,
+      "recall@k": 0.0,
+      "ndcg@k": 0.0
+    },
+    {
+      "name": "miniLM-top3",
+      "count": 3,
+      "init_seconds": 4.6,
+      "k": 3,
+      "precision@k": 0.0,
+      "recall@k": 0.0,
+      "ndcg@k": 0.0
+    }
+  ]
+}

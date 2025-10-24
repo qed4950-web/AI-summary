@@ -1,15 +1,16 @@
-# Installer & Workcenter UX Polish (Draft)
+# 설치 마법사 및 작업 센터 개선 메모 (초안)
 
-## Installer Wizard
-- [ ] Add policy configuration step (choose meeting/photo agents)
-- [ ] Highlight default storage/offloading options
-- [ ] Provide KPI opt-in toggle for telemetry collection
+## 설치 마법사
+- [ ] 회의/사진 에이전트 선택 단계 추가
+- [ ] 기본 저장 위치·오프로딩 옵션을 명확히 안내
+- [ ] KPI 수집(텔레메트리) 동의 토글 제공
 
-## Workcenter Dashboard
-- [ ] Surface meeting/photo pipeline status and latest actions
-- [ ] Display policy scope indicators for current session
-- [ ] Quick links to audit logs and release checklist
+## 작업 센터 대시보드
+- [ ] 회의/사진 파이프라인 상태와 최근 작업을 표시
+- [ ] 현재 세션에 적용된 정책 범위를 아이콘으로 안내
+- [ ] 감사 로그, 릴리스 가이드 등 주요 문서로 바로가기 제공
 
-## Notes
-- Integrate KPI snapshot summaries from `scripts/release_prepare.py`
-- Coordinate with Cycle 3/4 agents to show actionable items
+## 참고 메모
+- `scripts/release_prepare.py` 산출물을 UI 요약에 녹여 KPI 상태를 보여줍니다.
+- Electron 기반 빠른 프로토타입(`ui/electron/`)으로 플로팅 도구막대와 오버레이 아이디어를 검증합니다.
+- Cycle 3/4 범위에서 나온 액션 아이템을 UI에서 바로 처리할 수 있도록 연동합니다.

@@ -1,24 +1,24 @@
 import customtkinter as ctk
-import pandas as pd
+import tkinter as tk
 from pathlib import Path
 from typing import Any, Dict, List, Optional
-from dataclasses import dataclass, field
 import time
 import threading
 from core.data_pipeline.policies.engine import PolicyEngine
 
 # Core logic and helpers
-from src.core.helpers import parse_query_and_filters, have_all_artifacts
-from src.config import (
-    CORPUS_PARQUET,
-    CACHE_DIR,
+from ui.utils import (
+    parse_query_and_filters,
+    have_all_artifacts,
     DEFAULT_TOP_K,
     DEFAULT_SIMILARITY_THRESHOLD,
+    CORPUS_PARQUET,
+    CACHE_DIR,
     TOPIC_MODEL_PATH,
 )
-from src.core.retrieval import Retriever
 from ui.smart_folder_context import SmartFolderContext
 from ui.policy_cache import get_policy_engine
+from core.conversation.lnp_chat import LNPChat as CoreLNPChat
 
 
 def _path_within(path: Path, root: Path) -> bool:
@@ -38,104 +38,6 @@ def _path_within(path: Path, root: Path) -> bool:
             return False
     except Exception:
         return False
-
-
-@dataclass
-class LNPChat:
-    corpus_path: Path
-    cache_dir: Path
-    topk: int = DEFAULT_TOP_K
-    similarity_threshold: float = DEFAULT_SIMILARITY_THRESHOLD
-    retr: Optional[Retriever] = field(init=False, default=None)
-    ready_done: bool = field(init=False, default=False)
-
-    def ready(self, rebuild: bool = False):
-        print("엔진 초기화 시작...")
-        self.retr = Retriever(
-            model_path=TOPIC_MODEL_PATH,
-            corpus_path=self.corpus_path,
-            cache_dir=self.cache_dir,
-        )
-        self.retr.ready(rebuild=rebuild)
-        self.ready_done = True
-        print("✅ LNP Chat 준비 완료")
-
-    def ask(
-        self,
-        query: str,
-        topk: Optional[int] = None,
-        filters: Optional[Dict[str, Any]] = None,
-        path_prefix: Optional[Path] = None,
-        policy_engine: Optional[PolicyEngine] = None,
-        agent: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        if not self.ready_done:
-            self.ready(rebuild=False)
-
-        k = topk or self.topk
-        t0 = time.time()
-        candidate_hits = self.retr.search(query, top_k=max(k * 2, 20))
-        dt = time.time() - t0
-
-        filtered_hits = [h for h in candidate_hits if h["similarity"] >= self.similarity_threshold]
-        if path_prefix:
-            prefix = path_prefix
-            scoped_hits: List[Dict[str, Any]] = []
-            for hit in filtered_hits:
-                path_str = hit.get("path")
-                if not path_str:
-                    continue
-                if _path_within(Path(path_str), prefix):
-                    scoped_hits.append(hit)
-            filtered_hits = scoped_hits
-
-        blocked_hits = 0
-        policy_active = policy_engine is not None and policy_engine.has_policies
-        agent_name = (agent or self.policy_agent or "knowledge_search").strip()
-        if policy_active:
-            policy_hits: List[Dict[str, Any]] = []
-            for hit in filtered_hits:
-                path_str = hit.get("path")
-                if not path_str:
-                    blocked_hits += 1
-                    continue
-                hit_path = Path(path_str)
-                try:
-                    if policy_engine.allows(hit_path, agent=agent_name):
-                        policy_hits.append(hit)
-                    else:
-                        blocked_hits += 1
-                except Exception:
-                    blocked_hits += 1
-            filtered_hits = policy_hits
-
-        final_hits = filtered_hits[:k]
-        if not final_hits:
-            if blocked_hits:
-                answer_lines = [
-                    f"정책에 의해 제외된 문서 {blocked_hits}건을 제외하면 ‘{query}’와 관련된 결과가 없습니다."
-                ]
-            else:
-                answer_lines = [f"‘{query}’와 관련된 내용을 찾지 못했습니다."]
-        else:
-            answer_lines = [
-                f"‘{query}’와(과) 의미상 유사한 문서 Top {len(final_hits)} (검색 {dt:.2f}s):"
-            ]
-            for i, hit in enumerate(final_hits, 1):
-                sim = f"{hit['similarity']:.3f}"
-                answer_lines.append(f"{i}. {hit['path']}  (유사도: {sim})")
-                if hit.get("summary"):
-                    answer_lines.append(f"   요약: {hit['summary']}")
-            if blocked_hits:
-                answer_lines.append("")
-                answer_lines.append(f"정책으로 제외된 문서 {blocked_hits}건이 목록에서 제거되었습니다.")
-
-        return {
-            "answer": "\n".join(answer_lines),
-            "hits": final_hits,
-            "policy_blocked": blocked_hits,
-            "policy_enforced": policy_active,
-        }
 
 
 class ChatScreen(ctk.CTkFrame):
@@ -203,10 +105,38 @@ class ChatScreen(ctk.CTkFrame):
         self.results_textbox = ctk.CTkTextbox(
             self,
             font=ctk.CTkFont(size=14),
-            state="disabled",
+            state="normal",
         )
+        self.results_textbox.bind("<Key>", self._on_textbox_key)
+        self.results_textbox.bind("<Button-1>", lambda e: None, add=True)
+        self.results_textbox.bind("<Button-3>", self._show_textbox_menu)
+        self.results_textbox_menu = tk.Menu(self, tearoff=0)
+        self.results_textbox_menu.add_command(label="복사", command=self._copy_selection)
+        self.results_textbox_menu.add_command(label="전체 선택", command=self._select_all)
+
+        self.conversation_log: List[tuple[str, str]] = []
 
         self.refresh_state()
+
+    def _ensure_chat_engine(self) -> None:
+        if self.chat_engine is not None:
+            return
+        print("엔진 초기화 시작...")
+        engine = CoreLNPChat(
+            model_path=TOPIC_MODEL_PATH,
+            corpus_path=CORPUS_PARQUET,
+            cache_dir=CACHE_DIR,
+            topk=DEFAULT_TOP_K,
+            min_similarity=DEFAULT_SIMILARITY_THRESHOLD,
+        )
+        try:
+            engine.ready(rebuild=False)
+        except FileNotFoundError as exc:
+            raise RuntimeError("지식 검색용 모델이 없습니다. 먼저 전체 학습을 실행하세요.") from exc
+        except Exception as exc:
+            raise RuntimeError(f"엔진 초기화에 실패했습니다: {exc}") from exc
+        self.chat_engine = engine
+        print("✅ LNP Chat 준비 완료")
 
     def setup_ui(self):
         # This method is no longer directly called, its logic is integrated into refresh_state
@@ -221,6 +151,8 @@ class ChatScreen(ctk.CTkFrame):
         self.results_textbox.grid_forget()
 
         if not have_all_artifacts():
+            self.conversation_log.clear()
+            self._refresh_conversation_display()
             self.warning_label.configure(text="⚠️ 학습 데이터가 없습니다. 먼저 전체 학습을 실행하세요.")
             self.warning_label.grid(row=3, column=0, pady=(60, 12))
             self.train_button_redirect.grid(row=4, column=0, pady=(0, 12))
@@ -235,13 +167,16 @@ class ChatScreen(ctk.CTkFrame):
             self.results_textbox.grid(row=5, column=0, padx=12, pady=(0, 12), sticky="nsew")
 
             # Initialize chat engine if not already done
-            if self.chat_engine is None or not self.chat_engine.ready_done:
-                self.update_results("엔진을 초기화하는 중입니다... 잠시만 기다려주세요.")
+            if self.chat_engine is None or not getattr(self.chat_engine, "ready_done", False):
+                self.conversation_log.clear()
+                self._refresh_conversation_display()
+                self._append_conversation("system", "엔진을 초기화하는 중입니다... 잠시만 기다려주세요.")
                 self.search_entry.configure(state="disabled")
                 self.search_button.configure(state="disabled")
                 threading.Thread(target=self.initialize_engine, daemon=True).start()
             else:
-                self.update_results("질문을 입력하세요.")
+                if not self.conversation_log:
+                    self._append_conversation("system", "질문을 입력하세요.")
                 self.search_entry.configure(state="normal")
                 self.search_button.configure(state="normal")
 
@@ -253,14 +188,17 @@ class ChatScreen(ctk.CTkFrame):
 
     def initialize_engine(self):
         try:
-            self.chat_engine = LNPChat(corpus_path=CORPUS_PARQUET, cache_dir=CACHE_DIR)
-            self.chat_engine.ready()
-            self.update_results("엔진 초기화 완료. 질문을 입력하세요.")
+            self._ensure_chat_engine()
+            self.conversation_log.clear()
+            self._refresh_conversation_display()
+            self._append_conversation("system", "엔진 초기화 완료. 질문을 입력하세요.")
             self.search_entry.configure(state="normal")
             self.search_button.configure(state="normal")
             self._apply_context_constraints()
         except Exception as e:
-            self.update_results(f"엔진 초기화 중 오류 발생: {e}")
+            self.conversation_log.clear()
+            self._refresh_conversation_display()
+            self._append_conversation("system", f"엔진 초기화 중 오류 발생: {e}")
             self.search_entry.configure(state="disabled")
             self.search_button.configure(state="disabled")
 
@@ -271,7 +209,7 @@ class ChatScreen(ctk.CTkFrame):
         allowed, reason = self._context_allows_search()
         if not allowed:
             message = reason or "선택한 스마트 폴더에서는 지식·검색 비서를 사용할 수 없습니다. 다른 폴더를 선택하세요."
-            self.update_results(message)
+            self._append_conversation("system", message)
             if hasattr(self.app, "emit_work_center_event") and self.active_context is not None:
                 try:
                     self.app.emit_work_center_event(
@@ -285,42 +223,43 @@ class ChatScreen(ctk.CTkFrame):
 
         self.search_entry.configure(state="disabled")
         self.search_button.configure(state="disabled")
-        self.update_results(f"> {query}\n\n검색 중입니다...")
+        self._append_conversation("user", query)
 
         # Run search in a thread to keep the UI responsive
         threading.Thread(target=self.run_search_thread, args=(query,), daemon=True).start()
 
     def run_search_thread(self, query):
         try:
-            cleaned_query, filters = parse_query_and_filters(query)
+            cleaned_query, _ = parse_query_and_filters(query)
             if self.chat_engine is None:
                 raise RuntimeError("검색 엔진이 준비되지 않았습니다.")
-            context_path = self.active_context.path if self.active_context and self.active_context.path else None
             policy_engine = self._policy_engine()
-            result = self.chat_engine.ask(
-                cleaned_query,
-                filters=filters,
-                path_prefix=context_path,
-                policy_engine=policy_engine,
-                agent="knowledge_search",
+            if policy_engine is not None:
+                self.chat_engine.policy_engine = policy_engine
+            result = self.chat_engine.ask(cleaned_query)
+            hits = result.get("hits", [])
+            scoped_hits = hits
+            removed_by_scope = 0
+            context_path = self.active_context.path if self.active_context and self.active_context.path else None
+            if context_path:
+                scoped_hits = [h for h in hits if _path_within(Path(str(h.get("path"))), context_path)]
+                removed_by_scope = len(hits) - len(scoped_hits)
+            formatted = self._compose_answer(
+                query=query,
+                hits=scoped_hits,
+                llm_summary=result.get("llm_summary"),
+                removed_by_scope=removed_by_scope,
+                suggestions=result.get("suggestions"),
             )
-            answer = result.get("answer", "오류가 발생했습니다.")
-            self.update_results(f"> {query}\n\n{answer}")
-            self._log_search_event(query, result)
+            self._append_conversation("assistant", formatted)
+            result_for_logging = dict(result)
+            result_for_logging["hits"] = scoped_hits
+            self._log_search_event(query, result_for_logging)
         except Exception as e:
-            self.update_results(f"> {query}\n\n검색 중 오류 발생: {e}")
+            self._append_conversation("system", f"검색 중 오류 발생: {e}")
         finally:
             self.search_entry.configure(state="normal")
             self.search_button.configure(state="normal")
-
-    def update_results(self, text):
-        self.after(0, self._do_update_results, text)
-
-    def _do_update_results(self, text):
-        self.results_textbox.configure(state="normal")
-        self.results_textbox.delete("1.0", "end")
-        self.results_textbox.insert("1.0", text)
-        self.results_textbox.configure(state="disabled")
 
     # ------------------------------------------------------------------
     # Smart folder integration
@@ -376,6 +315,14 @@ class ChatScreen(ctk.CTkFrame):
         self.context_warning_label.grid_forget()
         if not have_all_artifacts():
             return
+        if self.chat_engine is None and have_all_artifacts():
+            try:
+                self._ensure_chat_engine()
+            except Exception as exc:
+                self.conversation_log.clear()
+                self._refresh_conversation_display()
+                self._append_conversation("system", f"엔진 초기화 중 오류 발생: {exc}")
+                return
         allowed, reason = self._context_allows_search()
         if not allowed:
             message = reason or "⚠️ 선택한 스마트 폴더에서는 지식·검색 비서를 사용할 수 없습니다."
@@ -417,3 +364,109 @@ class ChatScreen(ctk.CTkFrame):
     @staticmethod
     def _policy_engine() -> PolicyEngine:
         return get_policy_engine()
+
+    def _compose_answer(
+        self,
+        *,
+        query: str,
+        hits: List[Dict[str, Any]],
+        llm_summary: Optional[str],
+        removed_by_scope: int,
+        suggestions: Optional[List[str]],
+    ) -> str:
+        lines: List[str] = []
+        summary_text = (llm_summary or "").strip()
+        if summary_text:
+            lines.append("🧠 요약")
+            lines.append(summary_text)
+            lines.append("")
+
+        if not hits:
+            lines.append(f"‘{query}’와 관련된 문서를 찾지 못했습니다.")
+            if removed_by_scope:
+                lines.append(f"(선택한 범위에서 {removed_by_scope}건이 제외되었습니다.)")
+            return "\n".join(lines)
+
+        header = f"‘{query}’ 관련 문서 Top {len(hits)}"
+        if removed_by_scope:
+            header += f" (범위 제외 {removed_by_scope}건)"
+        lines.append(header)
+
+        for idx, hit in enumerate(hits, 1):
+            path = str(hit.get("path") or "")
+            similarity = hit.get("similarity") or hit.get("vector_similarity") or 0.0
+            try:
+                sim_str = f"{float(similarity):.3f}"
+            except Exception:
+                sim_str = "-"
+            lines.append(f"{idx}. {path} (유사도 {sim_str})")
+            preview = str(hit.get("preview") or "").strip()
+            if preview:
+                snippet = preview.replace("\n", " ")[:200]
+                if len(preview) > 200:
+                    snippet += " …"
+                lines.append(f"   {snippet}")
+
+        if suggestions:
+            cand = [s for s in suggestions if isinstance(s, str)]
+            if cand:
+                lines.append("")
+                lines.append("다음 질문 추천:")
+                for suggestion in cand[:3]:
+                    lines.append(f"- {suggestion}")
+
+        return "\n".join(lines)
+
+    def _append_conversation(self, role: str, text: str) -> None:
+        def _do() -> None:
+            content = (text or "").strip()
+            prefix_map = {"user": "사용자", "assistant": "비서", "system": "시스템"}
+            label = prefix_map.get(role, role)
+            self.conversation_log.append((label, content))
+            self._render_conversation_locked()
+
+        self.after(0, _do)
+
+    def _refresh_conversation_display(self) -> None:
+        self.after(0, self._render_conversation_locked)
+
+    def _render_conversation_locked(self) -> None:
+        self.results_textbox.delete("1.0", "end")
+        if not self.conversation_log:
+            return
+        for entry_label, entry_text in self.conversation_log:
+            display_text = entry_text if entry_text else ""
+            self.results_textbox.insert("end", f"{entry_label}: {display_text}\n\n")
+
+    def _on_textbox_key(self, event):
+        mods = event.state
+        ctrl = bool(mods & 0x4)
+        cmd = bool(mods & 0x10000)
+        if (ctrl or cmd) and event.keysym.lower() in {"c", "x"}:
+            return None
+        if (ctrl or cmd) and event.keysym.lower() == "a":
+            self._select_all()
+            return "break"
+        if event.keysym in {"Left", "Right", "Up", "Down", "Prior", "Next", "Home", "End"}:
+            return None
+        if event.keysym in {"Shift_L", "Shift_R", "Control_L", "Control_R", "Command", "Option_L", "Option_R"}:
+            return None
+        return "break"
+
+    def _copy_selection(self) -> None:
+        try:
+            text = self.results_textbox.get("sel.first", "sel.last")
+        except tk.TclError:
+            text = self.results_textbox.get("1.0", "end-1c")
+        if text:
+            self.clipboard_clear()
+            self.clipboard_append(text)
+
+    def _select_all(self) -> None:
+        self.results_textbox.tag_add("sel", "1.0", "end-1c")
+
+    def _show_textbox_menu(self, event: tk.Event) -> None:
+        try:
+            self.results_textbox_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            self.results_textbox_menu.grab_release()

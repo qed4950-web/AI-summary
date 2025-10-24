@@ -22,6 +22,11 @@ models/
 # Virtual environments
 .venv/
 venv/
+venv_mac/
+venv_gui/
+
+# Environment overrides
+.env
 
 # IDE / editor settings
 .vscode/
@@ -30,3 +35,4 @@ venv/
 # Misc
 .cache/
 found_files.csv
+miniconda.sh
