@@ -19,12 +19,12 @@ ollama --version
 ## 2. 모델 다운로드
 
 ```bash
-ollama pull llama3:8b      # 기본 예시
-ollama pull llama3.1:8b    # 필요한 모델 추가
+ollama pull llama3:8b-instruct-q4   # 권장: 8B Instruct 양자화 모델
+ollama pull llama3.1:8b-instruct-q4 # 필요한 경우 추가 모델
 ollama list
 ```
 
-`ollama list`를 통해 설치된 모델을 확인하세요. 모델 이름은 대소문자를 포함해 그대로 사용해야 합니다.
+`ollama list`를 통해 설치된 모델을 확인하세요. `llama3:8b-instruct-q4`를 설치하면 기본 별칭 `llama3`로 실행할 수 있습니다 (`ollama run llama3`).
 
 ## 3. 환경 변수 구성
 
@@ -32,7 +32,7 @@ CLI 또는 `.env` 파일에서 다음 변수를 지정하면 LNP Chat이 자동�
 
 ```bash
 export LNPCHAT_LLM_BACKEND=ollama
-export LNPCHAT_LLM_MODEL=llama3:8b       # 설치한 모델 이름 (예: llama3:8b)
+export LNPCHAT_LLM_MODEL=llama3          # 설치한 모델 이름 (예: llama3)
 export LNPCHAT_LLM_HOST=127.0.0.1:11434  # 기본값이면 생략 가능
 ```
 
@@ -42,8 +42,8 @@ Ollama 데몬이 실행 중인지 확인한 뒤 헬스체크 스크립트를 실
 
 ```bash
 ollama serve &               # 백그라운드 실행 (이미 실행 중이면 생략)
-python scripts/check_local_llm.py --backend ollama --model llama3:8b
-# 다른 모델명을 테스트하고 싶다면 --model llama3.1:8b 처럼 지정
+python scripts/check_local_llm.py --backend ollama --model llama3
+# 다른 모델명을 테스트하고 싶다면 --model llama3.1:8b-instruct-q4 처럼 지정
 ```
 
 모두 통과하면 LNP Chat이 LLM을 사용할 준비가 된 것입니다.
