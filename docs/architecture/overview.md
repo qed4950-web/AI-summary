@@ -17,9 +17,9 @@ InfoPilot 데스크톱 비서는 세 개의 층으로 구성되어 있습니다.
 
 ## 에이전트 구성
 
-- **지식·검색 비서**: Sentence-BERT 임베딩, 선택적 BM25 가중치, Cross-Encoder 재랭킹을 조합합니다. CLI 플래그(`--lexical-weight`, `--rerank-min-score`, `--translate` 등)로 세부 설정을 조정할 수 있습니다.
-- **회의 비서**: `core/agents/meeting/pipeline.py`가 STT, 요약, 감사 로그, 분석을 묶어 실행합니다.
-- **사진 비서**: `core/agents/photo/pipeline.py`가 태깅, 중복 감지, 베스트샷 추천을 수행합니다.
+- **지식·검색 비서**: Sentence-BERT 임베딩, 선택적 BM25 가중치, Cross-Encoder 재랭킹을 조합합니다. CLI 플래그(`--lexical-weight`, `--rerank-min-score`, `--translate` 등)로 세부 설정을 조정할 수 있습니다. 자세한 구조는 `docs/agents/document/architecture.md` 참고.
+- **회의 비서**: `core/agents/meeting/pipeline.py`가 STT, 요약, 감사 로그, 분석을 묶어 실행합니다. 세부 내용은 `docs/agents/meeting/architecture.md`에 정리되어 있습니다.
+- **사진 비서**: `core/agents/photo/pipeline.py`가 태깅, 중복 감지, 베스트샷 추천을 수행합니다. `docs/agents/photo/architecture.md`에서 단계별 설명을 확인할 수 있습니다.
 
 세 에이전트는 공통 인프라(`core/infra`의 모델 매니저, 스케줄러, 로깅)를 공유합니다.
 

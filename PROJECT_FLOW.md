@@ -143,4 +143,7 @@ python scripts/run_knowledge_agent.py \
 - 벤치마크: `python -m scripts.benchmarks.ann_benchmark ...`
 - 정확도 평가: `python -m scripts.benchmarks.accuracy_eval ...`
 - 릴리스 가이드: `docs/process/release.md`
+- 문서 비서 설계/운영: `docs/agents/document/README.md`
+- 회의 비서 설계/운영: `docs/agents/meeting/README.md`
+- 사진 비서 설계/운영: `docs/agents/photo/README.md`
 - KPI 스냅샷: `python scripts/util/release_prepare.py --print`

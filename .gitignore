@@ -24,6 +24,8 @@ models/
 venv/
 venv_mac/
 venv_gui/
+conda/
+joblib-*/
 
 # Environment overrides
 .env

@@ -23,7 +23,7 @@ ui/                    CustomTkinter 데스크톱 앱
 data/                  실행 중 생성되는 산출물 (Git 관리 제외)
 models/                로컬 모델 캐시 (Git 관리 제외)
 scripts/               CLI/빌드/유틸 스크립트
-docs/                  architecture / guides / process / research / roadmap / ux
+docs/                  agents / architecture / guides / process / research / roadmap / ux
 tests/                 pytest 기반 단위·통합 테스트
 ```
 
@@ -139,6 +139,7 @@ python scripts/launch_desktop.py          # 개발 중에는 python ui/app.py
 
 ## 7. 추가 문서
 
+- `docs/agents/`: 회의 비서 등 에이전트 설계·운영 가이드
 - `docs/architecture/`: 시스템 구성, 데이터/모듈 상호작용
 - `docs/guides/`: 로컬 LLM, 회의 모델 등 실사용 가이드
 - `docs/process/`: 운영/프로세스 정리, 체크리스트
