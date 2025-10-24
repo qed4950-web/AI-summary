@@ -7,6 +7,7 @@ AI-summary 저장소의 문서는 기능별로 다음과 같이 정리되어 있
 | `architecture/` | 전체 시스템 구조, 데이터 흐름, 에이전트 구성 | `overview.md` |
 | `guides/` | 실사용 가이드 (로컬 LLM 연결, 회의 모델 등) | `local_llm.md`, `meeting_models.md`, `ui_help.md` |
 | `agents/` | 에이전트별 설계·운영 가이드 | `document/`, `meeting/`, `photo/` |
+| `plan/` | 제품 기획/로드맵 정렬 문서 | `product_alignment.md` |
 | `process/` | 운영 프로세스와 릴리스 체크리스트 | `release.md` |
 | `research/` | 벤치마크, 튜닝 노트, 측정용 스크립트 | `performance_tuning.md`, `benchmarks/` |
 | `roadmap/` | 향후 기능 계획 및 우선순위 | `assistant.md` |
