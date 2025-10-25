@@ -59,3 +59,36 @@
 2. 폴더 인스펙터 UI에 캐시량·민감 폴더 토글을 노출하고, 측정 함수/로거 구현.
 3. 구형 문서/코드(기존 2GB 가정 등)를 제거하고 위 지침과 불일치하는 부분을 리팩토링.
 4. 테스트 스위트를 위 체크리스트에 맞춰 재정비하고, 주요 시나리오를 CI에 포함.
+
+## 8. 향후 확장 제안 (메모리·검토 필요)
+> 아래 항목은 **Full Assistant Edition** 업그레이드 계획(v2)에서 가져온 아이디어입니다.  
+> 제조사 요구(저메모리, 안정성)와 충돌할 수 있으니 도입 전에 반드시 용량/비용을 재검토하세요.
+
+### 8.1 검색 정확도 & 모델 세분화
+- **Semantic Reranker**: `core/search/reranker.py` 추가, `config/model_config.json`으로 threshold 관리 *(검토: RAM + GPU 500MB 내)*.
+- **Agent별 모델 설정**: `config/agent_meeting.json`, `agent_photo.json`, `agent_knowledge.json`으로 모델 경로/옵션 분리 *(검토: 유지보수 증가)*.
+- **Model Manager 확장**: 지연 로딩, GPU/CPU 자동 전환, 캐시 관리 (`core/model_manager.py`) *(검토: 초기화 복잡도)*.
+
+### 8.2 UI & 배포
+- **Electron Wrapper**: `ui/electron/` + `scripts/ipc_bridge.py`로 데스크톱 셸 구성 *(검토: 메모리 + 배포 복잡도)*.
+- **빌드 스크립트**: `scripts/build_desktop.ps1/sh`, PyInstaller + Electron Builder로 .exe/.dmg 생성 *(검토: 유지관리 비용)*.
+
+### 8.3 모델별 메모리 목표
+| Agent | 모델 구성 | 비고 | 목표 메모리 |
+| --- | --- | --- | --- |
+| Knowledge | SBERT + Reranker | 의미 검색 + 정밀 재정렬 | ≤ 500MB |
+| Meeting | Whisper + Llama3 | 음성→요약, 액션 아이템 | ≤ 1.5GB |
+| Photo | CLIP/ONNX | 태깅·중복 정리 | ≤ 1GB |
+| ModelManager | Lazy Load | GPU/CPU 자동 전환 | Idle 300–500MB |
+
+### 8.4 추가 테스트 항목 (검토 단계)
+- SBERT-only vs SBERT+Reranker 정확도 비교.
+- 모델 매니저의 lazy-loading 및 GPU/CPU 전환 시나리오.
+- Electron IPC → Python CLI (`scan/train/chat`) 왕복 테스트.
+- 빌드 아티팩트(.exe/.dmg) 실행 및 CLI와의 동등성 확인.
+- `/data/cache` 초기화 후 재생성 정상 여부.
+
+### 8.5 후속 아이디어
+- OpenAI-compatible API 어댑터(Ollama/LM Studio 연동).
+- 정책 엔진 기반 에이전트 제한(스마트 폴더별).
+- 에이전트 간 컨텍스트 공유(회의 → 지식 추천 등).
