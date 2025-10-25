@@ -1,0 +1,17 @@
+# Hybrid/offloading + monitoring defaults
+storage:
+  local_root: data/archive
+  cloud_bucket: infopilot-backups
+  cold_after_days: 45
+
+audit:
+  log_dir: logs/audit
+
+models:
+  default: sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2
+  registry:
+    default: sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2
+    meeting_default: meeting-model-small
+    photo_default: photo-model-lite
+    meeting_default:gpu: meeting-model-large
+    photo_default:gpu: photo-model-pro
