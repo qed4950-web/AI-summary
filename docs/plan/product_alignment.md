@@ -20,60 +20,66 @@
 
 모든 신규 기능은 위 표의 Cycle과 연결하여 README/문서/코드 주석을 업데이트합니다.
 
-## 3. 스마트 폴더 & 캐시 전략
-- 기존 문서에 언급됐던 **폴더별 캐시 상한 2GB** 가정은 제거합니다. 실제 사용자는 스마트 폴더를 수십 GB까지 사용할 수 있으므로, 캐시 정책을 **사용자 선택** 또는 **스토리지 사용량 기반 동적 관리**로 재설계해야 합니다.
-- 정책/코드 정렬 사항
-  - `core/config/smart_folders.json`: 캐시 정책 필드를 도입할 경우 이 파일에 스펙을 정의하고 문서화합니다.
-  - `core/search/retriever.py`: 인덱스 캐시 감시/정리 로직과 연동할 TODO 추가.
-  - `docs/plan/product_alignment.md` 및 `docs/architecture/overview.md`: 캐시 정책 변경 시 업데이트.
-- 전체 권한(폴더 미선택) 시나리오
-  - 사용자에게 **최대 캐시 용량**과 **정리 정책**을 설정할 수 있는 옵션을 제공해야 하며, 기본값은 코드/문서에서 일관되게 선언합니다.
-  - 폴더가 지정되지 않은 경우, 캐시 디렉터리를 전역(`data/cache/`)으로 사용하고 정리 전략을 UI에서 노출합니다.
+## 3. 즉시 우선 과제 (캐시 · 보안 · UX)
+### 3.1 스마트 폴더 · 캐시 정책 재정의
+- 이전에 언급된 **폴더별 2GB 상한** 가정은 폐기합니다. 스마트 폴더별로 최대 용량·정리 주기를 직접 설정할 수 있도록 설계합니다.
+- 코드/문서 정렬:
+  - `core/config/smart_folders.json`: 캐시 옵션 필드 정의 및 문서화.
+  - `core/search/retriever.py`: 인덱스 캐시 감시/정리 로직과 연동하는 TODO 명시.
+  - 전역 모드(폴더 미선택)에서는 `data/cache/` 전체를 대상으로 사용량을 표시하고 관리 정책을 UI에 노출합니다.
 
-## 4. 보안/프라이버시 민감 폴더
-- 기능 정의: 사용자가 전체 디렉터리 접근 권한을 부여했을 때, **제외할 Paths**를 정책으로 미리 지정해 민감 데이터를 처리하지 않도록 하는 옵션.
-- 구현 지침
-  - 정책 엔진(`core/data_pipeline/policies/engine.py`)에 `sensitive_paths` 또는 `exclude_paths` 필드를 추가하고, 스캐너와 에이전트가 이를 존중하도록 합니다.
-  - UI/UX: 폴더 인스펙터에서 “민감 폴더 제외” 스위치를 제공하고, 선택된 경로는 정책 JSON에 즉시 반영합니다.
-  - 문서: `docs/agents/document/architecture.md`와 `docs/plan/product_alignment.md`에 해당 옵션을 설명합니다.
+### 3.2 민감 폴더 제어
+- 전체 디렉터리 접근 권한을 부여했을 때 제외할 경로(`sensitive_paths`)를 정책으로 등록할 수 있어야 합니다.
+- 정책 엔진(`core/data_pipeline/policies/engine.py`)에 해당 필드를 추가하고, 스캐너·에이전트에서 자동으로 건너뛰도록 합니다.
+- UI에서는 폴더 인스펙터에 “민감 폴더 제외” 토글을 제공하고, 설정 변경 시 정책 JSON을 즉시 갱신합니다.
 
-## 5. UX 플로우: 폴더 인스펙터 & 캐시 정보
-- **폴더 인스펙터**는 Work Center/설정 화면에서 스마트 폴더별 상태를 확인하는 UI 컴포넌트입니다.
-  - “캐시량”은 선택된 폴더의 인덱스/요약 캐시가 차지하는 디스크 사용량을 의미합니다.
-  - 계산 방식: `data/cache/` 내 폴더별 서브디렉터리 사이즈 or STT/요약 캐시 디렉터리 합계.
-  - UI 명세는 `docs/guides/ui_help.md` 및 `docs/ux/smart_folder_glass_ui.md`에서 동일하게 설명하고, 개발 시 실제 계산 함수(`core/search/retriever.py` 혹은 별도 유틸)와 매칭합니다.
+### 3.3 폴더 인스펙터 & 캐시 표시
+- Work Center/설정 화면의 폴더 인스펙터에서 각 폴더의 캐시 사용량과 민감 폴더 상태를 한눈에 보여줍니다.
+- “캐시량”은 `data/cache/<폴더 식별자>` + STT/요약 캐시 디렉터리 합계로 계산합니다.
+- UI 명세는 `docs/guides/ui_help.md`, `docs/ux/smart_folder_glass_ui.md`와 동일하게 유지하고, 실제 계산 함수(`core/search/retriever.py` 또는 전용 유틸)와 연결합니다.
 
-## 6. 테스트 체크리스트
+## 4. 검증 & 전달
+### 4.1 테스트 체크리스트
 | 시나리오 | 체크 포인트 |
 | --- | --- |
-| 스마트 폴더 캐시 | 폴더를 추가/삭제하고 캐시 사용량이 UI와 로그에서 일관적으로 표시되는지 확인 |
-| 전체 접근 모드 | 폴더 미선택 상태에서 스캔/학습/대화 실행 후 캐시 디렉터리 사용량이 정책대로 관리되는지 확인 |
-| 민감 폴더 제외 | 선택한 경로가 스캔/요약 대상에서 제외되고 감사 로그에 기록되는지 확인 |
-| 정책 파일 변경 | `smart_folders.json` 수정 후 즉시 반영되는지, 유효하지 않은 정책이 에러로 드러나는지 검사 |
-| 회의/사진 비서 캐시 | 동일 입력 재실행 시 캐시 적중이 되고, 캐시 무효화 조건(모델 변경 등)이 정확히 동작하는지 확인 |
+| 스마트 폴더 캐시 | 폴더 추가/삭제 후 캐시 사용량이 UI·로그에서 일관되게 표시되는지 확인 |
+| 전체 접근 모드 | 폴더 미선택 상태에서 스캔/학습/대화 실행 후 캐시 용량 정책이 지켜지는지 확인 |
+| 민감 폴더 제외 | 제외 경로가 스캔/요약 대상에서 빠지고 감사 로그에 기록되는지 확인 |
+| 정책 파일 변경 | `smart_folders.json` 수정 후 즉시 반영되는지, 잘못된 정책은 오류로 드러나는지 확인 |
+| 회의/사진 비서 캐시 | 동일 입력 재실행 시 캐시가 재사용되고, 모델 변경 등 무효화 조건이 제대로 동작하는지 확인 |
 
-체크리스트는 `pytest` 기반 자동화와 수동 QA 항목으로 나누어 관리하며, 결과는 `results/` 폴더에 누적합니다.
+테스트는 `pytest` 기반 자동화와 수동 QA를 병행하고, 결과를 `results/` 폴더에 누적합니다.
 
-## 7. 다음 단계
+### 4.2 다음 배포 목표
 1. 스마트 폴더 정책 스키마에 캐시 용량·민감 폴더 필드를 추가하고 문서 반영.
-2. 폴더 인스펙터 UI에 캐시량·민감 폴더 토글을 노출하고, 측정 함수/로거 구현.
-3. 구형 문서/코드(기존 2GB 가정 등)를 제거하고 위 지침과 불일치하는 부분을 리팩토링.
-4. 테스트 스위트를 위 체크리스트에 맞춰 재정비하고, 주요 시나리오를 CI에 포함.
+2. 폴더 인스펙터 UI에 캐시량·민감 폴더 토글을 노출하고 측정 로거 구현.
+3. 구형 문서/코드(2GB 상한 가정 등)를 제거하고 본 문서와 불일치하는 부분 리팩토링.
+4. 테스트 스위트를 위 체크리스트와 연동해 CI에 편입.
 
-## 8. 향후 확장 제안 (메모리·검토 필요)
+## 5. 향후 확장 제안 (메모리·검토 필요)
 > 아래 항목은 **Full Assistant Edition** 업그레이드 계획(v2)에서 가져온 아이디어입니다.  
 > 제조사 요구(저메모리, 안정성)와 충돌할 수 있으니 도입 전에 반드시 용량/비용을 재검토하세요.
 
-### 8.1 검색 정확도 & 모델 세분화
+### 5.1 검색 정확도 & 모델 세분화
 - **Semantic Reranker**: `core/search/reranker.py` 추가, `config/model_config.json`으로 threshold 관리 *(검토: RAM + GPU 500MB 내)*.
 - **Agent별 모델 설정**: `config/agent_meeting.json`, `agent_photo.json`, `agent_knowledge.json`으로 모델 경로/옵션 분리 *(검토: 유지보수 증가)*.
 - **Model Manager 확장**: 지연 로딩, GPU/CPU 자동 전환, 캐시 관리 (`core/model_manager.py`) *(검토: 초기화 복잡도)*.
 
-### 8.2 UI & 배포
+### 5.2 UI & 배포
 - **Electron Wrapper**: `ui/electron/` + `scripts/ipc_bridge.py`로 데스크톱 셸 구성 *(검토: 메모리 + 배포 복잡도)*.
 - **빌드 스크립트**: `scripts/build_desktop.ps1/sh`, PyInstaller + Electron Builder로 .exe/.dmg 생성 *(검토: 유지관리 비용)*.
 
-### 8.3 모델별 메모리 목표
+#### 5.2.1 단계별 계획 요약
+| 단계 | 작업 | 설명 |
+| --- | --- | --- |
+| **1️⃣ Retriever 개선** | BM25 + SBERT 구조에 `semantic rerank` 추가 (`cross-encoder/ms-marco-MiniLM-L-6-v2` 등) | 문서 유사도 정밀도 향상 (RAM 영향 500MB 내 검토) |
+| **2️⃣ Agent별 모델 세분화** | Meeting→Whisper+Llama3, Photo→CLIP/ONNX, Knowledge→SBERT/Reranker | 각 Agent 최적화 모델 구성 (모델 수 늘어나므로 관리 주의) |
+| **3️⃣ Model Manager 확장** | GPU/CPU 자동 전환, lazy-load, 로컬 우선 캐시 | 로드 속도 및 자원 최적화 (초기화 복잡도 증가) |
+| **4️⃣ Electron 래핑** | CLI(`infopilot.py scan/train/chat`)를 Node.js IPC로 감싸기 | 백엔드 그대로, 프런트만 Electron 제어 (메모리 주의) |
+| **5️⃣ 로컬 빌드 및 배포** | `pyinstaller` + Electron `builder`로 `.exe`/`.dmg` 생성 | 내부 배포 혹은 개인용 앱 완성 |
+| **6️⃣ (선택) Upstream 반영** | 검증 완료 항목만 PR로 `develop`에 반영 | GitHub 코드베이스를 통제된 방식으로 유지 |
+
+### 5.3 모델별 메모리 목표
 | Agent | 모델 구성 | 비고 | 목표 메모리 |
 | --- | --- | --- | --- |
 | Knowledge | SBERT + Reranker | 의미 검색 + 정밀 재정렬 | ≤ 500MB |
@@ -81,14 +87,14 @@
 | Photo | CLIP/ONNX | 태깅·중복 정리 | ≤ 1GB |
 | ModelManager | Lazy Load | GPU/CPU 자동 전환 | Idle 300–500MB |
 
-### 8.4 추가 테스트 항목 (검토 단계)
+### 5.4 추가 테스트 항목 (검토 단계)
 - SBERT-only vs SBERT+Reranker 정확도 비교.
 - 모델 매니저의 lazy-loading 및 GPU/CPU 전환 시나리오.
 - Electron IPC → Python CLI (`scan/train/chat`) 왕복 테스트.
 - 빌드 아티팩트(.exe/.dmg) 실행 및 CLI와의 동등성 확인.
 - `/data/cache` 초기화 후 재생성 정상 여부.
 
-### 8.5 후속 아이디어
+### 5.5 후속 아이디어
 - OpenAI-compatible API 어댑터(Ollama/LM Studio 연동).
 - 정책 엔진 기반 에이전트 제한(스마트 폴더별).
 - 에이전트 간 컨텍스트 공유(회의 → 지식 추천 등).
