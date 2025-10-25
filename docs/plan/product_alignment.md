@@ -12,11 +12,11 @@
 ## 2. 릴리스 사이클 (Roadmap v3)
 | Cycle | 중심 과제 | 관련 코드/문서 | 상태 |
 | --- | --- | --- | --- |
-| Cycle 0 | 코어 파이프라인 `scan → train → chat`, 정책 엔진, 캐시 초기화 | `core/data_pipeline`, `docs/agents/document/*` | ✅ 완료 |
-| Cycle 1 | 지식·검색 비서 고도화, 정책 스코프 전환, Work Center 진입점 | `core/agents/document`, `ui/screens/conversation_screen.py` | ⏳ 진행 중 |
-| Cycle 2 | 회의 비서 STT/요약 파이프라인, 액션/결정 추적, 통합 캐시 | `core/agents/meeting`, `docs/agents/meeting/*` | ⏳ 진행 중 |
-| Cycle 3 | 사진 비서 태깅/중복/베스트샷, GPU/ONNX 플로우 | `core/agents/photo`, `docs/agents/photo/*` | ⏳ 진행 중 |
-| Cycle 4 | 운영·하이브리드: 감사, 권한, 오프로딩, 리소스 모니터링 | `core/infra`, `docs/plan/product_alignment.md` | 🔜 계획 |
+| Cycle 0 | 코어 파이프라인 `scan → train → chat`, 정책 엔진, 캐시 초기화 | `core/data_pipeline`, `docs/agents/document/*` | ✅ 완료 (배포 중) |
+| Cycle 1 | 지식·검색 비서 고도화, 정책 스코프 전환, Work Center 진입점 | `core/agents/document`, `ui/screens/conversation_screen.py` | ⏳ 진행 중 (LNPChat·정책 스코프 반영, Work Center 남음) |
+| Cycle 2 | 회의 비서 STT/요약 파이프라인, 액션/결정 추적, 통합 캐시 | `core/agents/meeting`, `docs/agents/meeting/*` | ⏳ 진행 중 (파이프라인 구현 완료, 캐시/민감 폴더/알림 미완) |
+| Cycle 3 | 사진 비서 태깅/중복/베스트샷, GPU/ONNX 플로우 | `core/agents/photo`, `docs/agents/photo/*` | ⏳ 진행 중 (MVP 존재, 태깅/ONNX 최적화 예정) |
+| Cycle 4 | 운영·하이브리드: 감사, 권한, 오프로딩, 리소스 모니터링 | `core/infra`, `docs/plan/product_alignment.md` | 🔜 계획 (설계만 존재) |
 
 모든 신규 기능은 위 표의 Cycle과 연결하여 README/문서/코드 주석을 업데이트합니다.
 
