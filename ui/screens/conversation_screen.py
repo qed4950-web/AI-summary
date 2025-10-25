@@ -194,7 +194,9 @@ class ConversationScreen(ctk.CTkFrame):
         self._pending_agent_label: Optional[str] = None
         self._task_started = False
         if sys.platform == "darwin":
-            self._command_masks = (0x10000, 0x100, 0x10)
+            # Tk on macOS sets the Command/Option modifiers on the higher bits of event.state.
+            # 0x100000 ≈ Command, 0x200000 ≈ Option/Alt. Keep a few aliases to cover layouts.
+            self._command_masks = (0x100000, 0x200000, 0x10000)
         else:
             self._command_masks = ()
 
