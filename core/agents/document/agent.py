@@ -20,13 +20,13 @@ class DocumentAgentConfig:
     topk: int = 5
     min_similarity: float = 0.35
     translate: bool = False
-    rerank: bool = False
+    rerank: bool = True
     rerank_model: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
     rerank_depth: int = 80
     rerank_batch_size: int = 16
     rerank_device: Optional[str] = None
     rerank_min_score: Optional[float] = 0.35
-    lexical_weight: float = 0.0
+    lexical_weight: float = 0.2
     show_translation: bool = False
     translation_lang: str = "en"
     llm_backend: Optional[str] = None

@@ -4,6 +4,8 @@ const os = require("os");
 const path = require("path");
 const { spawn } = require("child_process");
 
+const DEFAULT_PIPELINE_BASE = process.env.INFO_PIPELINE_API || "http://127.0.0.1:8080";
+
 const PathToolkit = {
   baseName(targetPath) {
     if (!targetPath || typeof targetPath !== "string") {
@@ -24,6 +26,38 @@ const PathToolkit = {
     return path.resolve(path.join(__dirname, "..", "..", rawPath));
   },
 };
+
+function resolvePipelineBase(rawBase) {
+  const value = typeof rawBase === "string" && rawBase.trim() ? rawBase.trim() : DEFAULT_PIPELINE_BASE;
+  if (/^https?:\/\//i.test(value)) {
+    return value;
+  }
+  return `http://${value}`;
+}
+
+async function pipelineRequest(endpoint, { method = "GET", body, baseUrl } = {}) {
+  const resolvedBase = resolvePipelineBase(baseUrl);
+  const url = new URL(endpoint, resolvedBase).toString();
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 15000);
+  try {
+    const response = await fetch(url, {
+      method,
+      headers: { "Content-Type": "application/json" },
+      body: body ? JSON.stringify(body) : undefined,
+      signal: controller.signal,
+    });
+    const text = await response.text();
+    const data = text ? JSON.parse(text) : {};
+    if (!response.ok) {
+      const message = data?.detail || data?.error || response.statusText;
+      throw new Error(message || "API 요청 실패");
+    }
+    return data;
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
 
 let windowRef;
 const SMART_FOLDER_CONFIG = path.join(__dirname, "..", "..", "core", "config", "smart_folders.json");
@@ -376,6 +410,34 @@ ipcMain.handle("open-path", async (_event, targetPath) => {
 ipcMain.handle("load-smart-folders", async () => {
   const data = readSmartFolders();
   return { ok: true, data };
+});
+
+ipcMain.handle("pipeline:status", async (_event, args = {}) => {
+  try {
+    const data = await pipelineRequest("/pipeline/status", { baseUrl: args.baseUrl });
+    return { ok: true, data };
+  } catch (err) {
+    return { ok: false, error: err.message };
+  }
+});
+
+ipcMain.handle("pipeline:run", async (_event, args = {}) => {
+  try {
+    const payload = args?.payload && typeof args.payload === "object" ? args.payload : {};
+    const data = await pipelineRequest("/pipeline/run", { method: "POST", body: payload, baseUrl: args.baseUrl });
+    return { ok: true, data };
+  } catch (err) {
+    return { ok: false, error: err.message };
+  }
+});
+
+ipcMain.handle("pipeline:cancel", async (_event, args = {}) => {
+  try {
+    const data = await pipelineRequest("/pipeline/cancel", { method: "POST", baseUrl: args.baseUrl });
+    return { ok: true, data };
+  } catch (err) {
+    return { ok: false, error: err.message };
+  }
 });
 
 app.on("window-all-closed", () => {

@@ -64,37 +64,79 @@ cp .env.example .env   # scripts/setup_env.sh 실행 시 자동 생성되기도 
 ### 3.4 파이프라인 실행
 
 ```bash
-# 1) 스캔: 파일 메타데이터 CSV 생성
-python infopilot.py scan --out data/found_files.csv
+# 0) 전체 파이프라인 한 번에 (스캔→학습→필요 시 chat)
+python infopilot.py pipeline all \
+  --out data/found_files.csv \
+  --corpus data/corpus.parquet \
+  --model data/topic_model.joblib \
+  --cache data/cache \
+  --state-file data/scan_state.json \
+  --chunk-cache data/cache/chunk_cache.json \
+  --launch-chat
 
-# 2) 학습: 코퍼스 및 토픽 모델 생성 (Sentence-BERT 임베딩 포함)
-python infopilot.py train \
+# 또는 개별 단계
+python infopilot.py run scan --out data/found_files.csv
+python infopilot.py run train \
   --scan_csv data/found_files.csv \
   --corpus data/corpus.parquet \
-  --model data/topic_model.joblib
-
-# 3) 대화형 검색/요약
-python infopilot.py chat \
+  --model data/topic_model.joblib \
+  --state-file data/scan_state.json \
+  --chunk-cache data/cache/chunk_cache.json \
+  --async-embed --embedding-concurrency 2
+python infopilot.py run chat \
   --model data/topic_model.joblib \
   --corpus data/corpus.parquet \
-  --cache data/cache
-
-# (선택) 증분 감시
-python infopilot.py watch \
+  --cache data/cache \
+  --lexical-weight 0.2
+python infopilot.py run watch \
   --cache data/cache \
   --corpus data/corpus.parquet \
   --model data/topic_model.joblib
 ```
 
-`python infopilot.py pipeline` 
-'python scripts/infopilot.py pipeline \
-    --out data/found_files.csv \
-    --corpus data/corpus.parquet \
-    --model data/topic_model.joblib \
-    --cache data/cache \
-    --launch-chat' 명령을 사용하면 스캔→학습까지 일괄 처리 후 옵션에 따라 대화 모드를 바로 실행할 수 있습니다.
+`pipeline all`은 scan/train을 자동으로 호출하고 증분 상태(`data/scan_state.json`)와 문서 해시 캐시(`data/cache/chunk_cache.json`)까지 유지하므로, 반복 실행 시 변경된 문서만 재처리합니다. 개별 단계는 `run <command>` 그룹으로 사용할 수 있으며, 필요한 경우 `--state-file`, `--chunk-cache`, `--async-embed/--no-async-embed`, `--embedding-concurrency` 등의 옵션으로 증분·성능 전략을 조정할 수 있습니다.
+
+보조 명령도 함께 제공합니다.
+
+```
+python infopilot.py logs show         # MLflow/psutil 로그 tail
+python infopilot.py logs clean --drift --resource
+python infopilot.py model quantize --model sentence-transformers/... --output models/sbert.onnx
+python infopilot.py drift check --scan-csv data/found_files.csv --corpus data/corpus.parquet
+python infopilot.py drift reembed --path /docs/2023/report.docx --scan-csv ... --corpus ...
+```
 
 > 대화 비서에서 회의나 사진 정리를 요청하면 자동으로 해당 전용 비서를 호출합니다. CLI는 최근에 사용한 경로 목록을 보여 주고, 번호 선택 또는 직접 입력으로 오디오/폴더를 지정할 수 있는 프롬프트를 제공합니다. 추가 정보가 필요한 경우 후속 질문이 이어집니다.
+
+### 3.5 Prefect DAG 실행
+
+`scripts/prefect_dag.py`는 scan→train→index→(선택)평가 단계를 Prefect 2.x Flow로 래핑합니다. Prefect를 설치했다면 아래와 같이 단일 명령으로 실행하거나 Prefect UI/에이전트에 배포할 수 있습니다.
+
+```bash
+python scripts/prefect_dag.py \
+  --root /Users/me/Documents \
+  --scan-csv data/found_files.csv \
+  --corpus data/corpus.parquet \
+  --model data/topic_model.joblib \
+  --cache data/cache \
+  --evaluation-cases data/eval/cases.jsonl \
+  --use-prefect
+```
+
+`--use-prefect`를 생략하면 동일한 Runner를 순수 Python 모드로 실행해 MLflow/psutil 세션과 독립적으로 사용할 수 있습니다. Prefect Deployment를 만들고 싶다면 `prefect deployment build scripts/prefect_dag.py:prefect_pipeline_flow --name ai-summary` 같은 표준 Prefect 명령을 재사용하세요.
+
+### 3.6 FastAPI 파이프라인 서버
+
+자동화된 스케줄링이나 원격 제어가 필요하면 `scripts/api_server.py`로 FastAPI 서버를 띄울 수 있습니다.
+
+```bash
+python scripts/api_server.py
+# POST http://127.0.0.1:8080/pipeline/run  {"scan_csv":"data/found_files.csv", ...}
+# GET  http://127.0.0.1:8080/pipeline/status
+# POST http://127.0.0.1:8080/pipeline/cancel
+```
+
+서버는 내부적으로 `scripts/prefect_dag.py`에서 제공하는 Runner를 재사용하며, 단계별 진행 상황/결과를 JSON으로 제공합니다. UI의 학습 화면에서도 동일한 API를 호출할 수 있도록 새로운 "FastAPI 제어" 패널을 추가했습니다.
 
 ## 4. 데스크톱 앱
 
@@ -108,6 +150,7 @@ python scripts/launch_desktop.py          # 개발 중에는 python ui/app.py
 - 대화 비서: 문서 기반 Q&A + LLM 요약(예: Ollama)
 - 지식·검색 비서: 의미 검색 + 필터링
 - 전체 학습 & 증분 업데이트: CLI 파이프라인을 GUI로 래핑
+- FastAPI 제어 패널: UI에서 바로 파이프라인 API 실행/상태 확인/취소
 - 회의/사진 비서: STT·요약·중복 정리 워크플로 미리보기
 - 대화 비서에서 회의/사진 관련 요청을 하면 자동으로 오디오·폴더 선택 대화상자가 뜨고, 최근에 사용한 파일/폴더를 재사용할 수 있는 입력 폼이 함께 표시됩니다. 입력을 완료하면 진행 상태와 취소 버튼이 표시되어 장시간 작업을 모니터링할 수 있습니다.
 
@@ -127,7 +170,7 @@ python scripts/launch_desktop.py          # 개발 중에는 python ui/app.py
    `scan` → `train` → `chat` 순으로 재실행
 
 3. **대화 엔진 갱신** (모델/코퍼스 업데이트 후)  
-   `infopilot.py chat --cache data/cache`로 FAISS 인덱스를 갱신
+   `infopilot.py run chat --cache data/cache`로 FAISS 인덱스를 갱신
 
 4. **Git 워크플로**  
    ```

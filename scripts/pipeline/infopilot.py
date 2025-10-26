@@ -1,19 +1,23 @@
 # infopilot.py
 from __future__ import annotations
 
-import argparse
+import contextlib
 import json
 import hashlib
 import itertools
 import math
+import os
+import shutil
 import queue
+import sys
 import threading
 import time
-import sys
 from dataclasses import dataclass
 from pathlib import Path
-import os
+from types import SimpleNamespace
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Set, Tuple
+
+import click
 
 ROOT_DIR = Path(__file__).resolve().parents[2]
 if str(ROOT_DIR) not in sys.path:
@@ -82,12 +86,24 @@ from core.search.retriever import (
     MODEL_TEXT_COLUMN,
     _split_tokens,
 )
+from core.monitor import check_drift, ResourceLogger
+from scripts.utils.mlflow_logger import (
+    DEFAULT_EXPERIMENT,
+    DEFAULT_TRACKING_URI,
+    mlflow_session,
+)
+from scripts.utils.quantizer import export_to_onnx
 
 
 KNOWLEDGE_AGENT = "knowledge_search"
 DEFAULT_POLICY_PATH = Path("./core/config/smart_folders.json")
 DEFAULT_FOUND_FILES = DATA_DIR / "found_files.csv"
 DEFAULT_SCHEDULED_ROOT = DATA_DIR / "scheduled"
+DEFAULT_SCAN_STATE = DATA_DIR / "scan_state.json"
+DEFAULT_CHUNK_CACHE = CACHE_DIR / "chunk_cache.json"
+DEFAULT_RESOURCE_LOG = Path("logs/resource_log.jsonl")
+DEFAULT_DRIFT_LOG = Path("logs/drift_log.jsonl")
+DEFAULT_SEMANTIC_BASELINE = Path("logs/semantic_baseline.json")
 
 _POLICY_CACHE: Dict[Path, PolicyEngine] = {}
 _SENTENCE_ENCODER_MANAGER: Optional[ModelManager] = None
@@ -131,6 +147,40 @@ def _remember_agent_history(kind: str, values: Iterable[str]) -> None:
             merged.append(existing)
     history[kind] = merged[:MAX_AGENT_HISTORY]
     _save_agent_history(history)
+
+
+@contextlib.contextmanager
+def _command_session(ctx: click.Context, run_name: str):
+    """Attach MLflow + resource logger lifecycle to each CLI command."""
+
+    settings = ctx.ensure_object(dict)
+    use_mlflow: bool = settings.get("use_mlflow", True)
+    tracking_uri: str = settings.get("mlflow_uri", DEFAULT_TRACKING_URI)
+    experiment: str = settings.get("mlflow_experiment", DEFAULT_EXPERIMENT)
+    resource_path: Optional[Path] = settings.get("resource_log_path")
+    resource_interval: float = settings.get("resource_interval", 30.0)
+
+    if use_mlflow:
+        mlflow_cm = mlflow_session(
+            run_name,
+            experiment=experiment,
+            tracking_uri=tracking_uri,
+            tags={"command": run_name},
+        )
+    else:
+        mlflow_cm = contextlib.nullcontext(None)
+
+    resource_logger = None
+    if resource_path:
+        resource_logger = ResourceLogger(Path(resource_path), interval=resource_interval)
+        resource_logger.start(context=run_name)
+
+    try:
+        with mlflow_cm as session:
+            yield session
+    finally:
+        if resource_logger:
+            resource_logger.stop()
 
 
 def _configure_offline_transformers() -> None:
@@ -275,6 +325,7 @@ def _run_scan(
     roots: List[Path] | None = None,
     *,
     policy_engine: Optional[PolicyEngine] = None,
+    exts: Optional[Iterable[str]] = None,
 ) -> List[Dict[str, Any]]:
     scan_roots = roots
     if policy_engine and policy_engine.has_policies and not roots:
@@ -285,8 +336,21 @@ def _run_scan(
             for root in candidate_roots:
                 print(f"   - {root}")
 
+    normalized_exts: Optional[Set[str]] = None
+    if exts:
+        normalized_exts = set()
+        for ext in exts:
+            value = (ext or "").strip().lower()
+            if not value:
+                continue
+            if not value.startswith("."):
+                value = f".{value}"
+            normalized_exts.add(value)
+        if not normalized_exts:
+            normalized_exts = None
+
     finder = FileFinder(
-        exts=FileFinder.DEFAULT_EXTS,
+        exts=normalized_exts or FileFinder.DEFAULT_EXTS,
         scan_all_drives=True,
         start_from_current_drive_only=False,
         follow_symlinks=False,
@@ -304,10 +368,16 @@ def _run_scan(
     return files
 
 
-def cmd_scan(args):
+def cmd_scan(args) -> int:
     policy_engine = _load_policy_engine(getattr(args, "policy", None))
     roots = _parse_roots(args.roots)
-    _run_scan(Path(args.out), roots, policy_engine=policy_engine)
+    rows = _run_scan(
+        Path(args.out),
+        roots,
+        policy_engine=policy_engine,
+        exts=getattr(args, "exts", None),
+    )
+    return len(rows)
 
 
 def _resolve_scan_csv(path: Path) -> Path:
@@ -809,6 +879,8 @@ def _build_train_config(args) -> TrainConfig:
         use_sentence_transformer=getattr(args, "use_embedding", True),
         embedding_model=getattr(args, "embedding_model", DEFAULT_EMBED_MODEL),
         embedding_batch_size=getattr(args, "embedding_batch_size", 32),
+        async_embeddings=getattr(args, "async_embed", True),
+        embedding_concurrency=max(1, int(getattr(args, "embedding_concurrency", 1))),
     )
 
 
@@ -922,15 +994,43 @@ def cmd_train(args):
     cfg = _build_train_config(args)
     out_corpus = Path(args.corpus)
     out_model = Path(args.model)
-    df, tm = run_step2(rows, out_corpus=out_corpus, out_model=out_model, cfg=cfg, use_tqdm=True, translate=args.translate)
+    chunk_cache_path = Path(getattr(args, "chunk_cache", DEFAULT_CHUNK_CACHE))
+    state_path = Path(getattr(args, "state_file", DEFAULT_SCAN_STATE))
+    df, tm = run_step2(
+        rows,
+        out_corpus=out_corpus,
+        out_model=out_model,
+        cfg=cfg,
+        use_tqdm=True,
+        translate=args.translate,
+        scan_state_path=state_path,
+        chunk_cache_path=chunk_cache_path,
+    )
+    metrics = df.attrs.get("metrics", {}) if hasattr(df, "attrs") else {}
+    incremental = df.attrs.get("incremental", {}) if hasattr(df, "attrs") else {}
+    if metrics:
+        metric_str = ", ".join(f"{k}={v}" for k, v in metrics.items())
+        print(f"📊 임베딩 품질 지표: {metric_str}")
     print("✅ 학습 완료")
+    return {
+        "rows": len(rows),
+        "corpus": str(out_corpus),
+        "model": str(out_model),
+        "metrics": metrics,
+        "incremental": incremental,
+    }
 
 
 def cmd_pipeline(args):
     out = Path(args.out)
     roots = _parse_roots(args.roots)
     policy_engine = _load_policy_engine(getattr(args, "policy", None))
-    scan_rows = _run_scan(out, roots, policy_engine=policy_engine)
+    scan_rows = _run_scan(
+        out,
+        roots,
+        policy_engine=policy_engine,
+        exts=getattr(args, "exts", None),
+    )
     filtered_rows = (
         scan_rows
         if not policy_engine or not policy_engine.has_policies
@@ -944,19 +1044,30 @@ def cmd_pipeline(args):
     cfg = _build_train_config(args)
     out_corpus = Path(args.corpus)
     out_model = Path(args.model)
-    df, tm = run_step2(rows, out_corpus=out_corpus, out_model=out_model, cfg=cfg, use_tqdm=True, translate=args.translate)
+    chunk_cache_path = Path(args.chunk_cache) if getattr(args, "chunk_cache", None) else Path(args.cache) / "chunk_cache.json"
+    state_path = Path(getattr(args, "state_file", DEFAULT_SCAN_STATE))
+    df, tm = run_step2(
+        rows,
+        out_corpus=out_corpus,
+        out_model=out_model,
+        cfg=cfg,
+        use_tqdm=True,
+        translate=args.translate,
+        scan_state_path=state_path,
+        chunk_cache_path=chunk_cache_path,
+    )
     print("✅ 파이프라인 완료")
 
     cache_dir = Path(args.cache)
     cache_dir.mkdir(parents=True, exist_ok=True)
     print(
         "ℹ️ 파이프라인은 scan/train 단계까지만 자동 실행되며 chat 모드는 별도 실행이 필요합니다.\n"
-        f"   → python infopilot.py chat --model {out_model} --corpus {out_corpus} --cache {cache_dir}"
+        f"   → python infopilot.py run chat --model {out_model} --corpus {out_corpus} --cache {cache_dir}"
     )
 
     if getattr(args, "launch_chat", False):
         print("\n💬 바로 chat 모드를 실행합니다. (종료하려면 'exit')")
-        chat_args = argparse.Namespace(
+        chat_args = SimpleNamespace(
             model=str(out_model),
             corpus=str(out_corpus),
             cache=str(cache_dir),
@@ -970,13 +1081,51 @@ def cmd_pipeline(args):
             rerank_batch_size=16,
             rerank_device=None,
             rerank_min_score=0.35,
-            lexical_weight=0.0,
+            lexical_weight=getattr(args, "lexical_weight", 0.2),
             show_translation=False,
             translation_lang="en",
             min_similarity=0.35,
             policy=str(getattr(args, "policy", str(DEFAULT_POLICY_PATH))),
         )
         cmd_chat(chat_args)
+
+    metrics = df.attrs.get("metrics", {}) if hasattr(df, "attrs") else {}
+    incremental = df.attrs.get("incremental", {}) if hasattr(df, "attrs") else {}
+    if metrics:
+        metric_str = ", ".join(f"{k}={v}" for k, v in metrics.items())
+        print(f"📊 임베딩 품질 지표: {metric_str}")
+
+    return {
+        "rows": len(rows),
+        "corpus": str(out_corpus),
+        "model": str(out_model),
+        "cache": str(cache_dir),
+        "metrics": metrics,
+        "incremental": incremental,
+    }
+
+
+def cmd_index(args):
+    policy_engine = _load_policy_engine(getattr(args, "policy", None))
+    scope = getattr(args, "scope", "auto")
+    cfg = DocumentAgentConfig(
+        model_path=Path(args.model),
+        corpus_path=Path(args.corpus),
+        cache_dir=Path(args.cache),
+        translate=getattr(args, "translate", False),
+        rerank=False,
+        policy_engine=policy_engine,
+        policy_scope=scope,
+        policy_agent=KNOWLEDGE_AGENT,
+        rebuild_index=True,
+    )
+    agent = DocumentAgent(cfg)
+    agent.prepare()
+    print("✅ 인덱스/캐시 갱신 완료")
+    return {
+        "cache": str(cfg.cache_dir),
+        "corpus": str(cfg.corpus_path),
+    }
 
 
 def cmd_chat(args):
@@ -1324,264 +1473,913 @@ def cmd_schedule(args):
     except KeyboardInterrupt:
         print("👋 스케줄러를 종료합니다.")
 
+# ---------------------------------------------------------------------------
+# Click 기반 CLI
+# ---------------------------------------------------------------------------
 
-def main():
-    ap = argparse.ArgumentParser(prog="infopilot", description="InfoPilot CLI - 다국어 문서 검색기")
-    sp = ap.add_subparsers(dest="cmd", required=True)
 
-    # scan
-    ap_scan = sp.add_parser("scan", help="드라이브 스캔하여 파일 목록 수집")
-    ap_scan.add_argument("--out", default=str(DEFAULT_FOUND_FILES))
-    ap_scan.add_argument(
+def _scan_options(func):
+    func = click.option(
+        "--policy",
+        default=str(DEFAULT_POLICY_PATH),
+        show_default=True,
+        help="스마트 폴더 정책 경로 (비활성화하려면 'none').",
+    )(func)
+    func = click.option(
+        "--ext",
+        "exts",
+        multiple=True,
+        help="스캔할 확장자를 지정합니다 (예: --ext pdf --ext docx). 지정하지 않으면 기본 확장자를 사용합니다.",
+    )(func)
+    func = click.option(
         "--root",
         "--roots",
-        dest="roots",
-        action="append",
-        help="스캔할 루트 디렉터리. 여러 번 지정 가능. 미지정 시 전체 스캔.",
-    )
-    ap_scan.add_argument(
+        "roots",
+        multiple=True,
+        type=click.Path(file_okay=False, dir_okay=True, path_type=str),
+        help="스캔/감시할 루트 경로 (여러 번 지정 가능).",
+    )(func)
+    func = click.option(
+        "--out",
+        default=str(DEFAULT_FOUND_FILES),
+        show_default=True,
+        type=click.Path(dir_okay=False, path_type=str),
+        help="스캔 결과 CSV 경로.",
+    )(func)
+    return func
+
+
+def _train_options(func):
+    func = click.option(
         "--policy",
         default=str(DEFAULT_POLICY_PATH),
-        help="스마트 폴더 정책 파일 경로 (비활성화하려면 'none').",
-    )
-    ap_scan.set_defaults(func=cmd_scan)
-
-    # train
-    ap_train = sp.add_parser(
-        "train",
-        help="코퍼스 생성 + 모델 학습 (기본: 번역 비활성, 다국어 Sentence-BERT)",
-    )
-    ap_train.add_argument("--scan_csv", default=str(DEFAULT_FOUND_FILES))
-    ap_train.add_argument("--corpus", default=str(CORPUS_PATH))
-    ap_train.add_argument("--model", default=str(TOPIC_MODEL_PATH))
-    ap_train.add_argument("--max_features", type=int, default=50000)
-    ap_train.add_argument("--n_components", type=int, default=DEFAULT_N_COMPONENTS)
-    ap_train.add_argument("--n_clusters", type=int, default=25)
-    ap_train.add_argument("--min_df", type=int, default=2)
-    ap_train.add_argument("--max_df", type=float, default=0.85)
-    ap_train.add_argument("--embedding-model", default=DEFAULT_EMBED_MODEL, help="Sentence-BERT 임베딩 모델 이름")
-    ap_train.add_argument("--embedding-batch-size", type=int, default=32, help="Sentence-BERT 배치 크기")
-    ap_train.add_argument(
-        "--limit",
+        show_default=True,
+        help="스마트 폴더 정책 경로 (비활성화하려면 'none').",
+    )(func)
+    func = click.option(
+        "--state-file",
+        default=str(DEFAULT_SCAN_STATE),
+        show_default=True,
+        type=click.Path(dir_okay=False, path_type=str),
+        help="증분 학습을 위한 스캔 상태 파일",
+    )(func)
+    func = click.option(
+        "--chunk-cache",
+        default=str(DEFAULT_CHUNK_CACHE),
+        show_default=True,
+        type=click.Path(dir_okay=False, path_type=str),
+        help="문서 해시 캐시 경로",
+    )(func)
+    func = click.option(
+        "--use-embedding/--no-embedding",
+        default=True,
+        show_default=True,
+        help="Sentence-BERT 임베딩 사용 여부.",
+    )(func)
+    func = click.option(
+        "--translate/--no-translate",
+        default=False,
+        show_default=True,
+        help="문서 학습 시 번역 파이프라인 사용 여부.",
+    )(func)
+    func = click.option(
         "--limit-files",
-        dest="limit_files",
+        "--limit",
+        "limit_files",
         type=int,
         default=0,
-        help="테스트용으로 상위 N개 파일만 사용합니다 (0=전체).",
-    )
-    translate_group = ap_train.add_mutually_exclusive_group()
-    translate_group.add_argument(
-        "--translate",
-        dest="translate",
-        action="store_true",
-        help="deep-translator로 영어 번역을 강제 활성화합니다.",
-    )
-    translate_group.add_argument(
-        "--no-translate",
-        dest="translate",
-        action="store_false",
-        help="번역 기능을 비활성화하고 원문으로 학습합니다.",
-    )
-    ap_train.add_argument("--no-embedding", dest="use_embedding", action="store_false", help="Sentence-BERT 대신 TF-IDF 백업 경로를 사용합니다.")
-    ap_train.add_argument(
-        "--policy",
-        default=str(DEFAULT_POLICY_PATH),
-        help="스마트 폴더 정책 파일 경로 (비활성화하려면 'none').",
-    )
-    ap_train.set_defaults(translate=False)
-    ap_train.set_defaults(use_embedding=True)
-    ap_train.set_defaults(func=cmd_train)
-
-    # pipeline
-    ap_pipe = sp.add_parser(
-        "pipeline",
-        help="스캔 후 바로 학습까지 진행 (기본: 번역 비활성)",
-    )
-    ap_pipe.add_argument("--out", default=str(DEFAULT_FOUND_FILES))
-    ap_pipe.add_argument(
-        "--root",
-        "--roots",
-        dest="roots",
-        action="append",
-        help="스캔할 루트 디렉터리. 여러 번 지정 가능. 미지정 시 전체 스캔.",
-    )
-    ap_pipe.add_argument("--corpus", default=str(CORPUS_PATH))
-    ap_pipe.add_argument("--model", default=str(TOPIC_MODEL_PATH))
-    ap_pipe.add_argument("--cache", default=str(CACHE_DIR))
-    ap_pipe.add_argument("--max_features", type=int, default=50000)
-    ap_pipe.add_argument("--n_components", type=int, default=DEFAULT_N_COMPONENTS)
-    ap_pipe.add_argument("--n_clusters", type=int, default=25)
-    ap_pipe.add_argument("--min_df", type=int, default=2)
-    ap_pipe.add_argument("--max_df", type=float, default=0.85)
-    ap_pipe.add_argument("--embedding-model", default=DEFAULT_EMBED_MODEL, help="Sentence-BERT 임베딩 모델 이름")
-    ap_pipe.add_argument("--embedding-batch-size", type=int, default=32, help="Sentence-BERT 배치 크기")
-    ap_pipe.add_argument(
-        "--limit",
-        "--limit-files",
-        dest="limit_files",
-        type=int,
-        default=0,
-        help="테스트용으로 상위 N개 파일만 사용합니다 (0=전체).",
-    )
-    translate_group_pipe = ap_pipe.add_mutually_exclusive_group()
-    translate_group_pipe.add_argument(
-        "--translate",
-        dest="translate",
-        action="store_true",
-        help="deep-translator로 영어 번역을 강제 활성화합니다.",
-    )
-    translate_group_pipe.add_argument(
-        "--no-translate",
-        dest="translate",
-        action="store_false",
-        help="번역 기능을 비활성화하고 원문으로 학습합니다.",
-    )
-    ap_pipe.add_argument("--no-embedding", dest="use_embedding", action="store_false", help="Sentence-BERT 대신 TF-IDF 백업 경로를 사용합니다.")
-    ap_pipe.add_argument(
-        "--launch-chat",
-        action="store_true",
-        help="파이프라인 완료 후 chat 모드를 바로 실행합니다.",
-    )
-    ap_pipe.add_argument(
-        "--policy",
-        default=str(DEFAULT_POLICY_PATH),
-        help="스마트 폴더 정책 파일 경로 (비활성화하려면 'none').",
-    )
-    ap_pipe.set_defaults(translate=False)
-    ap_pipe.set_defaults(use_embedding=True)
-    ap_pipe.set_defaults(func=cmd_pipeline)
-
-    # chat
-    ap_chat = sp.add_parser(
-        "chat",
-        help="대화형 질의 모드 (기본: 번역 비활성, 다국어 Sentence-BERT)",
-    )
-    ap_chat.add_argument("--model", default=str(TOPIC_MODEL_PATH))
-    ap_chat.add_argument("--corpus", default=str(CORPUS_PATH))
-    ap_chat.add_argument("--cache", default=str(CACHE_DIR))
-    ap_chat.add_argument("--scan_csv", default=str(DEFAULT_FOUND_FILES))
-    ap_chat.add_argument("--topk", type=int, default=5)
-    ap_chat.add_argument(
-        "--scope",
-        choices=["auto", "policy", "global"],
+        show_default=True,
+        help="테스트용 상위 N개 파일만 사용 (0=전체).",
+    )(func)
+    func = click.option("--embedding-batch-size", type=int, default=32, show_default=True)(func)
+    func = click.option("--embedding-concurrency", type=int, default=1, show_default=True, help="Sentence-BERT 임베딩 비동기 작업자 수")(func)
+    func = click.option("--async-embed/--no-async-embed", default=True, show_default=True, help="임베딩 비동기 큐 사용 여부")(func)
+    func = click.option(
+        "--embedding-dtype",
+        type=click.Choice(["auto", "fp32", "fp16"], case_sensitive=False),
         default="auto",
-        help="검색 범위: auto(정책 있으면 적용), policy(정책 강제), global(전체)"
-    )
-    translate_group_chat = ap_chat.add_mutually_exclusive_group()
-    translate_group_chat.add_argument(
-        "--translate",
-        dest="translate",
-        action="store_true",
-        help="deep-translator로 질의를 영어 번역한 뒤 검색합니다.",
-    )
-    translate_group_chat.add_argument(
-        "--no-translate",
-        dest="translate",
-        action="store_false",
-        help="질문 번역 기능을 비활성화합니다.",
-    )
-    ap_chat.add_argument("--no-auto-train", dest="auto_train", action="store_false", help="자동 학습 갱신을 비활성화합니다.")
-    rerank_group = ap_chat.add_mutually_exclusive_group()
-    rerank_group.add_argument("--rerank", dest="rerank", action="store_true", help="Cross-Encoder 재랭킹을 사용합니다 (기본값).")
-    rerank_group.add_argument("--no-rerank", dest="rerank", action="store_false", help="Cross-Encoder 재랭킹을 비활성화합니다.")
-    ap_chat.add_argument("--rerank-model", default="cross-encoder/ms-marco-MiniLM-L-6-v2", help="재랭킹에 사용할 Cross-Encoder 모델 이름")
-    ap_chat.add_argument("--rerank-depth", type=int, default=80, help="Cross-Encoder 재랭킹에 포함할 후보 문서 수 (50~100 권장)")
-    ap_chat.add_argument("--rerank-batch-size", type=int, default=16, help="Cross-Encoder 추론 배치 크기 (CPU 환경은 8~16 권장)")
-    ap_chat.add_argument("--rerank-device", default=None, help="재랭킹 모델을 로드할 디바이스(e.g. 'cuda', 'cuda:0', 'cpu')")
-    ap_chat.add_argument(
-        "--rerank-min-score",
-        type=float,
-        default=0.35,
-        help="Cross-Encoder 점수가 이 값보다 낮은 문서는 제외합니다.",
-    )
-    ap_chat.add_argument(
-        "--lexical-weight",
-        type=float,
-        default=0.0,
-        help="BM25 가중치 (0=의미 검색 전용). 필요 시 수동 조정",
-    )
-    ap_chat.add_argument(
-        "--min-similarity",
-        type=float,
-        default=0.35,
-        help="이 값보다 낮은 유사도 문서는 제외합니다 (0.0~1.0).",
-    )
-    ap_chat.add_argument("--show-translation", action="store_true", help="검색 결과에 번역본을 함께 표시합니다.")
-    ap_chat.add_argument("--translation-lang", default="en", help="번역 대상 언어 코드 (기본: en)")
-    ap_chat.add_argument(
-        "--policy",
-        default=str(DEFAULT_POLICY_PATH),
-        help="스마트 폴더 정책 파일 경로 (비활성화하려면 'none').",
-    )
-    ap_chat.add_argument(
-        "--query",
-        help="비대화형 모드에서 단일 질의를 실행합니다.",
-    )
-    ap_chat.add_argument(
-        "--json",
-        action="store_true",
-        help="질의 결과를 JSON으로 출력하고 종료합니다 (비대화형 모드).",
-    )
-    ap_chat.set_defaults(translate=False)
-    ap_chat.set_defaults(auto_train=True)
-    ap_chat.set_defaults(rerank=True)
-    ap_chat.set_defaults(func=cmd_chat)
+        show_default=True,
+        help="Sentence-BERT 임베딩 dtype (auto=GPU면 FP16 사용).",
+    )(func)
+    func = click.option("--embedding-model", default=DEFAULT_EMBED_MODEL, show_default=True)(func)
+    func = click.option("--max-df", type=float, default=0.85, show_default=True)(func)
+    func = click.option("--min-df", type=int, default=2, show_default=True)(func)
+    func = click.option("--n-clusters", type=int, default=25, show_default=True)(func)
+    func = click.option("--n-components", type=int, default=DEFAULT_N_COMPONENTS, show_default=True)(func)
+    func = click.option("--max-features", type=int, default=50000, show_default=True)(func)
+    func = click.option("--model", default=str(TOPIC_MODEL_PATH), show_default=True, type=click.Path(dir_okay=False, path_type=str))(func)
+    func = click.option("--corpus", default=str(CORPUS_PATH), show_default=True, type=click.Path(dir_okay=False, path_type=str))(func)
+    func = click.option("--scan-csv", default=str(DEFAULT_FOUND_FILES), show_default=True, type=click.Path(dir_okay=False, path_type=str))(func)
+    return func
 
-    # watch
-    ap_watch = sp.add_parser("watch", help="파일 변경을 감지해 코퍼스/인덱스를 증분 갱신")
-    ap_watch.add_argument("--root", "--roots", dest="roots", action="append", help="감시할 루트 디렉터리 (여러 번 지정 가능)")
-    ap_watch.add_argument("--scan_csv", default=str(DEFAULT_FOUND_FILES))
-    ap_watch.add_argument("--corpus", default=str(CORPUS_PATH))
-    ap_watch.add_argument("--model", default=str(TOPIC_MODEL_PATH))
-    ap_watch.add_argument("--cache", default=str(CACHE_DIR))
-    ap_watch.add_argument("--debounce-ms", type=int, default=2000, help="파일 이벤트 디바운스 시간(ms)")
-    ap_watch.add_argument("--translate", action="store_true", help="증분 추출 시 번역을 포함합니다.")
-    ap_watch.add_argument(
-        "--policy",
-        default=str(DEFAULT_POLICY_PATH),
-        help="스마트 폴더 정책 파일 경로 (비활성화하려면 'none').",
-    )
-    ap_watch.set_defaults(func=cmd_watch)
 
-    # schedule
-    ap_schedule = sp.add_parser("schedule", help="정책 기반 예약 파이프라인 실행")
-    ap_schedule.add_argument(
+def _pipeline_options(func):
+    func = click.option(
         "--policy",
         default=str(DEFAULT_POLICY_PATH),
-        help="스마트 폴더 정책 파일 경로 (비활성화하려면 'none').",
-    )
-    ap_schedule.add_argument(
+        show_default=True,
+        help="스마트 폴더 정책 경로 (비활성화하려면 'none').",
+    )(func)
+    func = click.option(
+        "--state-file",
+        default=str(DEFAULT_SCAN_STATE),
+        show_default=True,
+        type=click.Path(dir_okay=False, path_type=str),
+        help="증분 학습 상태 파일",
+    )(func)
+    func = click.option(
+        "--chunk-cache",
+        default="",
+        type=click.Path(dir_okay=False, path_type=str),
+        help="문서 해시 캐시 경로 (기본: cache 디렉터리 내 chunk_cache.json)",
+    )(func)
+    func = click.option(
+        "--launch-chat/--no-launch-chat",
+        default=False,
+        show_default=True,
+        help="파이프라인 완료 직후 chat 모드 실행 여부.",
+    )(func)
+    func = click.option("--cache", default=str(CACHE_DIR), show_default=True, type=click.Path(path_type=str))(func)
+    func = click.option("--use-embedding/--no-embedding", default=True, show_default=True)(func)
+    func = click.option("--translate/--no-translate", default=False, show_default=True)(func)
+    func = click.option(
+        "--limit-files",
+        "--limit",
+        "limit_files",
+        type=int,
+        default=0,
+        show_default=True,
+        help="테스트용 상위 N개만 사용.",
+    )(func)
+    func = click.option("--embedding-batch-size", type=int, default=32, show_default=True)(func)
+    func = click.option("--embedding-concurrency", type=int, default=1, show_default=True)(func)
+    func = click.option("--async-embed/--no-async-embed", default=True, show_default=True)(func)
+    func = click.option(
+        "--embedding-dtype",
+        type=click.Choice(["auto", "fp32", "fp16"], case_sensitive=False),
+        default="auto",
+        show_default=True,
+        help="Sentence-BERT 임베딩 dtype (auto=GPU면 FP16 사용).",
+    )(func)
+    func = click.option("--embedding-model", default=DEFAULT_EMBED_MODEL, show_default=True)(func)
+    func = click.option("--max-df", type=float, default=0.85, show_default=True)(func)
+    func = click.option("--min-df", type=int, default=2, show_default=True)(func)
+    func = click.option("--n-clusters", type=int, default=25, show_default=True)(func)
+    func = click.option("--n-components", type=int, default=DEFAULT_N_COMPONENTS, show_default=True)(func)
+    func = click.option("--max-features", type=int, default=50000, show_default=True)(func)
+    func = click.option("--model", default=str(TOPIC_MODEL_PATH), show_default=True, type=click.Path(dir_okay=False, path_type=str))(func)
+    func = click.option("--corpus", default=str(CORPUS_PATH), show_default=True, type=click.Path(dir_okay=False, path_type=str))(func)
+    func = click.option("--out", default=str(DEFAULT_FOUND_FILES), show_default=True, type=click.Path(dir_okay=False, path_type=str))(func)
+    func = click.option(
+        "--ext",
+        "exts",
+        multiple=True,
+        help="파이프라인 스캔 단계에서 사용할 확장자 (예: --ext pdf --ext docx).",
+    )(func)
+    func = click.option(
+        "--root",
+        "--roots",
+        "roots",
+        multiple=True,
+        type=click.Path(file_okay=False, dir_okay=True, path_type=str),
+        help="스캔할 루트 (여러 번 지정 가능).",
+    )(func)
+    return func
+
+
+def _index_options(func):
+    func = click.option(
+        "--policy",
+        default=str(DEFAULT_POLICY_PATH),
+        show_default=True,
+        help="스마트 폴더 정책 경로 (비활성화하려면 'none').",
+    )(func)
+    func = click.option(
+        "--scope",
+        type=click.Choice(["auto", "policy", "global"]),
+        default="auto",
+        show_default=True,
+        help="검색 범위 (auto=정책 자동, policy=정책 고정, global=전체).",
+    )(func)
+    func = click.option("--translate/--no-translate", default=False, show_default=True)(func)
+    func = click.option("--cache", default=str(CACHE_DIR), show_default=True, type=click.Path(path_type=str))(func)
+    func = click.option("--corpus", default=str(CORPUS_PATH), show_default=True, type=click.Path(path_type=str))(func)
+    func = click.option("--model", default=str(TOPIC_MODEL_PATH), show_default=True, type=click.Path(path_type=str))(func)
+    return func
+
+
+def _chat_options(func):
+    func = click.option(
+        "--policy",
+        default=str(DEFAULT_POLICY_PATH),
+        show_default=True,
+        help="스마트 폴더 정책 경로 (비활성화하려면 'none').",
+    )(func)
+    func = click.option(
+        "--scope",
+        type=click.Choice(["auto", "policy", "global"]),
+        default="auto",
+        show_default=True,
+    )(func)
+    func = click.option("--json/--no-json", "json_mode", default=False, show_default=True, help="결과를 JSON으로 출력 후 종료")(func)
+    func = click.option("--query", help="비대화형 단일 질의")(func)
+    func = click.option("--auto-train/--no-auto-train", default=True, show_default=True, help="scan CSV 최신 시 자동 학습")(func)
+    func = click.option("--translate/--no-translate", default=False, show_default=True)(func)
+    func = click.option("--topk", type=int, default=5, show_default=True)(func)
+    func = click.option("--min-similarity", type=float, default=0.35, show_default=True)(func)
+    func = click.option("--lexical-weight", type=float, default=0.2, show_default=True)(func)
+    func = click.option("--rerank/--no-rerank", default=True, show_default=True)(func)
+    func = click.option("--rerank-model", default="cross-encoder/ms-marco-MiniLM-L-6-v2", show_default=True)(func)
+    func = click.option("--rerank-depth", type=int, default=80, show_default=True)(func)
+    func = click.option("--rerank-batch-size", type=int, default=16, show_default=True)(func)
+    func = click.option("--rerank-device", default=None)(func)
+    func = click.option("--rerank-min-score", type=float, default=0.35, show_default=True)(func)
+    func = click.option("--show-translation/--hide-translation", default=False, show_default=True)(func)
+    func = click.option("--translation-lang", default="en", show_default=True)(func)
+    func = click.option("--cache", default=str(CACHE_DIR), show_default=True, type=click.Path(path_type=str))(func)
+    func = click.option("--corpus", default=str(CORPUS_PATH), show_default=True, type=click.Path(path_type=str))(func)
+    func = click.option("--model", default=str(TOPIC_MODEL_PATH), show_default=True, type=click.Path(path_type=str))(func)
+    func = click.option("--scan-csv", default=str(DEFAULT_FOUND_FILES), show_default=True, type=click.Path(path_type=str))(func)
+    return func
+
+
+def _watch_options(func):
+    func = click.option(
+        "--policy",
+        default=str(DEFAULT_POLICY_PATH),
+        show_default=True,
+        help="스마트 폴더 정책 경로 (비활성화하려면 'none').",
+    )(func)
+    func = click.option("--translate/--no-translate", default=False, show_default=True)(func)
+    func = click.option("--debounce-ms", type=int, default=2000, show_default=True)(func)
+    func = click.option("--cache", default=str(CACHE_DIR), show_default=True, type=click.Path(path_type=str))(func)
+    func = click.option("--model", default=str(TOPIC_MODEL_PATH), show_default=True, type=click.Path(path_type=str))(func)
+    func = click.option("--corpus", default=str(CORPUS_PATH), show_default=True, type=click.Path(path_type=str))(func)
+    func = click.option("--scan-csv", default=str(DEFAULT_FOUND_FILES), show_default=True, type=click.Path(path_type=str))(func)
+    func = click.option(
+        "--root",
+        "--roots",
+        "roots",
+        multiple=True,
+        type=click.Path(file_okay=False, dir_okay=True, path_type=str),
+        help="감시할 루트 경로 (여러 번 지정 가능).",
+    )(func)
+    return func
+
+
+def _schedule_options(func):
+    func = click.option(
+        "--policy",
+        default=str(DEFAULT_POLICY_PATH),
+        show_default=True,
+        help="스마트 폴더 정책 경로 (비활성화하려면 'none').",
+    )(func)
+    func = click.option(
         "--agent",
+        type=click.Choice(["knowledge_search", "meeting", "photo"]),
         default=KNOWLEDGE_AGENT,
-        choices=["knowledge_search", "meeting", "photo"],
-        help="예약 실행 대상 에이전트",
-    )
-    ap_schedule.add_argument(
-        "--output-root",
-        default=str(DEFAULT_SCHEDULED_ROOT),
-        help="정책별 산출물을 저장할 루트 디렉터리",
-    )
-    ap_schedule.add_argument(
-        "--translate",
-        action="store_true",
-        help="예약 학습 시 번역 파이프라인을 사용합니다.",
-    )
-    ap_schedule.add_argument(
-        "--once",
-        action="store_true",
-        help="즉시 실행 가능한 작업만 수행 후 종료합니다.",
-    )
-    ap_schedule.add_argument(
-        "--poll-seconds",
-        type=float,
-        default=60.0,
-        help="예약 작업 확인 간격(초). 최소 5초",
-    )
-    ap_schedule.set_defaults(translate=False)
-    ap_schedule.set_defaults(func=cmd_schedule)
+        show_default=True,
+        help="예약 실행할 에이전트.",
+    )(func)
+    func = click.option("--output-root", default=str(DEFAULT_SCHEDULED_ROOT), show_default=True, type=click.Path(path_type=str))(func)
+    func = click.option("--translate/--no-translate", default=False, show_default=True)(func)
+    func = click.option("--once", is_flag=True, help="예약 없이 즉시 실행 후 종료")(func)
+    func = click.option("--poll-seconds", type=float, default=60.0, show_default=True)(func)
+    return func
 
-    args = ap.parse_args()
-    args.func(args)
+
+@click.group(
+    help="🧠 AI-summary CLI — 로컬 문서 수집·임베딩·검색 파이프라인",
+    invoke_without_command=False,
+)
+@click.option("--mlflow/--no-mlflow", default=True, show_default=True, help="MLflow 로깅 사용 여부.")
+@click.option("--mlflow-uri", default=DEFAULT_TRACKING_URI, show_default=True, help="MLflow Tracking URI.")
+@click.option("--mlflow-experiment", default=DEFAULT_EXPERIMENT, show_default=True)
+@click.option(
+    "--resource-log-path",
+    default=str(DEFAULT_RESOURCE_LOG),
+    show_default=True,
+    type=click.Path(path_type=str),
+    help="psutil 리소스 로그 경로.",
+)
+@click.option("--resource-interval", default=30.0, show_default=True, help="리소스 로그 주기(초).")
+@click.option("--no-resource-log", is_flag=True, help="리소스 로깅 비활성화")
+@click.pass_context
+def cli(
+    ctx: click.Context,
+    mlflow: bool,
+    mlflow_uri: str,
+    mlflow_experiment: str,
+    resource_log_path: str,
+    resource_interval: float,
+    no_resource_log: bool,
+) -> None:
+    ctx.ensure_object(dict)
+    ctx.obj.update(
+        {
+            "use_mlflow": mlflow,
+            "mlflow_uri": mlflow_uri,
+            "mlflow_experiment": mlflow_experiment,
+            "resource_log_path": None if no_resource_log else Path(resource_log_path),
+            "resource_interval": resource_interval,
+        }
+    )
+
+
+@cli.group("run", help="핵심 파이프라인 단계(run scan/train/index/chat/watch).")
+@click.pass_context
+def run(ctx: click.Context) -> None:
+    ctx.ensure_object(dict)
+
+
+@cli.group("logs", help="MLflow/psutil 로그 확인 및 정리.")
+def logs() -> None:
+    pass
+
+
+@cli.group("model", help="모델 목록 조회 및 ONNX 양자화.")
+def model_group() -> None:
+    pass
+
+
+@cli.group("drift", help="드리프트 점검 및 재임베딩.")
+def drift_group() -> None:
+    pass
+
+
+@click.command("scan")
+@_scan_options
+@click.pass_context
+def scan_command(ctx: click.Context, out: str, roots: Tuple[str, ...], policy: str) -> None:
+    args = SimpleNamespace(out=out, roots=list(roots) if roots else None, policy=policy)
+    with _command_session(ctx, "scan") as session:
+        count = cmd_scan(args) or 0
+        if session:
+            session.log_params({"policy": policy})
+            session.log_metrics({"files": float(count)})
+    click.echo(f"📦 스캔 완료: {count}건 기록 ({out})")
+
+
+@click.command("train")
+@_train_options
+@click.pass_context
+def train_command(
+    ctx: click.Context,
+    scan_csv: str,
+    corpus: str,
+    model: str,
+    max_features: int,
+    n_components: int,
+    n_clusters: int,
+    min_df: int,
+    max_df: float,
+    embedding_model: str,
+    embedding_batch_size: int,
+    limit_files: int,
+    translate: bool,
+    use_embedding: bool,
+    policy: str,
+    state_file: str,
+    chunk_cache: str,
+    embedding_concurrency: int,
+    async_embed: bool,
+) -> None:
+    args = SimpleNamespace(
+        scan_csv=scan_csv,
+        corpus=corpus,
+        model=model,
+        max_features=max_features,
+        n_components=n_components,
+        n_clusters=n_clusters,
+        min_df=min_df,
+        max_df=max_df,
+        embedding_model=embedding_model,
+        embedding_batch_size=embedding_batch_size,
+        limit_files=limit_files,
+        translate=translate,
+        use_embedding=use_embedding,
+        policy=policy,
+        state_file=state_file,
+        chunk_cache=chunk_cache,
+        embedding_concurrency=embedding_concurrency,
+        async_embed=async_embed,
+    )
+    with _command_session(ctx, "train") as session:
+        stats = cmd_train(args) or {}
+        if session and stats:
+            session.log_params(
+                {
+                    "corpus": stats.get("corpus"),
+                    "model": stats.get("model"),
+                    "embedding_model": embedding_model,
+                    "use_embedding": str(use_embedding),
+                }
+            )
+            session.log_metrics({"rows": float(stats.get("rows", 0))})
+            extra_metrics = stats.get("metrics") or {}
+            if extra_metrics:
+                session.log_metrics(extra_metrics)
+    click.echo(f"🧠 학습 완료 → corpus={corpus}")
+
+
+@click.command("pipeline")
+@_pipeline_options
+@click.argument("target", required=False, default="all")
+@click.pass_context
+def pipeline_command(
+    ctx: click.Context,
+    target: str,
+    out: str,
+    roots: Tuple[str, ...],
+    exts: Tuple[str, ...],
+    corpus: str,
+    model: str,
+    cache: str,
+    max_features: int,
+    n_components: int,
+    n_clusters: int,
+    min_df: int,
+    max_df: float,
+    embedding_model: str,
+    embedding_batch_size: int,
+    limit_files: int,
+    translate: bool,
+    use_embedding: bool,
+    launch_chat: bool,
+    policy: str,
+    state_file: str,
+    chunk_cache: str,
+    embedding_concurrency: int,
+    async_embed: bool,
+) -> None:
+    normalized = (target or "all").strip().lower()
+    if normalized not in {"", "all"}:
+        raise click.UsageError("지원하지 않는 파이프라인 타겟입니다 (all만 지원).")
+    resolved_chunk_cache = chunk_cache or str(Path(cache) / "chunk_cache.json")
+    args = SimpleNamespace(
+        out=out,
+        roots=list(roots) if roots else None,
+        exts=list(exts) if exts else None,
+        corpus=corpus,
+        model=model,
+        cache=cache,
+        max_features=max_features,
+        n_components=n_components,
+        n_clusters=n_clusters,
+        min_df=min_df,
+        max_df=max_df,
+        embedding_model=embedding_model,
+        embedding_batch_size=embedding_batch_size,
+        limit_files=limit_files,
+        translate=translate,
+        use_embedding=use_embedding,
+        launch_chat=launch_chat,
+        policy=policy,
+        state_file=state_file,
+        chunk_cache=resolved_chunk_cache,
+        embedding_concurrency=embedding_concurrency,
+        async_embed=async_embed,
+    )
+    with _command_session(ctx, "pipeline") as session:
+        stats = cmd_pipeline(args) or {}
+        if session and stats:
+            session.log_params(
+                {
+                    "corpus": stats.get("corpus"),
+                    "model": stats.get("model"),
+                    "cache": stats.get("cache"),
+                    "launch_chat": str(launch_chat),
+                }
+            )
+            session.log_metrics({"rows": float(stats.get("rows", 0))})
+            extra_metrics = stats.get("metrics") or {}
+            if extra_metrics:
+                session.log_metrics(extra_metrics)
+    click.echo("🚀 pipeline all 완료")
+
+
+@click.command("index")
+@_index_options
+@click.pass_context
+def index_command(
+    ctx: click.Context,
+    model: str,
+    corpus: str,
+    cache: str,
+    translate: bool,
+    scope: str,
+    policy: str,
+) -> None:
+    args = SimpleNamespace(
+        model=model,
+        corpus=corpus,
+        cache=cache,
+        translate=translate,
+        scope=scope,
+        policy=policy,
+    )
+    with _command_session(ctx, "index") as session:
+        stats = cmd_index(args) or {}
+        if session and stats:
+            session.log_params({"cache": stats.get("cache"), "scope": scope})
+    click.echo(f"🧱 인덱스 캐시 갱신 완료 → {cache}")
+
+
+@click.command("chat")
+@_chat_options
+@click.pass_context
+def chat_command(
+    ctx: click.Context,
+    model: str,
+    corpus: str,
+    cache: str,
+    scan_csv: str,
+    topk: int,
+    translate: bool,
+    auto_train: bool,
+    rerank: bool,
+    rerank_model: str,
+    rerank_depth: int,
+    rerank_batch_size: int,
+    rerank_device: Optional[str],
+    rerank_min_score: float,
+    lexical_weight: float,
+    show_translation: bool,
+    translation_lang: str,
+    min_similarity: float,
+    policy: str,
+    scope: str,
+    query: Optional[str],
+    json_mode: bool,
+) -> None:
+    args = SimpleNamespace(
+        model=model,
+        corpus=corpus,
+        cache=cache,
+        scan_csv=scan_csv,
+        topk=topk,
+        translate=translate,
+        auto_train=auto_train,
+        rerank=rerank,
+        rerank_model=rerank_model,
+        rerank_depth=rerank_depth,
+        rerank_batch_size=rerank_batch_size,
+        rerank_device=rerank_device,
+        rerank_min_score=rerank_min_score,
+        lexical_weight=lexical_weight,
+        show_translation=show_translation,
+        translation_lang=translation_lang,
+        min_similarity=min_similarity,
+        policy=policy,
+        scope=scope,
+        query=query,
+        json=json_mode,
+    )
+    with _command_session(ctx, "chat"):
+        cmd_chat(args)
+
+
+@click.command("watch")
+@_watch_options
+@click.pass_context
+def watch_command(
+    ctx: click.Context,
+    roots: Tuple[str, ...],
+    scan_csv: str,
+    corpus: str,
+    model: str,
+    cache: str,
+    debounce_ms: int,
+    translate: bool,
+    policy: str,
+) -> None:
+    args = SimpleNamespace(
+        roots=list(roots) if roots else None,
+        scan_csv=scan_csv,
+        corpus=corpus,
+        model=model,
+        cache=cache,
+        debounce_ms=debounce_ms,
+        translate=translate,
+        policy=policy,
+    )
+    with _command_session(ctx, "watch"):
+        cmd_watch(args)
+
+
+@click.command("schedule")
+@_schedule_options
+@click.pass_context
+def schedule_command(
+    ctx: click.Context,
+    policy: str,
+    agent: str,
+    output_root: str,
+    translate: bool,
+    once: bool,
+    poll_seconds: float,
+) -> None:
+    args = SimpleNamespace(
+        policy=policy,
+        agent=agent,
+        output_root=output_root,
+        translate=translate,
+        once=once,
+        poll_seconds=poll_seconds,
+    )
+    with _command_session(ctx, "schedule"):
+        cmd_schedule(args)
+
+
+cli.add_command(scan_command)
+cli.add_command(train_command)
+cli.add_command(pipeline_command)
+cli.add_command(index_command)
+cli.add_command(chat_command)
+cli.add_command(watch_command)
+cli.add_command(schedule_command)
+run.add_command(scan_command)
+run.add_command(train_command)
+run.add_command(index_command)
+run.add_command(chat_command)
+run.add_command(watch_command)
+
+
+@logs.command("show")
+@click.option("--tail", type=int, default=20, show_default=True, help="표시할 최근 로그 라인 수.")
+@click.option(
+    "--resource-log-path",
+    default=str(DEFAULT_RESOURCE_LOG),
+    show_default=True,
+    type=click.Path(path_type=str),
+)
+@click.option(
+    "--drift-log-path",
+    default=str(DEFAULT_DRIFT_LOG),
+    show_default=True,
+    type=click.Path(path_type=str),
+)
+def logs_show(tail: int, resource_log_path: str, drift_log_path: str) -> None:
+    mlflow_dir = DEFAULT_TRACKING_URI.replace("file:", "")
+    click.echo(f"📁 MLflow tracking: {mlflow_dir}")
+
+    def _tail(path: Path) -> List[str]:
+        if not path.exists():
+            return []
+        with path.open("r", encoding="utf-8") as f:
+            lines = f.readlines()
+        return lines[-tail:]
+
+    res_path = Path(resource_log_path)
+    drift_path = Path(drift_log_path)
+    res_lines = _tail(res_path)
+    drift_lines = _tail(drift_path)
+    click.echo(f"📊 Resource log ({res_path}):")
+    if res_lines:
+        for line in res_lines:
+            click.echo(f"  {line.rstrip()}")
+    else:
+        click.echo("  (no entries)")
+    click.echo(f"📉 Drift log ({drift_path}):")
+    if drift_lines:
+        for line in drift_lines:
+            click.echo(f"  {line.rstrip()}")
+    else:
+        click.echo("  (no entries)")
+
+
+@logs.command("clean")
+@click.option("--resource", is_flag=True, help="리소스 로그 삭제")
+@click.option("--drift", is_flag=True, help="드리프트 로그 삭제")
+@click.option("--mlflow", "clean_mlflow", is_flag=True, help=".mlruns 디렉터리 비우기")
+def logs_clean(resource: bool, drift: bool, clean_mlflow: bool) -> None:
+    if resource:
+        path = DEFAULT_RESOURCE_LOG
+        if path.exists():
+            path.unlink()
+        click.echo(f"🧹 resource log 제거: {path}")
+    if drift:
+        path = DEFAULT_DRIFT_LOG
+        if path.exists():
+            path.unlink()
+        click.echo(f"🧹 drift log 제거: {path}")
+    if clean_mlflow:
+        tracking_dir = Path(DEFAULT_TRACKING_URI.replace("file:", ""))
+        if tracking_dir.exists():
+            shutil.rmtree(tracking_dir)
+        click.echo(f"🧹 MLflow 기록 제거: {tracking_dir}")
+
+
+@model_group.command("list")
+def model_list() -> None:
+    if not MODELS_DIR.exists():
+        click.echo("⚠️ MODELS_DIR가 존재하지 않습니다.")
+        return
+    click.echo("📚 모델 목록:")
+    for item in sorted(MODELS_DIR.glob("*")):
+        marker = "[DIR]" if item.is_dir() else "     "
+        click.echo(f"  {marker} {item}")
+
+
+@model_group.command("quantize")
+@click.option("--model", "model_name", required=True, help="HuggingFace 모델 ID 또는 로컬 경로")
+@click.option(
+    "--output",
+    required=True,
+    type=click.Path(dir_okay=False, path_type=str),
+    help="생성할 ONNX 경로",
+)
+@click.option("--seq-length", type=int, default=384, show_default=True, help="ONNX 내 최대 토큰 길이")
+@click.option("--opset", type=int, default=17, show_default=True)
+@click.option("--int8/--fp32", "int8", default=True, show_default=True, help="INT8 양자화 사용 여부")
+def model_quantize(model_name: str, output: str, seq_length: int, opset: int, int8: bool) -> None:
+    result = export_to_onnx(
+        model_name,
+        output_path=Path(output),
+        sequence_length=seq_length,
+        opset=opset,
+        quantize_int8=int8,
+    )
+    mode = "int8" if result.quantized else "fp32"
+    size_mb = result.file_size / (1024 * 1024) if result.file_size else 0
+    click.echo(f"✅ ONNX {mode} 저장 완료 ({size_mb:.1f} MB) → {result.output}")
+
+
+def _drift_log_candidates(log_path: Path, limit: int = 64) -> List[str]:
+    if limit <= 0 or not log_path.exists():
+        return []
+    try:
+        with log_path.open("r", encoding="utf-8") as f:
+            lines = f.readlines()
+    except OSError:
+        return []
+
+    seen: Set[str] = set()
+    picked: List[str] = []
+    for raw in reversed(lines):
+        entry = raw.strip()
+        if not entry:
+            continue
+        try:
+            payload = json.loads(entry)
+        except json.JSONDecodeError:
+            continue
+        for key in ("reembed_candidates", "changed_files", "new_files"):
+            for path in payload.get(key, []) or []:
+                normalized = str(path).strip()
+                if not normalized or normalized in seen:
+                    continue
+                seen.add(normalized)
+                picked.append(normalized)
+                if len(picked) >= limit:
+                    return picked
+        if picked:
+            # Stop after the most recent entry that yielded candidates.
+            return picked
+    return picked
+
+
+@drift_group.command("check")
+@click.option("--scan-csv", default=str(DEFAULT_FOUND_FILES), show_default=True, type=click.Path(path_type=str))
+@click.option("--corpus", default=str(CORPUS_PATH), show_default=True, type=click.Path(path_type=str))
+@click.option("--cache-dir", default=str(CACHE_DIR), show_default=True, type=click.Path(path_type=str))
+@click.option("--semantic-baseline", default=str(DEFAULT_SEMANTIC_BASELINE), show_default=True, type=click.Path(path_type=str))
+@click.option("--semantic-threshold", type=float, default=0.15, show_default=True, help="semantic drift 임계값 (cosine)")
+@click.option("--log-path", default=str(DEFAULT_DRIFT_LOG), show_default=True, type=click.Path(path_type=str))
+@click.option("--alert-threshold", type=float, default=0.1, show_default=True, help="hash drift 비율 알림 임계값")
+@click.pass_context
+def drift_check(
+    ctx: click.Context,
+    scan_csv: str,
+    corpus: str,
+    cache_dir: str,
+    semantic_baseline: str,
+    semantic_threshold: float,
+    log_path: str,
+    alert_threshold: float,
+) -> None:
+    cache_path = Path(cache_dir)
+    baseline_path = Path(semantic_baseline) if semantic_baseline else None
+    with _command_session(ctx, "drift-check") as session:
+        report = check_drift(
+            Path(scan_csv),
+            Path(corpus),
+            cache_dir=cache_path,
+            log_path=Path(log_path),
+            alert_threshold=alert_threshold,
+            semantic_baseline=baseline_path,
+            semantic_threshold=semantic_threshold,
+        )
+        if session:
+            session.log_metrics(
+                {
+                    "hash_drift_ratio": report.hash_drift_ratio,
+                    "semantic_shift": report.semantic_shift,
+                    "new_files": float(len(report.new_files)),
+                    "changed_files": float(len(report.changed_files)),
+                    "missing_files": float(len(report.missing_files)),
+                }
+            )
+
+    click.echo(f"📈 hash drift ratio={report.hash_drift_ratio:.3f} (scan={report.scan_rows}, corpus={report.corpus_rows})")
+    if report.new_files:
+        click.echo(f"➕ 신규 문서 {len(report.new_files)}건 (상위 5개):")
+        for path in report.new_files[:5]:
+            click.echo(f"   + {path}")
+    if report.changed_files:
+        click.echo(f"🌀 변경 감지 {len(report.changed_files)}건 (상위 5개):")
+        for path in report.changed_files[:5]:
+            click.echo(f"   * {path}")
+    if report.missing_files:
+        click.echo(f"➖ 누락 문서 {len(report.missing_files)}건 (상위 5개):")
+        for path in report.missing_files[:5]:
+            click.echo(f"   - {path}")
+    click.echo(
+        f"🎯 semantic shift={report.semantic_shift:.3f} (threshold={semantic_threshold:.2f}, sample={report.semantic_sample_size})"
+    )
+    if report.reembed_candidates:
+        click.echo(f"🔁 재임베딩 후보 {len(report.reembed_candidates)}건 (로그에 기록)")
+    if report.recommendations:
+        click.echo(f"✅ 권장 조치: {', '.join(report.recommendations)}")
+
+
+@drift_group.command("reembed")
+@click.option("--paths-file", type=click.Path(exists=True, path_type=str), help="재임베딩할 경로 리스트 파일")
+@click.option(
+    "--path",
+    "paths",
+    multiple=True,
+    help="재임베딩할 단일 경로 (여러 번 지정 가능)",
+)
+@click.option("--from-drift-log", "use_drift_log", is_flag=True, help="최신 드리프트 로그에서 자동 대상 추출")
+@click.option(
+    "--drift-log-path",
+    default=str(DEFAULT_DRIFT_LOG),
+    show_default=True,
+    type=click.Path(path_type=str),
+    help="드리프트 체크 JSONL 경로",
+)
+@click.option("--max-candidates", type=int, default=64, show_default=True, help="로그에서 불러올 최대 문서 수")
+@click.option("--scan-csv", default=str(DEFAULT_FOUND_FILES), show_default=True, type=click.Path(path_type=str))
+@click.option("--corpus", default=str(CORPUS_PATH), show_default=True, type=click.Path(path_type=str))
+@click.option("--cache", default=str(CACHE_DIR), show_default=True, type=click.Path(path_type=str))
+@click.option("--model", default=str(TOPIC_MODEL_PATH), show_default=True, type=click.Path(path_type=str))
+@click.option("--translate/--no-translate", default=False, show_default=True)
+@click.option("--policy", default=str(DEFAULT_POLICY_PATH), show_default=True)
+@click.pass_context
+def drift_reembed(
+    ctx: click.Context,
+    paths_file: Optional[str],
+    paths: Tuple[str, ...],
+    use_drift_log: bool,
+    drift_log_path: str,
+    max_candidates: int,
+    scan_csv: str,
+    corpus: str,
+    cache: str,
+    model: str,
+    translate: bool,
+    policy: str,
+) -> None:
+    candidate_paths: Set[str] = set(paths or [])
+    if paths_file:
+        file_lines = Path(paths_file).read_text(encoding="utf-8").splitlines()
+        candidate_paths.update(line.strip() for line in file_lines if line.strip())
+    if use_drift_log:
+        auto_paths = _drift_log_candidates(Path(drift_log_path), limit=max_candidates)
+        if auto_paths:
+            click.echo(f"📥 드리프트 로그에서 {len(auto_paths)}건 자동 수집")
+            candidate_paths.update(auto_paths)
+        else:
+            click.echo("⚠️ 드리프트 로그에서 자동으로 선택할 문서를 찾지 못했습니다.")
+    if not candidate_paths:
+        raise click.UsageError("재임베딩할 경로를 --path 또는 --paths-file로 지정하세요.")
+    encoder, batch_size, model_name = _load_sentence_encoder(Path(model))
+    if encoder is None:
+        raise click.ClickException("SentenceTransformer 모델 로드 실패로 재임베딩을 진행할 수 없습니다.")
+    policy_engine = _load_policy_engine(policy)
+    pipeline_ctx = IncrementalPipeline(
+        encoder=encoder,
+        batch_size=batch_size,
+        scan_csv=Path(scan_csv),
+        corpus_path=Path(corpus),
+        cache_dir=Path(cache),
+        translate=translate,
+        policy_engine=policy_engine,
+    )
+    with _command_session(ctx, "drift-reembed") as session:
+        pipeline_ctx.process(set(candidate_paths), set())
+        if session:
+            session.log_metrics({"reembedded": float(len(candidate_paths))})
+    click.echo(f"🔁 재임베딩 완료 ({len(candidate_paths)}건)")
+    try:
+        _get_sentence_encoder_manager().release(model_name)
+    except Exception:
+        pass
+
+
+def main() -> None:
+    cli(obj={})
 
 
 if __name__ == "__main__":

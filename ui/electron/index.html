@@ -9,6 +9,7 @@
   <body>
     <div class="toolbar-dock">
       <div class="toolbar" role="toolbar">
+        <div class="status" id="toolbar-status" role="status" aria-live="polite"></div>
         <button class="icon" data-action="mic" title="음성 명령">
           <span aria-hidden="true">🎤</span>
           <span class="visually-hidden">음성 명령</span>
@@ -37,6 +38,10 @@
         <button class="icon" data-view="knowledge-results" title="지식 검색">
           <span aria-hidden="true">🔎</span>
           <span class="visually-hidden">지식 검색 열기</span>
+        </button>
+        <button class="icon" data-view="pipeline" title="파이프라인 상태">
+          <span aria-hidden="true">⚡</span>
+          <span class="visually-hidden">파이프라인 패널 열기</span>
         </button>
         <button class="icon" data-action="settings" title="설정">
           <span aria-hidden="true">⚙️</span>
@@ -79,6 +84,49 @@
             <div class="knowledge-results">
               <p class="knowledge-results__folder" id="knowledge-results-folder"></p>
               <ul class="knowledge-results__list" id="knowledge-results-list"></ul>
+            </div>
+          </section>
+
+          <section class="panel-view" id="view-pipeline" hidden>
+            <div class="pipeline-card">
+              <div class="pipeline-card__status">
+                <span class="badge" id="pipeline-state-badge">IDLE</span>
+                <p id="pipeline-stage-text">파이프라인이 대기 중입니다.</p>
+              </div>
+              <form id="pipeline-run-form" class="pipeline-form">
+                <label>
+                  API 서버
+                  <input type="text" id="pipeline-api-base" value="http://127.0.0.1:8080" placeholder="http://127.0.0.1:8080" />
+                </label>
+                <label>
+                  루트 폴더 (선택 사항)
+                  <input type="text" id="pipeline-root-input" placeholder="예: ~/Documents" />
+                </label>
+                <label>
+                  확장자 필터 (콤마 구분)
+                  <input type="text" id="pipeline-exts-input" placeholder=".md,.pdf,.pptx" />
+                </label>
+                <label>
+                  샘플 제한 (0=전체)
+                  <input type="number" id="pipeline-limit-input" min="0" value="0" />
+                </label>
+                <label class="toggle-row">
+                  <input type="checkbox" id="pipeline-prefect-toggle" />
+                  <span>Prefect 플로우로 실행</span>
+                </label>
+                <div class="pipeline-form__actions">
+                  <button type="submit" class="primary">파이프라인 실행</button>
+                  <button type="button" id="pipeline-refresh-btn">상태 새로고침</button>
+                  <button type="button" id="pipeline-cancel-btn" class="ghost">중단</button>
+                </div>
+              </form>
+              <div class="pipeline-history">
+                <div class="pipeline-history__header">
+                  <h4>최근 단계</h4>
+                  <small>FastAPI / Prefect 로그</small>
+                </div>
+                <ul id="pipeline-history" class="pipeline-history__list"></ul>
+              </div>
             </div>
           </section>
 

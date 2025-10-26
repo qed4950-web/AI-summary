@@ -22,26 +22,46 @@
    `scripts/setup_env.sh`는 `.env`가 없으면 `.env.example`을 복사합니다. 필요 시 수동으로 `cp .env.example .env` 후 값을 수정하세요.
 2. **데이터 파이프라인**
    ```bash
-   # 스캔
-   python infopilot.py scan --out data/found_files.csv
-
-   # 학습
-   python infopilot.py train \
-     --scan_csv data/found_files.csv \
+   # 전체 파이프라인 한 번에 (증분 상태/해시 캐시 포함)
+   python infopilot.py pipeline all \
+     --out data/found_files.csv \
      --corpus data/corpus.parquet \
-     --model data/topic_model.joblib
-
-   # 대화 (대화형 모드)
-   python infopilot.py chat \
      --model data/topic_model.joblib \
-     --corpus data/corpus.parquet \
-     --cache data/cache
+     --cache data/cache \
+     --state-file data/scan_state.json \
+     --chunk-cache data/cache/chunk_cache.json
+
+   # 필요 시 개별 단계
+   python infopilot.py run scan --out data/found_files.csv
+   python infopilot.py run train --scan_csv data/found_files.csv --state-file data/scan_state.json --chunk-cache data/cache/chunk_cache.json
+   python infopilot.py run chat --model data/topic_model.joblib --corpus data/corpus.parquet --cache data/cache --lexical-weight 0.2
+   python infopilot.py run watch --corpus data/corpus.parquet --model data/topic_model.joblib --cache data/cache
+   ```
+
+   로그/품질 점검용 보조 커맨드도 자주 사용합니다.
+
+   ```bash
+   python infopilot.py logs show
+   python infopilot.py drift check --scan-csv data/found_files.csv --corpus data/corpus.parquet
+   python infopilot.py model quantize --model sentence-transformers/all-MiniLM-L6-v2 --output models/sbert.onnx
    ```
 3. **데스크톱 UI**
    ```bash
    python scripts/launch_desktop.py
    # 또는 직접 실행
    python ui/app.py
+   ```
+
+4. **오케스트레이션 (선택 사항)**
+   ```bash
+   # Prefect Flow로 전체 파이프라인 실행
+   python scripts/prefect_dag.py --root ~/Documents --use-prefect
+
+   # FastAPI 서버로 REST 제어
+   python scripts/api_server.py
+   # POST /pipeline/run  → 파이프라인 시작
+   # GET  /pipeline/status → 진행 상황 조회
+   # POST /pipeline/cancel → 중단
    ```
 
 ---
@@ -58,7 +78,7 @@
 1. 정책 파일을 편집합니다.
 2. 정책을 반영해 파이프라인을 실행합니다.
    ```bash
-   python infopilot.py pipeline \
+   python infopilot.py pipeline all \
      --out data/found_files.csv \
      --policy core/config/smart_folders.json \
      --corpus data/corpus.parquet \
@@ -66,7 +86,7 @@
    ```
 3. 정책 범위를 강제하고 싶다면 대화 시 `--scope policy`를 사용합니다.
    ```bash
-   python infopilot.py chat \
+   python infopilot.py run chat \
      --policy core/config/smart_folders.json \
      --scope policy \
      --model data/topic_model.joblib \
@@ -87,7 +107,7 @@
 
 ### 학습된 문서로 자연어 대화
 ```bash
-python infopilot.py chat \
+python infopilot.py run chat \
   --model data/topic_model.joblib \
   --corpus data/corpus.parquet \
   --cache data/cache
@@ -95,7 +115,7 @@ python infopilot.py chat \
 
 ### 단일 질의 + JSON 응답
 ```bash
-python infopilot.py chat \
+python infopilot.py run chat \
   --query "보안 가이드 요약해 줘" \
   --json \
   --model data/topic_model.joblib \

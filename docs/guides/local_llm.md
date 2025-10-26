@@ -57,7 +57,7 @@ python scripts/check_local_llm.py --backend ollama --model llama3
   환경 변수를 설정한 세션에서 다음 명령으로 대화 모드를 실행합니다.
 
   ```bash
-  python infopilot.py chat \
+  python infopilot.py run chat \
     --model data/topic_model.joblib \
     --corpus data/corpus.parquet \
     --cache data/cache

@@ -21,6 +21,7 @@ def test_chat_command_returns_json_payload():
     cmd = [
         sys.executable,
         str(SCRIPT),
+        "run",
         "chat",
         "--model",
         str(MODEL),

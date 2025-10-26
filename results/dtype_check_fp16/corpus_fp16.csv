@@ -1,0 +1,4 @@
+path,ext,ok,text,text_original,meta,size,mtime,ctime,owner,doc_hash,text_model,chunk_id,chunk_count,chunk_tokens,preview,content_hash,topic
+results/dtype_check_fp16/sample.csv,.csv,True,title text foo Async embed dtype test bar Ensuring FP16 flow works,title | text • foo | Async embed dtype test • bar | Ensuring FP16 flow works,"{'engine': 'pandas', 'columns': ['title', 'text'], 'rows_preview': 2}",67,1761485927.2401977,1761485927.2401977,dtype-test,02feb57cc277bfc3e3fa21c3d5f6077658b41525,"title text foo Async embed dtype test bar Ensuring FP16 flow works
+
+sample.csv sample dtype_check_fp16 dtype check fp16 .csv csv 2025 2025-10 2025-10-26 october 10 size:tiny dtype-test test",1,1,12,title | text • foo | Async embed dtype test • bar | Ensuring FP16 flow works,3b39830ba86797192adf475a197aa6435cf343cd,0

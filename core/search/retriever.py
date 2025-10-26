@@ -73,7 +73,7 @@ macOS/CPU 환경에서는 아래 명령으로 권장 버전을 설치한 뒤 다
       torch==2.3.0 torchvision==0.18.0 torchaudio==2.3.0 \\
       --index-url https://download.pytorch.org/whl/cpu
 
-설치 후 `python infopilot.py train` 또는 데스크톱 앱을 다시 실행하면 문제를 해결할 수 있습니다.
+설치 후 `python infopilot.py run train` 또는 데스크톱 앱을 다시 실행하면 문제를 해결할 수 있습니다.
 """
 
 try:
@@ -119,6 +119,9 @@ MAX_BM25_TOKENS = 8000
 MAX_PREVIEW_CHARS = 180
 DEFAULT_MMR_LAMBDA = 0.7
 RRF_DEFAULT_K = 60
+TEMPORAL_HALF_LIFE_DAYS = 365.0
+TEMPORAL_WEIGHT_FLOOR = 0.72
+TEMPORAL_WEIGHT_CEILING = 1.15
 _SESSION_HISTORY_LIMIT = 50
 _SESSION_CHAT_HISTORY_LIMIT = 20
 _SESSION_PREF_DECAY = 0.85
@@ -151,6 +154,26 @@ def _split_tokens(source: Any) -> List[str]:
     if not source:
         return []
     return list(_split_tokens_cached(str(source)))
+
+
+def _temporal_weight(mtime: Any, ctime: Any = None) -> float:
+    timestamp = None
+    for candidate in (mtime, ctime):
+        if candidate:
+            try:
+                ts = float(candidate)
+            except (TypeError, ValueError):
+                continue
+            if ts > 0:
+                timestamp = ts
+                break
+    if timestamp is None:
+        return 1.0
+    now = time.time()
+    age_days = max(0.0, (now - timestamp) / 86400.0)
+    decay = math.exp(-age_days / TEMPORAL_HALF_LIFE_DAYS)
+    weight = TEMPORAL_WEIGHT_FLOOR + (TEMPORAL_WEIGHT_CEILING - TEMPORAL_WEIGHT_FLOOR) * decay
+    return max(TEMPORAL_WEIGHT_FLOOR, min(TEMPORAL_WEIGHT_CEILING, weight))
 
 
 def _mask_path(path: str) -> str:
@@ -327,7 +350,7 @@ for keyword, exts in _DOMAIN_EXT_HINTS.items():
             _DOMAIN_KEYWORD_MAP.setdefault(form, set()).update(mapped_exts)
 
 # 의미 검색만 사용하도록 BM25 가중치를 비활성화
-_LEXICAL_WEIGHT = 0.0
+_LEXICAL_WEIGHT = 0.2
 _EXTENSION_MATCH_BONUS = 0.05
 
 
@@ -895,6 +918,14 @@ def _annotate_hits(
             elif lexical_score > 0.0:
                 reasons.append(f"키워드 일치 점수 {breakdown['lexical']:.2f}")
 
+        temporal_weight = _safe_float(hit.get("temporal_weight"))
+        if temporal_weight is not None and abs(temporal_weight - 1.0) > 0.01:
+            breakdown["recency"] = round(temporal_weight, 4)
+            if temporal_weight > 1.0:
+                reasons.append(f"최신 문서 가중치 {temporal_weight:.2f}")
+            else:
+                reasons.append(f"오래된 문서 가중치 {temporal_weight:.2f}")
+
         rerank_score = _safe_float(hit.get("rerank_score"))
         if rerank_score is not None:
             breakdown["rerank"] = round(rerank_score, 4)
@@ -1374,8 +1405,10 @@ def _rerank_hits(
             session,
         )
         owner_bonus = _compute_owner_bonus(hit.get("owner"), session)
-        final_score = float(base_score) + total_ext_bonus + owner_bonus
+        temporal_factor = _temporal_weight(hit.get("mtime"), hit.get("ctime"))
+        final_score = (float(base_score) * temporal_factor) + total_ext_bonus + owner_bonus
         hit["score"] = final_score
+        hit["temporal_weight"] = temporal_factor
         if "vector_similarity" in hit:
             hit["similarity"] = float(hit.get("vector_similarity", 0.0))
         else:
@@ -1510,38 +1543,41 @@ class CrossEncoderReranker:
                 ext_preferences,
                 session,
             )
-            owner_bonus = _compute_owner_bonus(hit.get("owner"), session)
+        owner_bonus = _compute_owner_bonus(hit.get("owner"), session)
+        temporal_factor = float(hit.get("temporal_weight", 1.0))
 
-            combined = (
-                (alpha * rerank_component)
-                + (beta * vector_component)
-                + (gamma * lexical_component)
-                + total_ext_bonus
-                + owner_bonus
-            )
+        combined = (
+            (alpha * rerank_component)
+            + (beta * vector_component)
+            + (gamma * lexical_component)
+            + total_ext_bonus
+            + owner_bonus
+        )
+        combined *= temporal_factor
 
-            original_vector = float(hit.get("vector_similarity", hit.get("similarity", 0.0)))
-            hit["vector_similarity"] = original_vector
-            hit.setdefault("pre_rerank_score", float(hit.get("score", 0.0)))
-            hit["rerank_score"] = float(rerank_score)
-            hit["combined_score"] = float(combined)
-            hit["score"] = float(combined)
-            hit["similarity"] = original_vector
-            hit["desired_extension_bonus"] = float(desired_ext_bonus)
-            hit["session_ext_bonus"] = float(session_ext_bonus)
-            hit["session_owner_bonus"] = float(owner_bonus)
-            if total_ext_bonus:
-                hit["rerank_ext_bonus"] = total_ext_bonus
-            match_reasons = hit.get("match_reasons")
-            if match_reasons is not None and session_ext_bonus:
-                label = "세션 선호 확장자 가중치" if session_ext_bonus > 0 else "세션 비선호 확장자 페널티"
-                if label not in match_reasons:
-                    match_reasons.append(label)
-            if match_reasons is not None and owner_bonus:
-                owner_label = "세션 선호 작성자 가중치" if owner_bonus > 0 else "세션 비선호 작성자 페널티"
-                if owner_label not in match_reasons:
-                    match_reasons.append(owner_label)
-            combined_hits.append(hit)
+        original_vector = float(hit.get("vector_similarity", hit.get("similarity", 0.0)))
+        hit["vector_similarity"] = original_vector
+        hit.setdefault("pre_rerank_score", float(hit.get("score", 0.0)))
+        hit["rerank_score"] = float(rerank_score)
+        hit["combined_score"] = float(combined)
+        hit["score"] = float(combined)
+        hit["similarity"] = original_vector
+        hit["desired_extension_bonus"] = float(desired_ext_bonus)
+        hit["session_ext_bonus"] = float(session_ext_bonus)
+        hit["session_owner_bonus"] = float(owner_bonus)
+        hit["temporal_weight"] = temporal_factor
+        if total_ext_bonus:
+            hit["rerank_ext_bonus"] = total_ext_bonus
+        match_reasons = hit.get("match_reasons")
+        if match_reasons is not None and session_ext_bonus:
+            label = "세션 선호 확장자 가중치" if session_ext_bonus > 0 else "세션 비선호 확장자 페널티"
+            if label not in match_reasons:
+                match_reasons.append(label)
+        if match_reasons is not None and owner_bonus:
+            owner_label = "세션 선호 작성자 가중치" if owner_bonus > 0 else "세션 비선호 작성자 페널티"
+            if owner_label not in match_reasons:
+                match_reasons.append(owner_label)
+        combined_hits.append(hit)
 
         combined_hits.sort(key=lambda item: item.get("score", 0.0), reverse=True)
         return combined_hits
@@ -1774,6 +1810,14 @@ class VectorIndex:
         self.ann_m = 32
         self.ann_ef_construction = 80
         self.ann_ef_search = 64
+        self.faiss_use_pq = True
+        self.faiss_pq_threshold = 2000
+        self.faiss_pq_m = 32
+        self.faiss_pq_nbits = 8
+        self.faiss_pq_min_nlist = 64
+        self.faiss_pq_max_nlist = 4096
+        self.faiss_pq_nprobe = 64
+        self._faiss_pq_active = False
 
     @staticmethod
     def _normalize_rows(matrix: np.ndarray) -> np.ndarray:
@@ -1903,10 +1947,21 @@ class VectorIndex:
             self._faiss_dirty = False
             return
         dim = self.Z.shape[1]
-        base = faiss.IndexFlatIP(dim)
-        index = faiss.IndexIDMap(base)
-        ids = np.asarray(self.doc_ids, dtype=np.int64)
-        index.add_with_ids(self.Z, ids)
+        use_pq = (
+            self.faiss_use_pq
+            and len(self.doc_ids) >= max(1, self.faiss_pq_threshold)
+        )
+        index = None
+        if use_pq:
+            index = self._build_ivfpq_index(dim)
+        if index is None:
+            base = faiss.IndexFlatIP(dim)
+            index = faiss.IndexIDMap(base)
+            ids = np.asarray(self.doc_ids, dtype=np.int64)
+            index.add_with_ids(self.Z, ids)
+            self._faiss_pq_active = False
+        else:
+            self._faiss_pq_active = True
         self.faiss_index = index
         self.dimension = dim
         self._faiss_dirty = False
@@ -1924,6 +1979,59 @@ class VectorIndex:
         except Exception:
             self.lexical_index = None
         self._lexical_dirty = False
+
+    def _resolve_pq_nlist(self) -> int:
+        total = len(self.doc_ids)
+        if total <= 0:
+            return 0
+        base = max(self.faiss_pq_min_nlist, total // 8)
+        nlist = min(self.faiss_pq_max_nlist, base)
+        nlist = max(1, min(nlist, total - 1))
+        return nlist
+
+    def _resolve_pq_m(self, dim: int) -> int:
+        target = min(max(1, self.faiss_pq_m), dim)
+        while target > 1 and dim % target != 0:
+            target -= 1
+        return max(1, target)
+
+    def _build_ivfpq_index(self, dim: int):
+        if faiss is None or self.Z is None or self.Z.size == 0:
+            return None
+        nlist = self._resolve_pq_nlist()
+        if nlist <= 0:
+            return None
+        subvectors = self._resolve_pq_m(dim)
+        if subvectors <= 0:
+            return None
+        try:
+            quantizer = faiss.IndexFlatIP(dim)
+            metric = getattr(faiss, "METRIC_INNER_PRODUCT", faiss.METRIC_L2)
+            index = faiss.IndexIVFPQ(
+                quantizer,
+                dim,
+                nlist,
+                subvectors,
+                max(1, int(self.faiss_pq_nbits)),
+                metric,
+            )
+        except Exception:
+            return None
+        try:
+            index.train(self.Z)
+        except Exception:
+            return None
+        ids = np.asarray(self.doc_ids, dtype=np.int64)
+        try:
+            index.add_with_ids(self.Z, ids)
+        except Exception:
+            return None
+        nprobe = max(1, min(self.faiss_pq_nprobe, nlist))
+        try:
+            index.nprobe = int(nprobe)
+        except Exception:
+            pass
+        return index
 
     def _tokenize_entry(self, entry: Dict[str, Any]) -> List[str]:
         corpus = " ".join(
@@ -2145,6 +2253,10 @@ class VectorIndex:
             try:
                 self.faiss_index = faiss.read_index(str(faiss_path))
                 self.dimension = getattr(self.faiss_index, "d", self.dimension)
+                try:
+                    self._faiss_pq_active = isinstance(self.faiss_index, faiss.IndexIVFPQ)
+                except Exception:
+                    self._faiss_pq_active = False
                 self._faiss_dirty = False
             except Exception:
                 self.faiss_index = None

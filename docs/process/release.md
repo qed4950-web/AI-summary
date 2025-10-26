@@ -2,7 +2,7 @@
 
 ## 빠른 점검 목록
 - `scripts/setup_env.sh` 또는 `scripts/dev/setup_env.sh`로 가상환경과 의존성을 재정비합니다.
-- 스테이징 데이터로 `infopilot.py scan`, `train`, `chat`, `watch` 스모크 테스트를 전부 실행합니다.
+- 스테이징 데이터로 `infopilot.py pipeline all`을 돌려 증분 파이프라인과 자동 학습이 정상 동작하는지 확인하고, 필요한 경우 `infopilot.py run scan/train/chat/watch`를 각각 재실행합니다.
 - `python scripts/util/release_prepare.py --print`으로 KPI JSON과 메트릭 스냅샷이 정상 생성되는지 확인합니다.
 - 회의/사진 에이전트 파이프라인을 각각 한 번씩 돌려 `summary.json`, `photo_report.json` 등 산출물을 검증합니다.
 - 데스크톱 배포가 필요하면 `scripts/build_desktop_ui.ps1`(Windows) 또는 `python scripts/launch_desktop.py --bundle`과 같은 PyInstaller 플로우로 새 실행 파일을 만들고, 버전 태그와 함께 업로드합니다.

@@ -17,7 +17,7 @@ export PHOTO_OUTPUT_DIR="$PWD/data/photo_outputs"
 
 ## 3. CLI 실행 예시
 
-`infopilot.py chat` 모드에서 사진 비서를 호출하려면 follow-up 프롬프트에 경로를 입력하면 됩니다.  
+`infopilot.py run chat` 모드에서 사진 비서를 호출하려면 follow-up 프롬프트에 경로를 입력하면 됩니다.  
 단독으로 실행하고 싶다면 아래 스니펫을 사용하세요.
 
 ```bash

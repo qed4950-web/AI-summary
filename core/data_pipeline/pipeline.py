@@ -8,13 +8,23 @@ import re
 import sys
 import threading
 import time
+import hashlib
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Optional, Dict, Any, List, Tuple, Union, Set
 
 from core.data_pipeline.custom_metadata import get_metadata_for_path
+from core.data_pipeline.cache_manager import ChunkCache
+from core.data_pipeline.incremental import (
+    load_scan_state,
+    filter_incremental_rows,
+    update_scan_state,
+    save_scan_state,
+)
+from core.data_pipeline.embedder import AsyncSentenceEmbedder
+from core.data_pipeline.evaluate import evaluate_embeddings
 
 import numpy as np
 
@@ -196,7 +206,23 @@ MODEL_TYPE_SENTENCE_TRANSFORMER = "sentence-transformer"
 DEFAULT_CHUNK_MIN_TOKENS = 200
 DEFAULT_CHUNK_MAX_TOKENS = 500
 
+EMBED_DTYPE_ENV = "INFOPILOT_EMBED_DTYPE"
+_VALID_EMBED_DTYPES = {"auto", "fp16", "fp32"}
+
+
+def _sanitize_embed_dtype(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+    normalized = str(value).strip().lower()
+    return normalized if normalized in _VALID_EMBED_DTYPES else None
+
 _TOKEN_REGEX = re.compile(TOKEN_PATTERN)
+
+
+def _hash_text(text: str) -> str:
+    if not text:
+        return ""
+    return hashlib.sha1(text.encode("utf-8", "ignore")).hexdigest()
 
 _EN_STOPWORDS: Set[str] = {
     "the", "and", "for", "that", "with", "from", "this", "have", "been", "were",
@@ -382,6 +408,8 @@ def _apply_uniform_chunks(
             new_rec["text"] = _remove_stopwords(base_text)
             new_rec["text_original"] = preview_source
             new_rec["preview"] = str(preview_source).strip()[:360]
+            new_rec["doc_hash"] = record.get("doc_hash", "")
+            new_rec["content_hash"] = _hash_text(new_rec["text"])
             chunked.append(new_rec)
             continue
 
@@ -407,6 +435,8 @@ def _apply_uniform_chunks(
                 orig_chunk = chunk_slice
             new_rec["text_original"] = orig_chunk
             new_rec["preview"] = (orig_chunk or chunk_slice).strip()[:360]
+            new_rec["doc_hash"] = record.get("doc_hash", "")
+            new_rec["content_hash"] = _hash_text(filtered_chunk or chunk_slice)
 
             chunked.append(new_rec)
 
@@ -917,6 +947,7 @@ class ExtractRecord:
     mtime: Optional[float] = None
     ctime: Optional[float] = None
     owner: Optional[str] = None
+    doc_hash: str = ""
 
 class CorpusBuilder:
     MAX_TRANSLATE_CHARS = 4000
@@ -927,10 +958,12 @@ class CorpusBuilder:
         progress: bool = True,
         translate: bool = False,
         max_workers: Optional[int] = None,
+        target_embed_dtype: str = "auto",
     ):
         self.max_text_chars = max_text_chars
         self.progress = progress
         self.translate = translate
+        self.target_embed_dtype = _sanitize_embed_dtype(target_embed_dtype) or "auto"
         self.translator = None
         if translate:
             if GoogleTranslator is None:
@@ -955,7 +988,9 @@ class CorpusBuilder:
         total = len(file_rows)
         if total == 0:
             print("ℹ️ 신규/변경 문서가 없어 추출을 건너뜁니다.", flush=True)
-            return pd.DataFrame(columns=list(ExtractRecord.__annotations__.keys()))
+            empty = pd.DataFrame(columns=list(ExtractRecord.__annotations__.keys()))
+            empty.attrs["target_embed_dtype"] = self.target_embed_dtype
+            return empty
 
         use_tqdm = self.progress and tqdm is not None
         desc = "📥 Extract & Translate" if self.translate else "📥 Extract"
@@ -998,6 +1033,7 @@ class CorpusBuilder:
 
         records = [r.__dict__ for r in recs if r is not None]
         df = pd.DataFrame(records)
+        df.attrs["target_embed_dtype"] = self.target_embed_dtype
         _prepare_text_frame(df)
         ok = int(df["ok"].sum()) if len(df) > 0 else 0
         fail = int((~df["ok"]).sum()) if len(df) > 0 else 0
@@ -1028,6 +1064,7 @@ class CorpusBuilder:
             text_for_model = original_text
             if self.translator and original_text.strip():
                 text_for_model = self._translate_text(original_text, context=path.name)
+            doc_hash = _hash_text(original_text)
 
             return ExtractRecord(
                 str(path),
@@ -1040,6 +1077,7 @@ class CorpusBuilder:
                 row.get("mtime"),
                 row.get("ctime"),
                 row.get("owner"),
+                doc_hash,
             )
         except Exception as e:
             return ExtractRecord(
@@ -1053,6 +1091,7 @@ class CorpusBuilder:
                 row.get("mtime"),
                 row.get("ctime"),
                 row.get("owner"),
+                "",
             )
 
     def _translate_text(self, text: str, *, context: str) -> str:
@@ -1186,27 +1225,48 @@ def _is_cache_fresh(cached: Dict[str, Any], row: Dict[str, Any]) -> bool:
 def _split_cache(
     file_rows: List[Dict[str, Any]],
     existing_df: Optional["pd.DataFrame"],
-) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-    if existing_df is None or "path" not in existing_df.columns:
-        return list(file_rows), []
+    *,
+    force_paths: Optional[Set[str]] = None,
+) -> Tuple[List[Dict[str, Any]], Optional["pd.DataFrame"]]:
+    if pd is None or existing_df is None or existing_df.empty or "path" not in existing_df.columns:
+        return list(file_rows), None
 
-    cache_map: Dict[str, Dict[str, Any]] = {}
-    for rec in existing_df.to_dict(orient="records"):
-        cache_map[rec.get("path", "")] = rec
+    meta_map: Dict[str, Dict[str, Any]] = {}
+    seen_paths: Set[str] = set()
+    for rec in existing_df[["path", "size", "mtime"]].drop_duplicates(subset=["path"]).to_dict(orient="records"):
+        key = str(rec.get("path") or "")
+        if key:
+            meta_map[key] = rec
+            seen_paths.add(key)
 
     to_process: List[Dict[str, Any]] = []
-    reused: List[Dict[str, Any]] = []
+    process_paths: Set[str] = set()
     for row in file_rows:
-        path = row.get("path")
-        cached = cache_map.get(path)
-        if cached and _is_cache_fresh(cached, row):
-            cached_copy = dict(cached)
-            cached_copy["size"] = row.get("size", cached_copy.get("size"))
-            cached_copy["mtime"] = row.get("mtime", cached_copy.get("mtime"))
-            reused.append(cached_copy)
-        else:
+        path = str(row.get("path") or "")
+        force = force_paths is not None and path in force_paths
+        cached = meta_map.get(path)
+        if force or not cached or not _is_cache_fresh(cached, row):
             to_process.append(row)
-    return to_process, reused
+            if path:
+                process_paths.add(path)
+
+    if not process_paths:
+        return to_process, existing_df.copy()
+
+    mask = ~existing_df["path"].astype(str).isin(process_paths)
+    remainder = existing_df[mask].copy()
+    return to_process, remainder
+
+
+def _collect_existing_rows(
+    existing_df: Optional["pd.DataFrame"],
+    target_paths: Set[str],
+) -> Optional["pd.DataFrame"]:
+    if pd is None or existing_df is None or existing_df.empty or not target_paths:
+        return None
+    mask = existing_df["path"].astype(str).isin({str(p) for p in target_paths})
+    subset = existing_df[mask].copy()
+    return subset if not subset.empty else None
 
 
 # =========================
@@ -1223,6 +1283,21 @@ class TrainConfig:
     use_sentence_transformer: bool = True
     embedding_model: str = DEFAULT_EMBED_MODEL
     embedding_batch_size: int = 32
+    async_embeddings: bool = True
+    embedding_concurrency: int = 1
+    embedding_dtype: str = "auto"
+
+
+def _resolve_embed_dtype(cfg: TrainConfig) -> str:
+    env_raw = os.getenv(EMBED_DTYPE_ENV)
+    env_value = _sanitize_embed_dtype(env_raw)
+    if env_raw:
+        if env_value is not None:
+            print(f"⚙️ 임베딩 dtype 설정: {env_value} ({EMBED_DTYPE_ENV})", flush=True)
+            return env_value
+        print(f"⚠️ {EMBED_DTYPE_ENV}={env_raw!r} 값이 잘못되어 auto 모드로 유지합니다.", flush=True)
+    cfg_value = _sanitize_embed_dtype(getattr(cfg, "embedding_dtype", None))
+    return cfg_value or "auto"
 
 class TopicModel:
     def __init__(self, cfg:TrainConfig):
@@ -1299,13 +1374,54 @@ class SentenceBertModel:
             else:
                 raise
         self.embedding_dim = int(self._encoder.get_sentence_embedding_dimension())
+        self._target_dtype = (cfg.embedding_dtype or "auto").strip().lower()
+        self._np_dtype = np.float16 if self._should_use_fp16() else np.float32
         self.cluster_model: Optional[MiniBatchKMeans] = None
         self.cluster_labels_: Optional[np.ndarray] = None
         self._kmeans_n_init = _resolve_kmeans_n_init()
+        self._async_enabled = bool(getattr(self.cfg, "async_embeddings", False))
+        self._async_threshold = max(512, int(self.cfg.embedding_batch_size) * 4)
+        self._async_embedder = (
+            AsyncSentenceEmbedder(
+                self._encoder,
+                batch_size=max(1, int(self.cfg.embedding_batch_size)),
+                concurrency=max(1, int(getattr(self.cfg, "embedding_concurrency", 1))),
+                target_dtype=self._target_dtype,
+                device=self._encoder_device(),
+            )
+            if self._async_enabled
+            else None
+        )
+
+    def _encoder_device(self) -> Optional[str]:
+        device = getattr(self._encoder, "device", None)
+        if device is None:
+            device = getattr(self._encoder, "_target_device", None)
+        if device is None:
+            return None
+        return str(device)
+
+    def _should_use_fp16(self) -> bool:
+        if self._target_dtype == "fp16":
+            return True
+        if self._target_dtype == "fp32":
+            return False
+        device = self._encoder_device()
+        return bool(device and device.startswith("cuda"))
 
     def encode(self, texts: List[str], *, show_progress: bool = False) -> np.ndarray:
         if not texts:
             return np.zeros((0, self.embedding_dim), dtype=np.float32)
+        use_async = (
+            self._async_enabled
+            and self._async_embedder is not None
+            and len(texts) >= self._async_threshold
+        )
+        if use_async:
+            try:
+                return self._async_embedder.encode(texts)
+            except Exception as exc:
+                print(f"⚠️ Async 임베딩 실패 → 동기 모드로 재시도합니다: {exc}", flush=True)
         embeddings = self._encoder.encode(
             texts,
             batch_size=max(1, int(self.cfg.embedding_batch_size)),
@@ -1315,7 +1431,10 @@ class SentenceBertModel:
         )
         if isinstance(embeddings, list):
             embeddings = np.asarray(embeddings, dtype=np.float32)
-        return np.asarray(embeddings, dtype=np.float32)
+        embeddings = np.asarray(embeddings, dtype=np.float32)
+        if embeddings.dtype != self._np_dtype:
+            embeddings = embeddings.astype(self._np_dtype, copy=False)
+        return embeddings
 
     def fit(self, df, text_col: str = "text") -> np.ndarray:
         texts = (df[text_col].fillna("").astype(str)).tolist()
@@ -1375,79 +1494,137 @@ class SentenceBertModel:
 # =========================
 # 파이프라인 실행 (메인 함수)
 # =========================
-def run_step2(file_rows:List[Dict[str,Any]],
-              out_corpus:Path=Path("./corpus.parquet"),
-              out_model:Path=Path("./topic_model.joblib"),
-              cfg:TrainConfig=TrainConfig(),
-              use_tqdm:bool=True,
-              translate:bool=False):
+
+def run_step2(
+    file_rows: List[Dict[str, Any]],
+    out_corpus: Path = Path("./corpus.parquet"),
+    out_model: Path = Path("./topic_model.joblib"),
+    cfg: TrainConfig = TrainConfig(),
+    use_tqdm: bool = True,
+    translate: bool = False,
+    *,
+    scan_state_path: Optional[Path] = None,
+    chunk_cache_path: Optional[Path] = None,
+):
     global tqdm
     original_tqdm = tqdm
     if not use_tqdm:
-        tqdm=None
+        tqdm = None
+
+    if cfg is None:
+        cfg = TrainConfig()
+    else:
+        cfg = replace(cfg)
+
+    target_embed_dtype = _resolve_embed_dtype(cfg)
+    cfg.embedding_dtype = target_embed_dtype
+
+    chunk_cache = ChunkCache(chunk_cache_path) if chunk_cache_path else None
+    scan_state = load_scan_state(scan_state_path) if scan_state_path else None
 
     try:
         print("=== Step 2 시작: 내용 추출 & 학습 === (번역: " + ("활성" if translate else "비활성") + ")", flush=True)
-        t_all=time.time()
+        t_all = time.time()
         if pd is None:
             raise RuntimeError("pandas 필요")
 
-        existing_df = _load_existing_corpus(out_corpus)
-        to_process, reused_records = _split_cache(file_rows, existing_df)
-
-        reused_count = len(reused_records)
-        process_count = len(to_process)
         total_count = len(file_rows)
-        if total_count:
-            print(
-                f"🗃️ 캐시 재사용: {reused_count:,} | 신규/변경 추출: {process_count:,} | 총합: {total_count:,}",
-                flush=True,
-            )
-        else:
-            print("📂 처리할 파일이 없습니다.", flush=True)
+        cached_by_state = 0
+        force_paths: Optional[Set[str]] = None
+        if scan_state_path and scan_state is not None:
+            forced_rows, cached_rows = filter_incremental_rows(file_rows, scan_state)
+            force_paths = {str(row.get("path") or "") for row in forced_rows if row.get("path")}
+            cached_by_state = len(cached_rows)
+            if force_paths:
+                print(
+                    f"⚙️ 증분 상태: {len(force_paths):,}건 재처리, 캐시 일치 {cached_by_state:,}건",
+                    flush=True,
+                )
+            else:
+                print("⚙️ 증분 상태: 신규 변경 없음", flush=True)
 
-        if process_count == 0 and reused_count == total_count and total_count > 0:
-            df = pd.DataFrame(reused_records)
-            df = _apply_uniform_chunks(
-                df,
-                min_tokens=DEFAULT_CHUNK_MIN_TOKENS,
-                max_tokens=DEFAULT_CHUNK_MAX_TOKENS,
-            )
+        existing_df = _load_existing_corpus(out_corpus)
+        to_process, reused_df = _split_cache(file_rows, existing_df, force_paths=force_paths)
+        process_paths = {str(row.get("path") or "") for row in to_process if row.get("path")}
+        process_count = len(process_paths)
+        print(
+            f"🗃️ 신규/변경 추출 대상: {process_count:,} | 총 스캔: {total_count:,}",
+            flush=True,
+        )
+
+        if process_count == 0:
+            if reused_df is not None:
+                df = reused_df.copy()
+            elif existing_df is not None:
+                df = existing_df.copy()
+            else:
+                df = pd.DataFrame(columns=list(ExtractRecord.__annotations__.keys()))
             _prepare_text_frame(df)
-            order_map = {row["path"]: idx for idx, row in enumerate(file_rows)}
-            if "path" in df.columns:
+            order_map = {row["path"]: idx for idx, row in enumerate(file_rows)} if file_rows else {}
+            if "path" in df.columns and order_map:
                 df["_order"] = df["path"].map(order_map)
                 df = df.sort_values("_order").drop(columns=["_order"]).reset_index(drop=True)
             CorpusBuilder.save(df, out_corpus)
-            if out_model.exists():
-                try:
-                    os.utime(out_model, None)
-                except OSError:
-                    pass
+            if chunk_cache:
+                chunk_cache.update_from_frame(df)
+                chunk_cache.save()
+            if scan_state_path:
+                updated_state = update_scan_state(scan_state or {}, file_rows)
+                save_scan_state(scan_state_path, updated_state)
+            df.attrs["metrics"] = {}
+            df.attrs["incremental"] = {
+                "requested": process_count,
+                "effective": 0,
+                "skipped_by_state": cached_by_state,
+                "total": total_count,
+            }
+            df.attrs["target_embed_dtype"] = target_embed_dtype
             print("✨ 변경된 문서가 없어 기존 모델을 유지합니다.", flush=True)
             return df, None
 
-        cb = CorpusBuilder(max_text_chars=200_000, progress=use_tqdm, translate=translate)
+        cb = CorpusBuilder(
+            max_text_chars=200_000,
+            progress=use_tqdm,
+            translate=translate,
+            target_embed_dtype=target_embed_dtype,
+        )
         df_new = cb.build(to_process) if process_count else pd.DataFrame(columns=list(ExtractRecord.__annotations__.keys()))
 
+        restored_df = None
+        unchanged_paths: Set[str] = set()
+        if chunk_cache and df_new is not None and not df_new.empty:
+            unchanged_paths = chunk_cache.unchanged_paths(df_new)
+            if unchanged_paths:
+                print(f"♻️ 내용 해시 동일 문서 재사용: {len(unchanged_paths):,}", flush=True)
+                if existing_df is not None:
+                    restored_df = _collect_existing_rows(existing_df, unchanged_paths)
+                df_new = df_new[~df_new["path"].isin(list(unchanged_paths))]
+
+        df_new_chunks = (
+            _apply_uniform_chunks(
+                df_new,
+                min_tokens=DEFAULT_CHUNK_MIN_TOKENS,
+                max_tokens=DEFAULT_CHUNK_MAX_TOKENS,
+            )
+            if df_new is not None and not df_new.empty
+            else pd.DataFrame(columns=list(df_new.columns) if df_new is not None else list(ExtractRecord.__annotations__.keys()))
+        )
+        if hasattr(df_new_chunks, "attrs"):
+            df_new_chunks.attrs["target_embed_dtype"] = target_embed_dtype
+
         frames: List["pd.DataFrame"] = []
-        if reused_count:
-            frames.append(pd.DataFrame(reused_records))
-        if not df_new.empty:
-            frames.append(df_new)
+        if reused_df is not None and not reused_df.empty:
+            frames.append(reused_df)
+        if restored_df is not None and not restored_df.empty:
+            frames.append(restored_df)
+        if df_new_chunks is not None and not df_new_chunks.empty:
+            frames.append(df_new_chunks)
+
         if frames:
             df = pd.concat(frames, ignore_index=True)
         else:
             df = pd.DataFrame(columns=list(ExtractRecord.__annotations__.keys()))
 
-        if pd is None:
-            raise RuntimeError("pandas 필요")
-
-        df = _apply_uniform_chunks(
-            df,
-            min_tokens=DEFAULT_CHUNK_MIN_TOKENS,
-            max_tokens=DEFAULT_CHUNK_MAX_TOKENS,
-        )
         _prepare_text_frame(df)
 
         order_map = {row["path"]: idx for idx, row in enumerate(file_rows)} if file_rows else {}
@@ -1468,11 +1645,26 @@ def run_step2(file_rows:List[Dict[str,Any]],
         print(f"🧹 학습 대상 문서: {len(train_df):,}/{len(df):,}", flush=True)
         if len(train_df) == 0:
             CorpusBuilder.save(df, out_corpus)
+            if scan_state_path:
+                updated_state = update_scan_state(scan_state or {}, file_rows)
+                save_scan_state(scan_state_path, updated_state)
+            if chunk_cache:
+                chunk_cache.update_from_frame(df)
+                chunk_cache.save()
             print(f"⚠️ 유효 텍스트 없음. 코퍼스만 저장: {out_corpus}", flush=True)
+            df.attrs["metrics"] = {}
+            df.attrs["incremental"] = {
+                "requested": process_count,
+                "effective": 0,
+                "skipped_by_state": cached_by_state,
+                "total": total_count,
+            }
+            df.attrs["target_embed_dtype"] = target_embed_dtype
             return df, None
 
         topics_df = None
         model_obj: Optional[Any] = None
+        metrics: Dict[str, float] = {}
 
         if cfg.use_sentence_transformer and SentenceTransformer is not None:
             try:
@@ -1485,6 +1677,7 @@ def run_step2(file_rows:List[Dict[str,Any]],
                 if semantic_model.cluster_labels_ is not None:
                     train_df["topic"] = semantic_model.cluster_labels_
                     topics_df = train_df[["path", "topic"]].copy()
+                    metrics = evaluate_embeddings(embeddings, semantic_model.cluster_labels_, topk=min(5, max(1, embeddings.shape[0] - 1)))
                 model_obj = semantic_model
             except Exception as exc:
                 print(f"⚠️ Sentence-BERT 학습 실패로 TF-IDF 백업 경로를 사용합니다: {exc}", flush=True)
@@ -1498,6 +1691,7 @@ def run_step2(file_rows:List[Dict[str,Any]],
             train_df["topic"] = labels
             topics_df = train_df[["path", "topic"]].copy()
             model_obj = tm
+            metrics = {}
 
         if topics_df is not None:
             df = df.merge(topics_df, on="path", how="left")
@@ -1509,12 +1703,33 @@ def run_step2(file_rows:List[Dict[str,Any]],
         elif isinstance(model_obj, TopicModel) and joblib:
             model_obj.save(out_model)
 
+        if chunk_cache:
+            current_paths = set(df["path"].astype(str)) if "path" in df.columns else set()
+            missing = chunk_cache.known_paths() - current_paths
+            if missing:
+                chunk_cache.drop_paths(missing)
+            chunk_cache.update_from_frame(df)
+            chunk_cache.save()
+
+        if scan_state_path:
+            updated_state = update_scan_state(scan_state or {}, file_rows)
+            save_scan_state(scan_state_path, updated_state)
+
         dt_all = time.time() - t_all
         print(f"💾 저장 완료: corpus → {out_corpus} | model → {out_model}", flush=True)
         print(f"🎉 Step 2 종료 (총 {dt_all:.1f}s)", flush=True)
+        df.attrs["metrics"] = metrics or {}
+        df.attrs["incremental"] = {
+            "requested": process_count,
+            "effective": len(df_new_chunks["path"].unique()) if not df_new_chunks.empty else 0,
+            "skipped_by_state": cached_by_state,
+            "total": total_count,
+        }
+        df.attrs["target_embed_dtype"] = target_embed_dtype
         return df, model_obj
     finally:
         tqdm = original_tqdm
+
 
 
 def update_corpus_file(

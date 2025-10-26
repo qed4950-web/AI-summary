@@ -15,6 +15,7 @@
   const viewSmartFolders = document.getElementById("view-smart-folders");
   const viewMeetingSummary = document.getElementById("view-meeting-summary");
   const viewKnowledgeResults = document.getElementById("view-knowledge-results");
+  const viewPipeline = document.getElementById("view-pipeline");
 
   const smartFolderList = document.getElementById("smart-folder-list");
   const meetingSummaryFolder = document.getElementById("meeting-summary-folder");
@@ -23,6 +24,18 @@
   const meetingSummaryActions = document.getElementById("meeting-summary-actions");
   const knowledgeResultsFolder = document.getElementById("knowledge-results-folder");
   const knowledgeResultsList = document.getElementById("knowledge-results-list");
+  const pipelineStateBadge = document.getElementById("pipeline-state-badge");
+  const pipelineStageText = document.getElementById("pipeline-stage-text");
+  const pipelineForm = document.getElementById("pipeline-run-form");
+  const pipelineBaseInput = document.getElementById("pipeline-api-base");
+  const pipelineRootInput = document.getElementById("pipeline-root-input");
+  const pipelineExtsInput = document.getElementById("pipeline-exts-input");
+  const pipelineLimitInput = document.getElementById("pipeline-limit-input");
+  const pipelinePrefectToggle = document.getElementById("pipeline-prefect-toggle");
+  const pipelineRefreshBtn = document.getElementById("pipeline-refresh-btn");
+  const pipelineCancelBtn = document.getElementById("pipeline-cancel-btn");
+  const pipelineHistoryList = document.getElementById("pipeline-history");
+  const statusBubble = document.getElementById("toolbar-status");
 
   if (!toolbar || !panelLayer || !panel) {
     return;
@@ -33,21 +46,22 @@
   let micActive = false;
   let statusTimer = null;
   let activeView = "placeholder";
+  let pipelinePollInterval = null;
+  let latestPipelineStatus = null;
 
   const clamp = (value, min, max) => Math.min(Math.max(value, min), max);
 
   const showStatus = (message) => {
-    const status = toolbar.querySelector(".status");
-    if (!status) {
+    if (!statusBubble) {
       return;
     }
-    status.textContent = message;
-    status.classList.add("show");
+    statusBubble.textContent = message;
+    statusBubble.classList.add("show");
     if (statusTimer) {
       clearTimeout(statusTimer);
     }
     statusTimer = setTimeout(() => {
-      status.classList.remove("show");
+      statusBubble.classList.remove("show");
     }, 2200);
   };
 
@@ -59,6 +73,7 @@
       panel.classList.add("is-visible");
       panelLayer.setAttribute("aria-hidden", "false");
     } else {
+      stopPipelinePolling();
       panel.classList.remove("is-visible");
       panelLayer.setAttribute("aria-hidden", "true");
       setTimeout(() => {
@@ -75,12 +90,16 @@
     viewSmartFolders.hidden = view !== "smart-folders";
     viewMeetingSummary.hidden = view !== "meeting-summary";
     viewKnowledgeResults.hidden = view !== "knowledge-results";
+    if (viewPipeline) {
+      viewPipeline.hidden = view !== "pipeline";
+    }
 
     const viewTitleMap = {
       placeholder: "Liquid Glass 패널",
       "smart-folders": "스마트 폴더",
       "meeting-summary": "회의 요약",
       "knowledge-results": "지식 검색 결과",
+      pipeline: "자동화 파이프라인",
     };
 
     const viewSubtitleMap = {
@@ -88,10 +107,18 @@
       "smart-folders": "검색과 요약 범위를 선택하세요.",
       "meeting-summary": "AI가 생성한 회의 요약",
       "knowledge-results": "선택한 범위에서 찾은 결과",
+      pipeline: "Prefect/FastAPI 파이프라인을 제어합니다.",
     };
 
     panelTitle.textContent = title || viewTitleMap[view] || "패널";
     panelSubtitle.textContent = subtitle || viewSubtitleMap[view] || "";
+
+    if (view === "pipeline") {
+      syncPipelineStatus();
+      startPipelinePolling();
+    } else if (view !== "pipeline") {
+      stopPipelinePolling();
+    }
 
     viewButtons.forEach((button) => {
       const matches = button.dataset.view === view;
@@ -126,6 +153,9 @@
     selectedFolder = folder;
     highlightSmartFolders();
     updatePlaceholder();
+    if (pipelineRootInput && !pipelineRootInput.value) {
+      pipelineRootInput.placeholder = folder?.path || folder?.rawPath || pipelineRootInput.placeholder;
+    }
   };
 
   const renderSmartFolders = (folders) => {
@@ -312,6 +342,111 @@
     });
   };
 
+  const parseExtensions = (raw) =>
+    (raw || "")
+      .split(",")
+      .map((token) => token.trim().toLowerCase())
+      .filter(Boolean)
+      .map((ext) => (ext.startsWith(".") ? ext : `.${ext}`));
+
+  const formatTimestamp = (value) => {
+    if (!value) {
+      return "-";
+    }
+    if (typeof value === "number") {
+      const ms = value > 1e12 ? value : value * 1000;
+      return new Date(ms).toLocaleTimeString();
+    }
+    const date = new Date(value);
+    if (!Number.isNaN(date.getTime())) {
+      return date.toLocaleTimeString();
+    }
+    return "-";
+  };
+
+  const renderPipelineHistory = (history) => {
+    if (!pipelineHistoryList) {
+      return;
+    }
+    pipelineHistoryList.innerHTML = "";
+    const items = Array.isArray(history) ? history.slice(-6).reverse() : [];
+    if (!items.length) {
+      const li = document.createElement("li");
+      li.textContent = "최근 단계 기록이 없습니다.";
+      pipelineHistoryList.appendChild(li);
+      return;
+    }
+    items.forEach((item) => {
+      const li = document.createElement("li");
+      const title = document.createElement("strong");
+      title.textContent = `${(item.stage || "stage").toUpperCase()} · ${item.status || "unknown"}`;
+      const meta = document.createElement("span");
+      const parts = [formatTimestamp(item.timestamp)];
+      if (item.error) {
+        parts.push(item.error);
+      } else if (item.details && Object.keys(item.details).length) {
+        parts.push(
+          Object.entries(item.details)
+            .map(([key, value]) => `${key}=${value}`)
+            .slice(0, 3)
+            .join(", ")
+        );
+      }
+      meta.textContent = parts.filter(Boolean).join(" · ");
+      li.appendChild(title);
+      li.appendChild(meta);
+      pipelineHistoryList.appendChild(li);
+    });
+  };
+
+  const renderPipelineStatus = (payload) => {
+    if (!pipelineStateBadge || !pipelineStageText) {
+      return;
+    }
+    const state = (payload?.state || "idle").toUpperCase();
+    pipelineStateBadge.textContent = state;
+    pipelineStageText.textContent = payload?.stage
+      ? `현재 단계: ${payload.stage}`
+      : "파이프라인이 대기 중입니다.";
+    renderPipelineHistory(payload?.history);
+  };
+
+  const syncPipelineStatus = async (showToast = false) => {
+    if (!window.toolbarAPI?.pipeline?.status) {
+      return;
+    }
+    try {
+      const baseUrl = pipelineBaseInput?.value?.trim();
+      const response = await window.toolbarAPI.pipeline.status(baseUrl);
+      if (response?.ok) {
+        latestPipelineStatus = response.data;
+        renderPipelineStatus(response.data);
+        if (showToast) {
+          showStatus("파이프라인 상태를 새로고침했습니다.");
+        }
+      } else if (response?.error) {
+        showStatus(response.error);
+      }
+    } catch (err) {
+      console.error("[Pipeline] status error", err);
+      showStatus("파이프라인 상태를 불러올 수 없습니다.");
+    }
+  };
+
+  const startPipelinePolling = () => {
+    stopPipelinePolling();
+    pipelinePollInterval = setInterval(() => {
+      syncPipelineStatus();
+    }, 6000);
+  };
+
+  const stopPipelinePolling = () => {
+    if (pipelinePollInterval) {
+      clearInterval(pipelinePollInterval);
+      pipelinePollInterval = null;
+    }
+  };
+
   const handleKnowledgeListClick = (event) => {
     const target = event.target instanceof HTMLElement ? event.target : null;
     if (!target) {
@@ -496,6 +631,64 @@
   });
 
   knowledgeResultsList?.addEventListener("click", handleKnowledgeListClick);
+
+  pipelineRefreshBtn?.addEventListener("click", () => {
+    syncPipelineStatus(true);
+  });
+
+  pipelineCancelBtn?.addEventListener("click", () => {
+    if (!window.toolbarAPI?.pipeline?.cancel) {
+      showStatus("파이프라인 API를 사용할 수 없습니다.");
+      return;
+    }
+    const baseUrl = pipelineBaseInput?.value?.trim();
+    window.toolbarAPI.pipeline
+      .cancel(baseUrl)
+      .then((response) => {
+        if (response?.ok) {
+          showStatus("파이프라인 취소를 요청했습니다.");
+          syncPipelineStatus();
+        } else {
+          showStatus(response?.error || "취소 요청에 실패했습니다.");
+        }
+      })
+      .catch((err) => {
+        console.error("[Pipeline] cancel error", err);
+        showStatus("취소 요청에 실패했습니다.");
+      });
+  });
+
+  pipelineForm?.addEventListener("submit", (event) => {
+    event.preventDefault();
+    if (!window.toolbarAPI?.pipeline?.run) {
+      showStatus("파이프라인 API를 사용할 수 없습니다.");
+      return;
+    }
+    const baseUrl = pipelineBaseInput?.value?.trim();
+    const preferredRoot = pipelineRootInput?.value?.trim() || selectedFolder?.path || "";
+    const exts = parseExtensions(pipelineExtsInput?.value || "");
+    const limit = Math.max(0, Number(pipelineLimitInput?.value || 0) || 0);
+    const payload = {
+      roots: preferredRoot ? [preferredRoot] : [],
+      exts,
+      limit_files: limit,
+      use_prefect: Boolean(pipelinePrefectToggle?.checked),
+    };
+    showStatus("파이프라인 실행을 요청했습니다.");
+    window.toolbarAPI.pipeline
+      .run(baseUrl, payload)
+      .then((response) => {
+        if (response?.ok) {
+          syncPipelineStatus();
+        } else {
+          showStatus(response?.error || "파이프라인 실행에 실패했습니다.");
+        }
+      })
+      .catch((err) => {
+        console.error("[Pipeline] run error", err);
+        showStatus("파이프라인 실행에 실패했습니다.");
+      });
+  });
 
   window.addEventListener("keydown", (event) => {
     if (event.key === "Escape" && panelLayer.classList.contains("is-visible")) {

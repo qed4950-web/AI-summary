@@ -107,7 +107,7 @@ class LNPChat:
     rerank_batch_size: int = 16
     rerank_device: Optional[str] = None
     rerank_min_score: Optional[float] = 0.35
-    lexical_weight: float = 0.0
+    lexical_weight: float = 0.2
     show_translation: bool = False
     translation_lang: str = "en"
     min_similarity: float = 0.35
@@ -315,7 +315,7 @@ class LNPChat:
                 self.index_reasons.append(f"index_cache 확인 실패: {exc}")
                 cache_hint_added = True
 
-        self.index_reasons.append("python infopilot.py pipeline --out data/found_files.csv 로 scan/train을 다시 실행해보세요.")
+        self.index_reasons.append("python infopilot.py pipeline all --out data/found_files.csv 로 scan/train을 다시 실행해보세요.")
         if cache_hint_added:
             self.index_reasons.append("파이프라인 완료 후 --cache 옵션을 chat 명령과 동일하게 지정했는지 확인해주세요.")
 

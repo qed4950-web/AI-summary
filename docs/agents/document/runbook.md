@@ -1,6 +1,6 @@
 # 문서 비서 실행 방법 (Runbook)
 
-문서 비서는 `infopilot.py chat` 또는 `scripts/run_knowledge_agent.py`를 통해 구동됩니다. 실행 전 필수 자원과 정책 구성을 확인하세요.
+문서 비서는 `infopilot.py run chat` 또는 `scripts/run_knowledge_agent.py`를 통해 구동됩니다. 실행 전 필수 자원과 정책 구성을 확인하세요.
 
 ## 1. 필수 자원 확인
 
@@ -9,7 +9,7 @@ ls data/topic_model.joblib
 ls data/corpus.parquet
 ```
 
-두 파일이 없으면 `infopilot.py scan` → `infopilot.py train` 순서로 데이터를 준비해야 합니다.  
+두 파일이 없으면 `infopilot.py pipeline all` 또는 `infopilot.py run scan` → `infopilot.py run train` 순서로 데이터를 준비해야 합니다. 파이프라인 실행 시 `--state-file data/scan_state.json --chunk-cache data/cache/chunk_cache.json`을 지정하면 증분 학습이 자동 활성화됩니다.  
 캐시 디렉터리(`data/cache/`)는 실행 중 자동 생성됩니다.
 
 ## 2. 환경 변수
@@ -27,7 +27,7 @@ export LNPCHAT_LLM_HOST=127.0.0.1:11434  # 기본값이면 생략 가능
 ## 3. CLI 실행
 
 ```bash
-python infopilot.py chat \
+python infopilot.py run chat \
   --model data/topic_model.joblib \
   --corpus data/corpus.parquet \
   --cache data/cache \
@@ -52,6 +52,6 @@ python scripts/run_knowledge_agent.py \
 
 ## 4. 트러블슈팅
 
-- **모델/코퍼스 누락**: 위 명령으로 존재 여부를 먼저 확인한 뒤, `docs/agents/document/architecture.md`의 “주석 사항”을 참고해 재학습을 수행합니다.
+- **모델/코퍼스 누락**: 위 명령으로 존재 여부를 먼저 확인한 뒤, `infopilot.py pipeline all`을 다시 실행해 재학습을 수행합니다.
 - **LLM 연결 실패**: `docs/guides/local_llm.md`의 헬스체크 절차로 로컬 LLM 상태를 확인하거나, 원격 API 키를 `.env`에 설정하세요.
 - **정책 미적용**: 정책 JSON이 유효한지 `PolicyEngine.from_file` 로더에서 에러가 발생하는지 확인합니다.
