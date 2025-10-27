@@ -11,6 +11,8 @@ build/
 # Data & models (runtime artifacts)
 data/
 models/
+data/corpus.parquet
+data/topic_model.joblib
 *.parquet
 *.joblib
 *.safetensors
