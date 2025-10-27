@@ -5,7 +5,8 @@
 param(
     [string]$Python = "python",
     [string]$OutputName = "InfoPilotDesktop",
-    [switch]$CreateZip
+    [switch]$CreateZip,
+    [string]$SignCommand = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -41,7 +42,14 @@ $cmd = @(
 Write-Host "   Command : $($cmd -join ' ')"
 & $cmd[0] $cmd[1..($cmd.Length-1)]
 
-Write-Host "✅ 빌드가 완료되었습니다. dist\\$OutputName\\$OutputName.exe 파일을 확인하세요." -ForegroundColor Green
+$exePath = Join-Path $repoRoot "dist" | Join-Path -ChildPath $OutputName | Join-Path -ChildPath ("$OutputName.exe")
+if ($SignCommand) {
+    $expanded = $SignCommand.Replace("{file}", $exePath)
+    Write-Host "🖊️ 코드 서명 실행: $expanded" -ForegroundColor Cyan
+    Invoke-Expression $expanded
+}
+
+Write-Host "✅ 빌드가 완료되었습니다. dist\$OutputName\$OutputName.exe 파일을 확인하세요." -ForegroundColor Green
 
 if ($CreateZip) {
     $distPath = Join-Path $repoRoot "dist" | Join-Path -ChildPath $OutputName

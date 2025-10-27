@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import threading
 import time
 from pathlib import Path
@@ -12,7 +13,7 @@ repo_root = Path(__file__).resolve().parents[1]
 if str(repo_root) not in sys.path:
     sys.path.insert(0, str(repo_root))
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
 
 from core.config.paths import CACHE_DIR, CORPUS_PATH, TOPIC_MODEL_PATH
@@ -228,6 +229,14 @@ app = FastAPI(
 )
 
 RUNNER = PipelineRunner()
+API_TOKEN = os.getenv("INFOPILOT_API_TOKEN", "").strip()
+
+
+def require_token(header_token: str = Header(default="", alias="X-API-Token")) -> None:
+    if not API_TOKEN:
+        return
+    if header_token != API_TOKEN:
+        raise HTTPException(status_code=401, detail="invalid or missing API token")
 
 
 @app.get("/health")
@@ -238,12 +247,12 @@ def health() -> Dict[str, Any]:
     }
 
 
-@app.get("/pipeline/status")
+@app.get("/pipeline/status", dependencies=[Depends(require_token)])
 def pipeline_status() -> Dict[str, Any]:
     return RUNNER.status()
 
 
-@app.post("/pipeline/run")
+@app.post("/pipeline/run", dependencies=[Depends(require_token)])
 def pipeline_run(body: PipelineRunRequest) -> Dict[str, Any]:
     config = body.to_config()
     try:
@@ -253,7 +262,7 @@ def pipeline_run(body: PipelineRunRequest) -> Dict[str, Any]:
     return {"message": "pipeline started", "status": status}
 
 
-@app.post("/pipeline/cancel", response_model=CancelResponse)
+@app.post("/pipeline/cancel", response_model=CancelResponse, dependencies=[Depends(require_token)])
 def pipeline_cancel() -> CancelResponse:
     try:
         status = RUNNER.cancel()

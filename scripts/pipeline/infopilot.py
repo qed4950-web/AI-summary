@@ -109,6 +109,13 @@ _POLICY_CACHE: Dict[Path, PolicyEngine] = {}
 _SENTENCE_ENCODER_MANAGER: Optional[ModelManager] = None
 
 
+def _require_pandas() -> None:
+    if pd is None:
+        raise click.ClickException(
+            "pandas 라이브러리가 필요합니다. `pip install pandas` 또는 `bash scripts/setup_env.sh` 후 다시 시도하세요."
+        )
+
+
 def _load_agent_history() -> Dict[str, List[str]]:
     try:
         payload = json.loads(HISTORY_PATH.read_text(encoding="utf-8"))
@@ -1807,10 +1814,128 @@ def drift_group() -> None:
     pass
 
 
+def _perform_drift_check(
+    ctx: click.Context,
+    *,
+    run_name: str,
+    scan_csv: str,
+    corpus: str,
+    cache_dir: str,
+    semantic_baseline: str,
+    semantic_threshold: float,
+    log_path: str,
+    alert_threshold: float,
+):
+    _require_pandas()
+    cache_path = Path(cache_dir)
+    baseline_path = Path(semantic_baseline) if semantic_baseline else None
+    with _command_session(ctx, run_name) as session:
+        report = check_drift(
+            Path(scan_csv),
+            Path(corpus),
+            cache_dir=cache_path,
+            log_path=Path(log_path),
+            alert_threshold=alert_threshold,
+            semantic_baseline=baseline_path,
+            semantic_threshold=semantic_threshold,
+        )
+        if session:
+            session.log_metrics(
+                {
+                    "hash_drift_ratio": report.hash_drift_ratio,
+                    "semantic_shift": report.semantic_shift,
+                    "new_files": float(len(report.new_files)),
+                    "changed_files": float(len(report.changed_files)),
+                    "missing_files": float(len(report.missing_files)),
+                }
+            )
+    return report
+
+
+def _print_drift_report(report, semantic_threshold: float) -> None:
+    click.echo(f"📈 hash drift ratio={report.hash_drift_ratio:.3f} (scan={report.scan_rows}, corpus={report.corpus_rows})")
+    if report.new_files:
+        click.echo(f"➕ 신규 문서 {len(report.new_files)}건 (상위 5개):")
+        for path in report.new_files[:5]:
+            click.echo(f"   + {path}")
+    if report.changed_files:
+        click.echo(f"🌀 변경 감지 {len(report.changed_files)}건 (상위 5개):")
+        for path in report.changed_files[:5]:
+            click.echo(f"   * {path}")
+    if report.missing_files:
+        click.echo(f"➖ 누락 문서 {len(report.missing_files)}건 (상위 5개):")
+        for path in report.missing_files[:5]:
+            click.echo(f"   - {path}")
+    click.echo(
+        f"🎯 semantic shift={report.semantic_shift:.3f} (threshold={semantic_threshold:.2f}, sample={report.semantic_sample_size})"
+    )
+    if report.reembed_candidates:
+        click.echo(f"🔁 재임베딩 후보 {len(report.reembed_candidates)}건 (로그에 기록)")
+    if report.recommendations:
+        click.echo(f"✅ 권장 조치: {', '.join(report.recommendations)}")
+
+
+def _auto_reembed_targets(report, *, max_candidates: int, include_changed: bool, include_new: bool) -> Set[str]:
+    ordered: List[str] = []
+    ordered.extend(report.reembed_candidates or [])
+    if include_changed:
+        ordered.extend(report.changed_files or [])
+    if include_new:
+        ordered.extend(report.new_files or [])
+    deduped: List[str] = []
+    seen: Set[str] = set()
+    for path in ordered:
+        path = str(path or "")
+        if not path or path in seen:
+            continue
+        deduped.append(path)
+        seen.add(path)
+        if max_candidates and len(deduped) >= max_candidates:
+            break
+    return set(deduped)
+
+
+def _run_reembed_pipeline(
+    ctx: click.Context,
+    paths: Set[str],
+    *,
+    scan_csv: str,
+    corpus: str,
+    cache: str,
+    model: str,
+    translate: bool,
+    policy: str,
+    run_name: str,
+) -> None:
+    encoder, batch_size, model_name = _load_sentence_encoder(Path(model))
+    if encoder is None:
+        raise click.ClickException("SentenceTransformer 모델 로드 실패로 재임베딩을 진행할 수 없습니다.")
+    policy_engine = _load_policy_engine(policy)
+    pipeline_ctx = IncrementalPipeline(
+        encoder=encoder,
+        batch_size=batch_size,
+        scan_csv=Path(scan_csv),
+        corpus_path=Path(corpus),
+        cache_dir=Path(cache),
+        translate=translate,
+        policy_engine=policy_engine,
+    )
+    with _command_session(ctx, run_name) as session:
+        pipeline_ctx.process(set(paths), set())
+        if session:
+            session.log_metrics({"reembedded": float(len(paths))})
+    click.echo(f"🔁 재임베딩 완료 ({len(paths)}건)")
+    try:
+        _get_sentence_encoder_manager().release(model_name)
+    except Exception:
+        pass
+
+
 @click.command("scan")
 @_scan_options
 @click.pass_context
 def scan_command(ctx: click.Context, out: str, roots: Tuple[str, ...], policy: str) -> None:
+    _require_pandas()
     args = SimpleNamespace(out=out, roots=list(roots) if roots else None, policy=policy)
     with _command_session(ctx, "scan") as session:
         count = cmd_scan(args) or 0
@@ -1844,6 +1969,7 @@ def train_command(
     embedding_concurrency: int,
     async_embed: bool,
 ) -> None:
+    _require_pandas()
     args = SimpleNamespace(
         scan_csv=scan_csv,
         corpus=corpus,
@@ -1912,6 +2038,7 @@ def pipeline_command(
     embedding_concurrency: int,
     async_embed: bool,
 ) -> None:
+    _require_pandas()
     normalized = (target or "all").strip().lower()
     if normalized not in {"", "all"}:
         raise click.UsageError("지원하지 않는 파이프라인 타겟입니다 (all만 지원).")
@@ -1970,6 +2097,7 @@ def index_command(
     scope: str,
     policy: str,
 ) -> None:
+    _require_pandas()
     args = SimpleNamespace(
         model=model,
         corpus=corpus,
@@ -2258,49 +2386,18 @@ def drift_check(
     log_path: str,
     alert_threshold: float,
 ) -> None:
-    cache_path = Path(cache_dir)
-    baseline_path = Path(semantic_baseline) if semantic_baseline else None
-    with _command_session(ctx, "drift-check") as session:
-        report = check_drift(
-            Path(scan_csv),
-            Path(corpus),
-            cache_dir=cache_path,
-            log_path=Path(log_path),
-            alert_threshold=alert_threshold,
-            semantic_baseline=baseline_path,
-            semantic_threshold=semantic_threshold,
-        )
-        if session:
-            session.log_metrics(
-                {
-                    "hash_drift_ratio": report.hash_drift_ratio,
-                    "semantic_shift": report.semantic_shift,
-                    "new_files": float(len(report.new_files)),
-                    "changed_files": float(len(report.changed_files)),
-                    "missing_files": float(len(report.missing_files)),
-                }
-            )
-
-    click.echo(f"📈 hash drift ratio={report.hash_drift_ratio:.3f} (scan={report.scan_rows}, corpus={report.corpus_rows})")
-    if report.new_files:
-        click.echo(f"➕ 신규 문서 {len(report.new_files)}건 (상위 5개):")
-        for path in report.new_files[:5]:
-            click.echo(f"   + {path}")
-    if report.changed_files:
-        click.echo(f"🌀 변경 감지 {len(report.changed_files)}건 (상위 5개):")
-        for path in report.changed_files[:5]:
-            click.echo(f"   * {path}")
-    if report.missing_files:
-        click.echo(f"➖ 누락 문서 {len(report.missing_files)}건 (상위 5개):")
-        for path in report.missing_files[:5]:
-            click.echo(f"   - {path}")
-    click.echo(
-        f"🎯 semantic shift={report.semantic_shift:.3f} (threshold={semantic_threshold:.2f}, sample={report.semantic_sample_size})"
+    report = _perform_drift_check(
+        ctx,
+        run_name="drift-check",
+        scan_csv=scan_csv,
+        corpus=corpus,
+        cache_dir=cache_dir,
+        semantic_baseline=semantic_baseline,
+        semantic_threshold=semantic_threshold,
+        log_path=log_path,
+        alert_threshold=alert_threshold,
     )
-    if report.reembed_candidates:
-        click.echo(f"🔁 재임베딩 후보 {len(report.reembed_candidates)}건 (로그에 기록)")
-    if report.recommendations:
-        click.echo(f"✅ 권장 조치: {', '.join(report.recommendations)}")
+    _print_drift_report(report, semantic_threshold)
 
 
 @drift_group.command("reembed")
@@ -2341,6 +2438,7 @@ def drift_reembed(
     translate: bool,
     policy: str,
 ) -> None:
+    _require_pandas()
     candidate_paths: Set[str] = set(paths or [])
     if paths_file:
         file_lines = Path(paths_file).read_text(encoding="utf-8").splitlines()
@@ -2354,28 +2452,85 @@ def drift_reembed(
             click.echo("⚠️ 드리프트 로그에서 자동으로 선택할 문서를 찾지 못했습니다.")
     if not candidate_paths:
         raise click.UsageError("재임베딩할 경로를 --path 또는 --paths-file로 지정하세요.")
-    encoder, batch_size, model_name = _load_sentence_encoder(Path(model))
-    if encoder is None:
-        raise click.ClickException("SentenceTransformer 모델 로드 실패로 재임베딩을 진행할 수 없습니다.")
-    policy_engine = _load_policy_engine(policy)
-    pipeline_ctx = IncrementalPipeline(
-        encoder=encoder,
-        batch_size=batch_size,
-        scan_csv=Path(scan_csv),
-        corpus_path=Path(corpus),
-        cache_dir=Path(cache),
+    _run_reembed_pipeline(
+        ctx,
+        candidate_paths,
+        scan_csv=scan_csv,
+        corpus=corpus,
+        cache=cache,
+        model=model,
         translate=translate,
-        policy_engine=policy_engine,
+        policy=policy,
+        run_name="drift-reembed",
     )
-    with _command_session(ctx, "drift-reembed") as session:
-        pipeline_ctx.process(set(candidate_paths), set())
-        if session:
-            session.log_metrics({"reembedded": float(len(candidate_paths))})
-    click.echo(f"🔁 재임베딩 완료 ({len(candidate_paths)}건)")
-    try:
-        _get_sentence_encoder_manager().release(model_name)
-    except Exception:
-        pass
+
+
+@drift_group.command("auto")
+@click.option("--scan-csv", default=str(DEFAULT_FOUND_FILES), show_default=True, type=click.Path(path_type=str))
+@click.option("--corpus", default=str(CORPUS_PATH), show_default=True, type=click.Path(path_type=str))
+@click.option("--cache", default=str(CACHE_DIR), show_default=True, type=click.Path(path_type=str))
+@click.option("--semantic-baseline", default=str(DEFAULT_SEMANTIC_BASELINE), show_default=True, type=click.Path(path_type=str))
+@click.option("--semantic-threshold", type=float, default=0.15, show_default=True, help="semantic drift 임계값 (cosine)")
+@click.option("--log-path", default=str(DEFAULT_DRIFT_LOG), show_default=True, type=click.Path(path_type=str))
+@click.option("--alert-threshold", type=float, default=0.1, show_default=True, help="hash drift 비율 알림 임계값")
+@click.option("--model", default=str(TOPIC_MODEL_PATH), show_default=True, type=click.Path(path_type=str))
+@click.option("--translate/--no-translate", default=False, show_default=True)
+@click.option("--policy", default=str(DEFAULT_POLICY_PATH), show_default=True)
+@click.option("--max-reembed", type=int, default=32, show_default=True, help="자동 재임베딩 상한")
+@click.option("--include-changed/--skip-changed", default=True, show_default=True)
+@click.option("--include-new/--skip-new", default=False, show_default=True)
+@click.pass_context
+def drift_auto(
+    ctx: click.Context,
+    scan_csv: str,
+    corpus: str,
+    cache: str,
+    semantic_baseline: str,
+    semantic_threshold: float,
+    log_path: str,
+    alert_threshold: float,
+    model: str,
+    translate: bool,
+    policy: str,
+    max_reembed: int,
+    include_changed: bool,
+    include_new: bool,
+) -> None:
+    report = _perform_drift_check(
+        ctx,
+        run_name="drift-auto",
+        scan_csv=scan_csv,
+        corpus=corpus,
+        cache_dir=cache,
+        semantic_baseline=semantic_baseline,
+        semantic_threshold=semantic_threshold,
+        log_path=log_path,
+        alert_threshold=alert_threshold,
+    )
+    _print_drift_report(report, semantic_threshold)
+
+    targets = _auto_reembed_targets(
+        report,
+        max_candidates=max_reembed,
+        include_changed=include_changed,
+        include_new=include_new,
+    )
+    if not targets:
+        click.echo("✨ 자동 재임베딩 대상이 없어 종료합니다.")
+        return
+
+    click.echo(f"🔁 자동 재임베딩 대상 {len(targets)}건 처리 중…")
+    _run_reembed_pipeline(
+        ctx,
+        targets,
+        scan_csv=scan_csv,
+        corpus=corpus,
+        cache=cache,
+        model=model,
+        translate=translate,
+        policy=policy,
+        run_name="drift-auto-reembed",
+    )
 
 
 def main() -> None:

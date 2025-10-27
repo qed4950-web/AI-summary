@@ -12,5 +12,4 @@
 
 ## 참고 메모
 - `scripts/release_prepare.py` 산출물을 UI 요약에 녹여 KPI 상태를 보여줍니다.
-- Electron 기반 빠른 프로토타입(`ui/electron/`)으로 플로팅 도구막대와 오버레이 아이디어를 검증합니다.
 - Cycle 3/4 범위에서 나온 액션 아이템을 UI에서 바로 처리할 수 있도록 연동합니다.

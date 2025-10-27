@@ -1,8 +1,8 @@
 @echo off
-setlocal
-
+setlocal ENABLEDELAYEDEXPANSION
 set PYTHON=python
 set OUTPUT_NAME=InfoPilotDesktop
+set SIGN_CMD=
 
 :parse_args
 if "%~1"=="" goto after_parse
@@ -14,6 +14,12 @@ if "%~1"=="--python" (
 )
 if "%~1"=="--name" (
     set OUTPUT_NAME=%~2
+    shift
+    shift
+    goto parse_args
+)
+if "%~1"=="--sign-cmd" (
+    set SIGN_CMD=%~2
     shift
     shift
     goto parse_args
@@ -54,6 +60,14 @@ if errorlevel 1 (
 echo.
 echo [INFO] 빌드 성공. dist\%OUTPUT_NAME%\%OUTPUT_NAME%.exe 를 실행하세요.
 echo.
+
+if not "%SIGN_CMD%"=="" (
+    set "TARGET=dist\%OUTPUT_NAME%\%OUTPUT_NAME%.exe"
+    set "SIGN_RUN=%SIGN_CMD%"
+    set "SIGN_RUN=!SIGN_RUN:{file}=%TARGET%!"
+    echo [INFO] 코드 서명 실행: !SIGN_RUN!
+    cmd /c !SIGN_RUN!
+)
 
 popd
 exit /b 0

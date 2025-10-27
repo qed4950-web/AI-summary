@@ -49,6 +49,7 @@ flowchart TD
 | 🧱 Index | `python infopilot.py index --corpus data/corpus.parquet`    | FAISS IVF-PQ 인덱스 빌드       |
 | 🔍 Chat  | `python infopilot.py run chat --cache data/cache`           | 검색 + CrossEncoder rerank  |
 | 🧭 Watch | `python infopilot.py watch`                                 | drift 감지 후 자동 partial 재학습 |
+| 🔁 Drift Auto | `python infopilot.py drift auto`                        | drift 체크 → 후보 추출 → 재임베딩 |
 
 ---
 
@@ -84,6 +85,40 @@ flowchart TD
 | **Semantic Drift**          | cosine mean shift ≥ 0.15   | 의미 변화 감지                  |
 | **Retrieval-time Re-Embed** | 오래된 문서 요청 시 on-demand 재임베딩 | 최신 컨텍스트 반영                |
 | **Drift 로그**                | `logs/drift_log.json`      | 날짜, drift rate, action 기록 |
+| **Auto Pipeline**           | `python infopilot.py drift auto` | 점검→후보 추출→재임베딩을 한 번에 실행 |
+
+---
+
+## 7️⃣ Chunk Cache Backend (JSON ↔ SQLite)
+
+| 옵션 | 설명 | 설정 |
+| --- | --- | --- |
+| JSON (기본) | `chunk_cache.json`에 doc_hash 맵을 저장 | 별도 설정 없음 |
+| SQLite | 대규모 코퍼스에서도 빠른 조회/쓰기 | `INFOPILOT_CACHE_BACKEND=sqlite` + `chunk_cache.sqlite` |
+| GC 제한 | 오래된 엔트리를 자동 정리 | `INFOPILOT_CACHE_MAX_ENTRIES=100000` (0이면 무제한) |
+
+- `INFOPILOT_CACHE_BACKEND=sqlite` 를 설정하면 `chunk_cache.json` 경로가 자동으로 `.sqlite` 파일로 변환됩니다.
+- 동일 인터페이스이므로 CLI 인자는 그대로 두고, 실행 로그에서 “Chunk cache: SQLite backend” 메시지로 전환 여부를 확인할 수 있습니다.
+
+---
+
+## 8️⃣ Edge Adapter (SQLite Export + Mini API)
+
+경량 디바이스/모바일에서 사용할 수 있도록 SQLite 코퍼스와 검색 API를 바로 생성합니다.
+
+```bash
+# 1) 코퍼스 → SQLite 변환
+python scripts/edge_adapter.py export \
+  --corpus data/corpus.parquet \
+  --database data/edge_corpus.sqlite --force
+
+# 2) 로컬 미니 검색 API 실행
+python scripts/edge_adapter.py serve --database data/edge_corpus.sqlite --host 0.0.0.0 --port 9090
+```
+
+- `/search?q=...&limit=5` 엔드포인트로 단순 LIKE 기반 조회를 제공합니다.
+- FastAPI/uvicorn 의존성이 있으므로 Edge 장치에도 해당 패키지를 설치해야 합니다.
+- Atlas Work Center 패널에서 최근 활동 및 `logs/resource_log.jsonl`을 바로 확인할 수 있어, Edge/export 작업 현황을 빠르게 모니터링할 수 있습니다.
 
 ---
 
@@ -146,7 +181,7 @@ python -m onnxruntime.quantization \
 | **검색 개선**   | CLIP + CrossEncoder rerank 통합           |
 | **자동화 고도화** | Prefect or FastAPI DAG 노드별 실행           |
 | **리소스 최적화** | Mixed-precision embedding + async queue |
-| **UX 통합**   | Electron 기반 작업센터에서 파이프라인 제어             |
+| **UX 통합**   | CustomTkinter 작업센터에서 파이프라인 제어             |
 
 ---
 
@@ -198,7 +233,7 @@ python -m onnxruntime.quantization \
 | `run`      | `scan`, `train`, `index`, `chat`, `watch` | 핵심 파이프라인 실행          |
 | `logs`     | `show`, `clean`                           | MLflow/psutil 로그 관리  |
 | `model`    | `list`, `quantize`                        | 모델 상태 관리 (ONNX 변환 등) |
-| `drift`    | `check`, `reembed`                        | 의미 드리프트 감지 및 자동 재임베딩 |
+| `drift`    | `check`, `auto`, `reembed`                | 의미 드리프트 감지 및 자동 재임베딩 |
 | `pipeline` | `all`                                     | 스캔→학습→인덱스→대화까지 일괄 수행 |
 
 ### ▶ 실행 예시
@@ -221,7 +256,24 @@ python infopilot.py model quantize --model models/sbert.onnx
 
 # 5️⃣ 의미 드리프트 점검
 python infopilot.py drift check
+
+# 6️⃣ 점검 + 재임베딩 일괄 실행
+python infopilot.py drift auto
 ```
+
+### ▶ FastAPI 제어 (선택)
+
+```bash
+export INFOPILOT_API_TOKEN="my-secret"
+uvicorn scripts.api_server:app --host 127.0.0.1 --port 8080
+
+# 실행
+curl -H "X-API-Token: my-secret" -X POST http://127.0.0.1:8080/pipeline/run -d '{...}'
+# 상태
+curl -H "X-API-Token: my-secret" http://127.0.0.1:8080/pipeline/status
+```
+
+`INFOPILOT_API_TOKEN`을 설정하면 `X-API-Token` 헤더로 인증된 요청만 수락하며, `/health`는 무인증 헬스 체크용으로 유지됩니다.
 
 ---
 
@@ -388,7 +440,7 @@ flowchart TD
 | **모델 관리**   | GPU 감지 및 자동 로드 (`core/utils/model_manager.py`) |
 | **검색 개선**   | CLIP + CrossEncoder 멀티모달 리랭킹                   |
 | **자동화 고도화** | Prefect/FastAPI 기반 DAG 실행                      |
-| **UX 통합**   | Electron 기반 로컬 워크센터 연동                         |
+| **UX 통합**   | CustomTkinter 기반 로컬 워크센터 연동                    |
 | **리소스 최적화** | async 임베딩 큐 + mixed precision                  |
 
 ---

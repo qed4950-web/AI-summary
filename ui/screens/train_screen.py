@@ -17,7 +17,7 @@ from ui.utils import (
     SUPPORTED_EXTS,
     TOPIC_MODEL_PATH,
 )
-from ui.utils.cli_runner import run_infopilot_cli
+from ui.cli_runner import run_infopilot_cli
 
 SCAN_STATE_PATH = DATA_DIR / "scan_state.json"
 CHUNK_CACHE_PATH = CACHE_DIR / "chunk_cache.json"

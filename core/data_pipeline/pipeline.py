@@ -16,7 +16,7 @@ from dataclasses import dataclass, replace
 from typing import Optional, Dict, Any, List, Tuple, Union, Set
 
 from core.data_pipeline.custom_metadata import get_metadata_for_path
-from core.data_pipeline.cache_manager import ChunkCache
+from core.data_pipeline.cache_manager import ChunkCache, SQLiteChunkCache
 from core.data_pipeline.incremental import (
     load_scan_state,
     filter_incremental_rows,
@@ -208,6 +208,8 @@ DEFAULT_CHUNK_MAX_TOKENS = 500
 
 EMBED_DTYPE_ENV = "INFOPILOT_EMBED_DTYPE"
 _VALID_EMBED_DTYPES = {"auto", "fp16", "fp32"}
+CACHE_BACKEND_ENV = "INFOPILOT_CACHE_BACKEND"
+_VALID_CACHE_BACKENDS = {"json", "sqlite"}
 
 
 def _sanitize_embed_dtype(value: Optional[str]) -> Optional[str]:
@@ -215,6 +217,29 @@ def _sanitize_embed_dtype(value: Optional[str]) -> Optional[str]:
         return None
     normalized = str(value).strip().lower()
     return normalized if normalized in _VALID_EMBED_DTYPES else None
+
+
+def _sanitize_cache_backend(value: Optional[str]) -> str:
+    if not value:
+        return "json"
+    normalized = str(value).strip().lower()
+    return normalized if normalized in _VALID_CACHE_BACKENDS else "json"
+
+
+def _create_chunk_cache(path: Path) -> ChunkCache:
+    backend = _sanitize_cache_backend(os.getenv(CACHE_BACKEND_ENV))
+    actual_path = path
+    if backend == "sqlite":
+        if actual_path.suffix.lower() == ".json":
+            actual_path = actual_path.with_suffix(".sqlite")
+        elif not actual_path.name.endswith(".sqlite"):
+            actual_path = actual_path.with_name(actual_path.name + ".sqlite")
+    if backend == "sqlite":
+        print(f"⚙️ Chunk cache: SQLite backend → {actual_path}", flush=True)
+        return SQLiteChunkCache(actual_path)
+    if backend != "json":
+        print(f"⚠️ 지원하지 않는 캐시 백엔드 '{backend}' → json으로 대체합니다.", flush=True)
+    return ChunkCache(path)
 
 _TOKEN_REGEX = re.compile(TOKEN_PATTERN)
 
@@ -1519,7 +1544,7 @@ def run_step2(
     target_embed_dtype = _resolve_embed_dtype(cfg)
     cfg.embedding_dtype = target_embed_dtype
 
-    chunk_cache = ChunkCache(chunk_cache_path) if chunk_cache_path else None
+    chunk_cache = _create_chunk_cache(chunk_cache_path) if chunk_cache_path else None
     scan_state = load_scan_state(scan_state_path) if scan_state_path else None
 
     try:

@@ -313,6 +313,11 @@ _SEMANTIC_SYNONYMS: Dict[str, Set[str]] = {
     "제안서": {"proposal", "pitch", "offer"},
     "계획": {"plan", "planning"},
     "정리": {"summary", "overview"},
+    "ml": {"machine learning", "머신러닝", "머신 러닝", "기계학습", "기계 학습"},
+    "머신러닝": {"machine learning", "ml", "기계학습", "ai"},
+    "기계학습": {"machine learning", "ml", "머신러닝"},
+    "ai": {"artificial intelligence", "인공지능", "머신러닝"},
+    "인공지능": {"ai", "artificial intelligence", "machine learning", "머신러닝"},
 }
 
 
@@ -3213,9 +3218,12 @@ class Retriever:
             desired_exts=requested_exts,
             session=session,
         )
+        rerank_pruned_all = False
+        rerank_threshold: Optional[float] = None
         if self.rerank_min_score is not None:
             filtered: List[Dict[str, Any]] = []
-            threshold = self.rerank_min_score
+            threshold = float(self.rerank_min_score)
+            rerank_threshold = threshold
 
             for hit in reranked:
                 raw_score = hit.get("rerank_score", hit.get("score", hit.get("similarity", 0.0)))
@@ -3229,7 +3237,12 @@ class Retriever:
             if filtered:
                 reranked = filtered
             else:
-                return []
+                rerank_pruned_all = True
+                reranked = []
+                logger.info(
+                    "rerank threshold filtered all candidates (threshold=%.2f); falling back to vector/lexical ranking",
+                    threshold,
+                )
 
         rank_sources: List[List[Dict[str, Any]]] = []
         if lexical_ranking:
@@ -3251,6 +3264,16 @@ class Retriever:
             metadata_filters=metadata_filters,
             lexical_weight=adaptive_lex_weight,
         )
+        if rerank_pruned_all and annotated:
+            note = (
+                "Cross-Encoder 임계값 미달 후보는 제외되어 임베딩/키워드 순위로 대체했습니다."
+                if rerank_threshold is None
+                else f"Cross-Encoder 임계값 {rerank_threshold:.2f} 미만 후보는 제외되어 임베딩/키워드 순위로 대체했습니다."
+            )
+            for hit in annotated:
+                reasons = hit.setdefault("match_reasons", [])
+                if note not in reasons:
+                    reasons.append(note)
         if can_use_semantic_cache and semantic_cache is not None and q_vector is not None:
             semantic_cache.store(q_vector, annotated)
             self._record_cache_event("semantic", hit=False)

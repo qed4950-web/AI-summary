@@ -8,6 +8,7 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
         "llm_backend": "",
         "llm_model": "",
         "llm_host": "",
+        "llm_api_key": "",
         "top_k": 8,
         "min_similarity": 0.35,
         "include_references": True,

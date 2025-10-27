@@ -6,12 +6,25 @@ import json
 import time
 from dataclasses import dataclass, asdict
 from pathlib import Path
+import os
 from typing import Dict, Iterable, List, Optional, Set, Tuple
+
+import sqlite3
 
 try:
     import pandas as pd
 except Exception:  # pragma: no cover - optional
     pd = None  # type: ignore[assignment]
+
+
+CACHE_MAX_ENTRIES_ENV = "INFOPILOT_CACHE_MAX_ENTRIES"
+
+
+def _max_cache_entries() -> int:
+    try:
+        return max(0, int(os.getenv(CACHE_MAX_ENTRIES_ENV, "0") or 0))
+    except ValueError:
+        return 0
 
 
 @dataclass
@@ -30,6 +43,7 @@ class ChunkCache:
         self._entries: Dict[str, CacheEntry] = {}
         self._hash_index: Dict[str, str] = {}
         self._dirty = False
+        self._max_entries = _max_cache_entries()
         self._load()
 
     def _load(self) -> None:
@@ -106,6 +120,7 @@ class ChunkCache:
             if entry.doc_hash:
                 self._hash_index[entry.doc_hash] = str(path)
             self._dirty = True
+        self._prune_if_needed()
 
     def drop_paths(self, missing: Iterable[str]) -> None:
         removed = False
@@ -119,3 +134,130 @@ class ChunkCache:
 
     def known_paths(self) -> Set[str]:
         return set(self._entries.keys())
+
+    def _prune_if_needed(self) -> None:
+        limit = self._max_entries
+        if limit <= 0 or len(self._entries) <= limit:
+            return
+        ordered = sorted(self._entries.values(), key=lambda entry: entry.updated_at, reverse=True)
+        keep = {entry.path for entry in ordered[:limit]}
+        for path in list(self._entries.keys()):
+            if path not in keep:
+                entry = self._entries.pop(path)
+                if entry.doc_hash in self._hash_index:
+                    self._hash_index.pop(entry.doc_hash, None)
+                self._dirty = True
+
+
+class SQLiteChunkCache:
+    """SQLite-backed chunk cache for larger datasets."""
+
+    def __init__(self, cache_path: Path) -> None:
+        self.cache_path = cache_path
+        self._conn = sqlite3.connect(str(cache_path))
+        self._conn.execute("PRAGMA journal_mode=WAL;")
+        self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS entries (
+                path TEXT PRIMARY KEY,
+                doc_hash TEXT,
+                chunk_count INTEGER,
+                updated_at REAL
+            )
+            """
+        )
+        self._conn.commit()
+        self._max_entries = _max_cache_entries()
+
+    def save(self) -> None:
+        self._conn.commit()
+
+    def _row_map(self) -> Dict[str, CacheEntry]:
+        cursor = self._conn.execute("SELECT path, doc_hash, chunk_count, updated_at FROM entries")
+        rows = cursor.fetchall()
+        return {
+            path: CacheEntry(path=path, doc_hash=doc_hash or "", chunk_count=chunk_count or 0, updated_at=updated_at or 0.0)
+            for path, doc_hash, chunk_count, updated_at in rows
+        }
+
+    def unchanged_paths(self, df: "pd.DataFrame") -> Set[str]:
+        if pd is None or df is None or df.empty or "path" not in df.columns or "doc_hash" not in df.columns:
+            return set()
+        existing = self._row_map()
+        results: Set[str] = set()
+        for path, doc_hash in zip(df["path"], df["doc_hash"]):
+            key = str(path or "")
+            if not key:
+                continue
+            cached = existing.get(key)
+            if cached and cached.doc_hash and str(doc_hash) == cached.doc_hash:
+                results.add(key)
+        return results
+
+    def update_from_frame(self, df: "pd.DataFrame") -> None:
+        if pd is None or df is None or df.empty or "path" not in df.columns:
+            return
+        now = time.time()
+        grouped = df.groupby("path", dropna=True)
+        rows: List[Tuple[str, str, int, float]] = []
+        for path, group in grouped:
+            doc_hash = ""
+            if "doc_hash" in group.columns:
+                doc_hash = str(group["doc_hash"].fillna("").iloc[0])
+            if "chunk_count" in group.columns and not group["chunk_count"].isnull().all():
+                chunk_count = int(group["chunk_count"].fillna(0).iloc[0])
+            else:
+                chunk_count = int(len(group))
+            rows.append((str(path), doc_hash, chunk_count, now))
+        if not rows:
+            return
+        self._conn.executemany(
+            """
+            INSERT INTO entries(path, doc_hash, chunk_count, updated_at)
+            VALUES(?, ?, ?, ?)
+            ON CONFLICT(path) DO UPDATE SET
+                doc_hash=excluded.doc_hash,
+                chunk_count=excluded.chunk_count,
+                updated_at=excluded.updated_at
+            """,
+            rows,
+        )
+        self._conn.commit()
+        self._prune_if_needed()
+
+    def drop_paths(self, missing: Iterable[str]) -> None:
+        items = [str(path) for path in missing if path]
+        if not items:
+            return
+        with self._conn:
+            for chunk in [items[i : i + 200] for i in range(0, len(items), 200)]:
+                placeholders = ", ".join("?" for _ in chunk)
+                self._conn.execute(f"DELETE FROM entries WHERE path IN ({placeholders})", chunk)
+
+    def known_paths(self) -> Set[str]:
+        cursor = self._conn.execute("SELECT path FROM entries")
+        return {row[0] for row in cursor.fetchall()}
+
+    def _prune_if_needed(self) -> None:
+        limit = self._max_entries
+        if limit <= 0:
+            return
+        cur = self._conn.execute("SELECT COUNT(1) FROM entries")
+        total = cur.fetchone()[0]
+        if total <= limit:
+            return
+        remove = total - limit
+        with self._conn:
+            self._conn.execute(
+                "DELETE FROM entries WHERE path IN (SELECT path FROM entries ORDER BY updated_at ASC LIMIT ?)",
+                (remove,),
+            )
+
+    def close(self) -> None:
+        try:
+            self._conn.close()
+        except Exception:
+            pass
+
+    def __del__(self) -> None:  # pragma: no cover - best-effort cleanup
+        self.close()

@@ -66,8 +66,8 @@
 - **Model Manager 확장**: 지연 로딩, GPU/CPU 자동 전환, 캐시 관리 (`core/model_manager.py`) *(검토: 초기화 복잡도)*.
 
 ### 5.2 UI & 배포
-- **Electron Wrapper**: `ui/electron/` + `scripts/ipc_bridge.py`로 데스크톱 셸 구성 *(검토: 메모리 + 배포 복잡도)*.
-- **빌드 스크립트**: `scripts/build_desktop.ps1/sh`, PyInstaller + Electron Builder로 .exe/.dmg 생성 *(검토: 유지관리 비용)*.
+- **데스크톱 Wrapping**: CustomTkinter 앱을 PyInstaller로 패키징 *(Atlas UI 기준)*.
+- **빌드 스크립트**: `scripts/build_desktop_ui.bat/.ps1`에서 `--sign-cmd`/`-SignCommand`로 코드 서명까지 자동화.
 
 #### 5.2.1 단계별 계획 요약
 | 단계 | 작업 | 설명 |
@@ -75,8 +75,8 @@
 | **1️⃣ Retriever 개선** | BM25 + SBERT 구조에 `semantic rerank` 추가 (`cross-encoder/ms-marco-MiniLM-L-6-v2` 등) | 문서 유사도 정밀도 향상 (RAM 영향 500MB 내 검토) |
 | **2️⃣ Agent별 모델 세분화** | Meeting→Whisper+Llama3, Photo→CLIP/ONNX, Knowledge→SBERT/Reranker | 각 Agent 최적화 모델 구성 (모델 수 늘어나므로 관리 주의) |
 | **3️⃣ Model Manager 확장** | GPU/CPU 자동 전환, lazy-load, 로컬 우선 캐시 | 로드 속도 및 자원 최적화 (초기화 복잡도 증가) |
-| **4️⃣ Electron 래핑** | CLI(`infopilot.py scan/train/chat`)를 Node.js IPC로 감싸기 | 백엔드 그대로, 프런트만 Electron 제어 (메모리 주의) |
-| **5️⃣ 로컬 빌드 및 배포** | `pyinstaller` + Electron `builder`로 `.exe`/`.dmg` 생성 | 내부 배포 혹은 개인용 앱 완성 |
+| **4️⃣ 데스크톱 패키징** | PyInstaller 기반 단일 실행 파일/디렉터리 생성 | 배포 편의성 확보 |
+| **5️⃣ 로컬 빌드 및 배포** | 스크립트로 코드 서명(`--sign-cmd`)·압축·릴리스 노트 생성 | 내부 배포 혹은 개인용 앱 완성 |
 | **6️⃣ (선택) Upstream 반영** | 검증 완료 항목만 PR로 `develop`에 반영 | GitHub 코드베이스를 통제된 방식으로 유지 |
 
 ### 5.3 모델별 메모리 목표
@@ -90,11 +90,14 @@
 ### 5.4 추가 테스트 항목 (검토 단계)
 - SBERT-only vs SBERT+Reranker 정확도 비교.
 - 모델 매니저의 lazy-loading 및 GPU/CPU 전환 시나리오.
-- Electron IPC → Python CLI (`scan/train/chat`) 왕복 테스트.
+- PyInstaller 패키지 실행 시 CLI와 동등하게 동작하는지 확인.
 - 빌드 아티팩트(.exe/.dmg) 실행 및 CLI와의 동등성 확인.
 - `/data/cache` 초기화 후 재생성 정상 여부.
+- `INFOPILOT_CACHE_BACKEND=sqlite`, `INFOPILOT_CACHE_MAX_ENTRIES` 환경 변수 조합에서 캐시가 안정적으로 GC되는지 확인.
+- `scripts/edge_adapter.py export/serve` 출력물로 모바일/Edge 검색이 정상 처리되는지 확인.
 
 ### 5.5 후속 아이디어
 - OpenAI-compatible API 어댑터(Ollama/LM Studio 연동).
 - 정책 엔진 기반 에이전트 제한(스마트 폴더별).
 - 에이전트 간 컨텍스트 공유(회의 → 지식 추천 등).
+- Edge Adapter(`scripts/edge_adapter.py export/serve`)를 활용한 모바일/임베디드 배포 자동화.

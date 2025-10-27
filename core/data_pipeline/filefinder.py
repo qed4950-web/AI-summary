@@ -5,7 +5,7 @@ import platform
 import time
 import threading
 from pathlib import Path
-from typing import Iterable, List, Dict, Optional, Any
+from typing import Iterable, List, Dict, Optional, Any, Set, Union
 
 try:
     import pwd  # POSIX only; optional
@@ -125,6 +125,7 @@ class FileFinder:
         self._stop_progress = threading.Event()
         self._total_dirs_estimate = None
         self._current_root = ""
+        self._permission_notices: Set[str] = set()
 
     # ---------- roots ----------
     def _windows_drives(self) -> List[Path]:
@@ -321,9 +322,15 @@ class FileFinder:
                                 with self._lock:
                                     self._files_scanned += 1
                                 yield Path(entry.path)
-                        except (PermissionError, FileNotFoundError, OSError):
+                        except PermissionError:
+                            self._record_permission(entry.path)
                             continue
-            except (PermissionError, FileNotFoundError, NotADirectoryError, OSError):
+                        except (FileNotFoundError, OSError):
+                            continue
+            except PermissionError:
+                self._record_permission(current)
+                continue
+            except (FileNotFoundError, NotADirectoryError, OSError):
                 continue
 
     # ---------- public ----------
@@ -405,6 +412,13 @@ class FileFinder:
             w.writeheader()
             for r in rows:
                 w.writerow(r)
+
+    def _record_permission(self, path: Union[Path, str]) -> None:
+        key = str(path)
+        if key not in self._permission_notices:
+            self._permission_notices.add(key)
+            if len(self._permission_notices) <= 20:
+                print(f"⚠️ 접근 권한이 없어 건너뜁니다: {key}", flush=True)
 
     @staticmethod
     def collect_file_metadata(path: Path, *, allowed_exts: Optional[Iterable[str]] = None) -> Optional[Dict[str, Any]]:

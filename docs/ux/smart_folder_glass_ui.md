@@ -56,4 +56,3 @@
 ## 8. 향후 개선 메모
 - CustomTkinter는 완전한 윈도우 투명도를 지원하지 않으므로 Canvas로 유사 글래스 효과를 냅니다.
 - 열기/닫기 애니메이션은 `after`와 `geometry` 조합으로 단계적인 확대 연출을 할 수 있습니다.
-- Electron/React 버전으로 확장할 경우 CSS `backdrop-filter: blur()`를 활용하면 더 자연스러운 효과를 구현할 수 있습니다.
