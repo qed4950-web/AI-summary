@@ -82,6 +82,8 @@ class FileFinder:
         "temp",
         ".cache",
         "logs",
+        "applications",
+        "system",
     }
 
     def __init__(

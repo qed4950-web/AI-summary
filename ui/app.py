@@ -201,6 +201,7 @@ class AISummaryApp(ctk.CTk):
                     cache_dir=CACHE_DIR,
                     topk=config["top_k"],
                     min_similarity=config["min_similarity"],
+                    lexical_weight=config["lexical_weight"],
                     llm_backend=config["llm_backend"] or None,
                     llm_model=config["llm_model"],
                     llm_host=config["llm_host"],
@@ -239,6 +240,10 @@ class AISummaryApp(ctk.CTk):
             min_sim = float(convo.get("min_similarity") or DEFAULT_SIMILARITY_THRESHOLD)
         except Exception:
             min_sim = DEFAULT_SIMILARITY_THRESHOLD
+        try:
+            lexical_weight = max(0.0, min(1.0, float(convo.get("lexical_weight", 0.35))))
+        except Exception:
+            lexical_weight = 0.35
         include_refs = bool(convo.get("include_references", True))
         return {
             "llm_backend": backend,
@@ -247,6 +252,7 @@ class AISummaryApp(ctk.CTk):
             "llm_api_key": api_key,
             "top_k": top_k,
             "min_similarity": min_sim,
+            "lexical_weight": lexical_weight,
             "include_references": include_refs,
         }
 

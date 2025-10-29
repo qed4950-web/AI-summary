@@ -529,11 +529,6 @@ def _metadata_text(
             stem = p.stem
             if stem and stem != name:
                 tokens.append(stem)
-            tokens.extend(_split_tokens(stem))
-            parent_name = p.parent.name if p.parent else ""
-            if parent_name:
-                tokens.append(parent_name)
-                tokens.extend(_split_tokens(parent_name))
         else:
             tokens.append(str(path))
     if ext:
@@ -546,7 +541,6 @@ def _metadata_text(
     if drive:
         drive_str = str(drive)
         tokens.append(drive_str)
-        tokens.extend(_split_tokens(drive_str))
     for epoch in (mtime, ctime):
         tokens.extend(_time_tokens(epoch))
     bucket = _size_bucket(size)
@@ -554,7 +548,6 @@ def _metadata_text(
         tokens.append(bucket)
     if owner:
         tokens.append(str(owner))
-        tokens.extend(_split_tokens(str(owner)))
     if extra:
         extra_clean = TextCleaner.clean(str(extra))
         if extra_clean:
@@ -576,13 +569,13 @@ def _metadata_text(
 
 
 def _compose_model_text(base_text: str, metadata: str) -> str:
-    base_text = base_text or ""
-    metadata = metadata or ""
-    if metadata and base_text:
-        return f"{base_text}\n\n{metadata}"
-    if metadata:
-        return metadata
-    return base_text
+    base = (base_text or "").strip()
+    meta = (metadata or "").strip()
+    if base:
+        if meta and len(base) < 40:
+            return f"{base}\n\n{meta}"
+        return base
+    return meta
 
 
 def _prepare_text_frame(df: "pd.DataFrame") -> "pd.DataFrame":
@@ -665,6 +658,31 @@ def _prepare_text_frame(df: "pd.DataFrame") -> "pd.DataFrame":
         for idx in range(len(df))
     ]
     return df
+
+
+def _deduplicate_corpus(df: "pd.DataFrame") -> "pd.DataFrame":
+    """Remove duplicate chunks based on content hash (and chunk_id when available)."""
+    if pd is None or df is None or df.empty:
+        return df
+    if "content_hash" not in df.columns or "path" not in df.columns:
+        return df
+
+    working = df.copy()
+    working["_dedup_pref"] = working["path"].apply(
+        lambda p: 1 if str(p or "").startswith("/Volumes/") else 0
+    )
+    working["_dedup_len"] = working["path"].apply(lambda p: len(str(p or "")))
+    working["_dedup_order"] = range(len(working))
+
+    subset_cols = ["content_hash"]
+    if "chunk_id" in working.columns:
+        subset_cols.append("chunk_id")
+
+    working = working.sort_values(subset_cols + ["_dedup_pref", "_dedup_len", "_dedup_order"])
+    working = working.drop_duplicates(subset=subset_cols, keep="first")
+    working = working.sort_values("_dedup_order").drop(columns=["_dedup_pref", "_dedup_len", "_dedup_order"])
+    working = working.reset_index(drop=True)
+    return working
 
 
 def _resolve_kmeans_n_init() -> Union[str, int]:
@@ -1589,6 +1607,7 @@ def run_step2(
             if "path" in df.columns and order_map:
                 df["_order"] = df["path"].map(order_map)
                 df = df.sort_values("_order").drop(columns=["_order"]).reset_index(drop=True)
+            df = _deduplicate_corpus(df)
             CorpusBuilder.save(df, out_corpus)
             if chunk_cache:
                 chunk_cache.update_from_frame(df)
@@ -1669,6 +1688,7 @@ def run_step2(
             _prepare_text_frame(train_df)
         print(f"🧹 학습 대상 문서: {len(train_df):,}/{len(df):,}", flush=True)
         if len(train_df) == 0:
+            df = _deduplicate_corpus(df)
             CorpusBuilder.save(df, out_corpus)
             if scan_state_path:
                 updated_state = update_scan_state(scan_state or {}, file_rows)
@@ -1721,6 +1741,7 @@ def run_step2(
         if topics_df is not None:
             df = df.merge(topics_df, on="path", how="left")
 
+        df = _deduplicate_corpus(df)
         CorpusBuilder.save(df, out_corpus)
 
         if isinstance(model_obj, SentenceBertModel):
@@ -1782,6 +1803,7 @@ def update_corpus_file(
         max_tokens=DEFAULT_CHUNK_MAX_TOKENS,
     )
     _prepare_text_frame(combined)
+    combined = _deduplicate_corpus(combined)
     CorpusBuilder.save(combined, corpus_path)
     return combined
 
@@ -1806,5 +1828,6 @@ def remove_from_corpus(paths: List[str], corpus_path: Path) -> "pd.DataFrame":
         max_tokens=DEFAULT_CHUNK_MAX_TOKENS,
     )
     _prepare_text_frame(filtered)
+    filtered = _deduplicate_corpus(filtered)
     CorpusBuilder.save(filtered, corpus_path)
     return filtered
