@@ -206,6 +206,7 @@ class AISummaryApp(ctk.CTk):
                     llm_model=config["llm_model"],
                     llm_host=config["llm_host"],
                     llm_options=llm_options,
+                    llm_health_timeout=config["llm_health_timeout"],
                 )
             )
             meeting_agent = MeetingAgent()
@@ -245,6 +246,16 @@ class AISummaryApp(ctk.CTk):
         except Exception:
             lexical_weight = 0.35
         include_refs = bool(convo.get("include_references", True))
+        health_timeout = convo.get("llm_health_timeout")
+        try:
+            if health_timeout in ("", None):
+                parsed_timeout = None
+            else:
+                parsed_timeout = float(health_timeout)
+        except Exception:
+            parsed_timeout = None
+        if parsed_timeout is not None and parsed_timeout < 1.0:
+            parsed_timeout = 1.0
         return {
             "llm_backend": backend,
             "llm_model": model,
@@ -254,6 +265,7 @@ class AISummaryApp(ctk.CTk):
             "min_similarity": min_sim,
             "lexical_weight": lexical_weight,
             "include_references": include_refs,
+            "llm_health_timeout": parsed_timeout,
         }
 
     def _build_llm_options(self, config: Dict[str, object]) -> Dict[str, str]:

@@ -33,6 +33,7 @@ class DocumentAgentConfig:
     llm_model: Optional[str] = None
     llm_host: Optional[str] = None
     llm_options: Optional[Dict[str, str]] = None
+    llm_health_timeout: Optional[float] = None
     policy_engine: Optional[PolicyEngine] = None
     policy_scope: str = "auto"
     policy_agent: str = "knowledge_search"
@@ -67,6 +68,7 @@ class DocumentAgent(ConversationalAgent):
             llm_model=config.llm_model or "llama3",
             llm_host=config.llm_host,
             llm_options=config.llm_options or {},
+            llm_health_timeout=config.llm_health_timeout,
             policy_engine=config.policy_engine,
             policy_scope=config.policy_scope,
             policy_agent=config.policy_agent,

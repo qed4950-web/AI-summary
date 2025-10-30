@@ -34,7 +34,7 @@
    # 필요 시 개별 단계
    python infopilot.py run scan --out data/found_files.csv
    python infopilot.py run train --scan_csv data/found_files.csv --state-file data/scan_state.json --chunk-cache data/cache/chunk_cache.json
-   python infopilot.py run chat --model data/topic_model.joblib --corpus data/corpus.parquet --cache data/cache --lexical-weight 0.2
+   python infopilot.py run chat --model data/topic_model.joblib --corpus data/corpus.parquet --cache data/cache --lexical-weight 0.35
    python infopilot.py run watch --corpus data/corpus.parquet --model data/topic_model.joblib --cache data/cache
    ```
 

@@ -60,8 +60,19 @@ flowchart TD
 | **Semantic Rerank 추가** | `CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")` → 상위 20개 재정렬 | MLflow로 reranker 버전 기록 |
 | **Vector Compression** | `FAISS IVF-PQ`, PQ32, `nbits=8`                                     | CPU 추론, 메모리 절감         |
 | **Temporal Awareness** | 문서 메타데이터(`created_at`) 기반 time-weight 적용                            | 3년 전 문서 recall 유지      |
-| **Hybrid Scoring**     | `(semantic*0.8)+(bm25*0.2)`                                         | 실험적 가중 조정              |
+| **Hybrid Scoring**     | `semantic + (bm25*0.35)`                                           | 실험적 가중 조정              |
 | **Offline Evaluation** | `core/data_pipeline/evaluate.py` → P@K, nDCG 자동 측정                  | MLflow metric 저장       |
+
+- **문서 태깅 자동화**: `_prepare_text_frame`이 파일 경로/이름/추가 메타데이터를 스캔해 `doc_tags`, `doc_primary_tag` 컬럼을 생성합니다. `법령`, `공고`, `회의록`, `보고서` 등으로 분류된 태그가 메타텍스트와 인덱스에 함께 저장돼, 관련 질의에서 BM25 점수를 보강합니다.
+- **서식/목차 패널티**: `_negative_template_penalty`가 `목차`, `표지`, `Table of Contents`와 같은 패턴을 감지하면 재랭킹 점수와 최종 점수에 패널티를 적용해 노이즈 문서를 뒤로 밀어냅니다.
+
+---
+
+### Golden Query 세트 관리
+
+- `configs/golden_queries.sample.jsonl`을 복사해 `data/eval/golden_queries.jsonl`로 저장하고, 실제 질의/문서 경로를 채워 넣습니다.
+- `pytest tests/regression/test_retriever_golden.py -q`를 실행하면 상위 k(기본 5) 안에 기대 문서가 포함됐는지 확인합니다.
+- 자동 파이프라인 대신 수동 검증이 필요한 경우, `python scripts/evaluate_rag.py --cases data/eval/golden_queries.jsonl --model data/topic_model.joblib --corpus data/corpus.parquet --cache data/cache`로 빠르게 리콜을 확인할 수 있습니다.
 
 ---
 

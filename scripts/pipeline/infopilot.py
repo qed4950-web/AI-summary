@@ -1088,7 +1088,7 @@ def cmd_pipeline(args):
             rerank_batch_size=16,
             rerank_device=None,
             rerank_min_score=0.35,
-            lexical_weight=getattr(args, "lexical_weight", 0.2),
+            lexical_weight=getattr(args, "lexical_weight", 0.35),
             show_translation=False,
             translation_lang="en",
             min_similarity=0.35,
@@ -1694,7 +1694,7 @@ def _chat_options(func):
     func = click.option("--translate/--no-translate", default=False, show_default=True)(func)
     func = click.option("--topk", type=int, default=5, show_default=True)(func)
     func = click.option("--min-similarity", type=float, default=0.35, show_default=True)(func)
-    func = click.option("--lexical-weight", type=float, default=0.2, show_default=True)(func)
+    func = click.option("--lexical-weight", type=float, default=0.35, show_default=True)(func)
     func = click.option("--rerank/--no-rerank", default=True, show_default=True)(func)
     func = click.option("--rerank-model", default="cross-encoder/ms-marco-MiniLM-L-6-v2", show_default=True)(func)
     func = click.option("--rerank-depth", type=int, default=80, show_default=True)(func)

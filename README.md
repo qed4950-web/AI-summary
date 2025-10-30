@@ -87,7 +87,7 @@ python infopilot.py run chat \
   --model data/topic_model.joblib \
   --corpus data/corpus.parquet \
   --cache data/cache \
-  --lexical-weight 0.2
+  --lexical-weight 0.35
 python infopilot.py run watch \
   --cache data/cache \
   --corpus data/corpus.parquet \

@@ -9,6 +9,7 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
         "llm_model": "",
         "llm_host": "",
         "llm_api_key": "",
+        "llm_health_timeout": 20.0,
         "top_k": 8,
         "min_similarity": 0.35,
         "include_references": True,

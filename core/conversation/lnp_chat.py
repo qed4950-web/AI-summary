@@ -10,6 +10,7 @@ import time
 import threading
 import os
 from dataclasses import dataclass, field
+import math
 from pathlib import Path
 from typing import Dict, Any, Optional, Set, Tuple, List
 import textwrap
@@ -118,6 +119,7 @@ class LNPChat:
     llm_model: str = field(default_factory=lambda: os.getenv("LNPCHAT_LLM_MODEL", "llama3"))
     llm_host: str = field(default_factory=lambda: os.getenv("LNPCHAT_LLM_HOST", ""))
     llm_options: Dict[str, str] = field(default_factory=dict)
+    llm_health_timeout: Optional[float] = field(default=None)
 
     retr: Optional[Retriever] = field(init=False, default=None)
     translator: Optional[Any] = field(init=False, default=None)
@@ -157,10 +159,21 @@ class LNPChat:
                 return True
             return default
         require_llm = _env_flag("LNPCHAT_REQUIRE_LLM", default=True)
-        health_timeout = os.getenv("LNPCHAT_LLM_HEALTH_TIMEOUT", "").strip()
-        try:
-            health_timeout_s = float(health_timeout) if health_timeout else 20.0
-        except ValueError:
+        health_timeout_env = os.getenv("LNPCHAT_LLM_HEALTH_TIMEOUT", "").strip()
+        health_timeout_s: float
+        if self.llm_health_timeout is not None:
+            try:
+                health_timeout_s = float(self.llm_health_timeout)
+            except (TypeError, ValueError):
+                health_timeout_s = 20.0
+        elif health_timeout_env:
+            try:
+                health_timeout_s = float(health_timeout_env)
+            except ValueError:
+                health_timeout_s = 20.0
+        else:
+            health_timeout_s = 20.0
+        if not math.isfinite(health_timeout_s) or health_timeout_s <= 0:
             health_timeout_s = 20.0
         health_timeout_s = max(1.0, health_timeout_s)
         try:

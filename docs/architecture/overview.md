@@ -10,14 +10,14 @@ InfoPilot 데스크톱 비서는 세 개의 층으로 구성되어 있습니다.
 
 1. **스캔** (`infopilot.py run scan`): `core/data_pipeline/filefinder.FileFinder`를 이용해 `data/found_files.csv`를 생성하고 스캔 상태(`data/scan_state.json`)를 갱신합니다.
 2. **학습** (`infopilot.py pipeline all` 또는 `infopilot.py run train`): 텍스트 청크를 정규화하고 `data/corpus.parquet`, `data/topic_model.joblib`, 문서 해시 캐시(`data/cache/chunk_cache.json`)를 갱신합니다. 증분 실행 시 변경된 문서만 재임베딩합니다.
-3. **질의/대화** (`infopilot.py run chat`): `core/conversation/LNPChat`과 `core/search/retriever.Retriever`가 결합해 하이브리드 검색(semantic 0.8 + BM25 0.2)·CrossEncoder rerank·Temporal weighting을 적용합니다.
+3. **질의/대화** (`infopilot.py run chat`): `core/conversation/LNPChat`과 `core/search/retriever.Retriever`가 결합해 하이브리드 검색(semantic + BM25×0.35)·CrossEncoder rerank·Temporal weighting을 적용합니다.
 4. **감시** (`infopilot.py run watch`): 파일 변경 이벤트를 감지해 코퍼스·인덱스를 증분으로 갱신하고, drift 탐지 결과는 `infopilot.py drift check/reembed`로 확인할 수 있습니다.
 
 주요 산출물 경로는 `core/config/paths.py`에서 확인할 수 있습니다.
 
 ## 에이전트 구성
 
-- **지식·검색 비서**: Sentence-BERT 임베딩, 기본 BM25 가중치(0.2), Temporal weighting, Cross-Encoder 재랭킹을 조합합니다. CLI 플래그(`--lexical-weight`, `--rerank-min-score`, `--translate` 등)로 세부 설정을 조정할 수 있습니다. 자세한 구조는 `docs/agents/document/architecture.md` 참고.
+- **지식·검색 비서**: Sentence-BERT 임베딩, 기본 BM25 가중치(0.35), Temporal weighting, Cross-Encoder 재랭킹을 조합합니다. CLI 플래그(`--lexical-weight`, `--rerank-min-score`, `--translate` 등)로 세부 설정을 조정할 수 있습니다. 자세한 구조는 `docs/agents/document/architecture.md` 참고.
 - **회의 비서**: `core/agents/meeting/pipeline.py`가 STT, 요약, 감사 로그, 분석을 묶어 실행합니다. 세부 내용은 `docs/agents/meeting/architecture.md`에 정리되어 있습니다.
 - **사진 비서**: `core/agents/photo/pipeline.py`가 태깅, 중복 감지, 베스트샷 추천을 수행합니다. `docs/agents/photo/architecture.md`에서 단계별 설명을 확인할 수 있습니다.
 

@@ -578,6 +578,136 @@ def _compose_model_text(base_text: str, metadata: str) -> str:
     return meta
 
 
+_DOC_TAG_HINTS: Tuple[Tuple[str, Tuple[str, ...], Tuple[str, ...]], ...] = (
+    (
+        "law",
+        (
+            "법령",
+            "법률",
+            "법규",
+            "조례",
+            "규정",
+            "규칙",
+            "지침",
+            "세칙",
+            "훈령",
+            "행정규칙",
+            "regulation",
+            "ordinance",
+            "bylaw",
+        ),
+        ("법령문서", "법규", "조례"),
+    ),
+    (
+        "notice",
+        (
+            "공고",
+            "공지",
+            "고시",
+            "입찰",
+            "계약",
+            "발주",
+            "제안요청서",
+            "rfp",
+            "announcement",
+            "notice",
+        ),
+        ("공고문", "입찰", "공지문"),
+    ),
+    (
+        "report",
+        (
+            "보고서",
+            "분석",
+            "결과보고",
+            "백서",
+            "리포트",
+            "report",
+            "analysis",
+        ),
+        ("보고서", "분석자료"),
+    ),
+    (
+        "minutes",
+        (
+            "회의록",
+            "의사록",
+            "minutes",
+            "meeting minutes",
+        ),
+        ("회의록", "회의기록"),
+    ),
+    (
+        "plan",
+        (
+            "계획",
+            "전략",
+            "로드맵",
+            "마스터플랜",
+            "plan",
+            "strategy",
+            "roadmap",
+        ),
+        ("계획서", "전략문서"),
+    ),
+    (
+        "manual",
+        (
+            "매뉴얼",
+            "지침서",
+            "가이드",
+            "guide",
+            "manual",
+        ),
+        ("지침서", "가이드"),
+    ),
+)
+
+
+def _infer_doc_tags(path_value: str, extra: Optional[str]) -> Tuple[List[str], List[str]]:
+    haystack_parts = []
+    if path_value:
+        haystack_parts.append(str(path_value))
+        try:
+            path_obj = Path(path_value)
+            haystack_parts.append(path_obj.name)
+            haystack_parts.append(path_obj.stem)
+        except Exception:
+            pass
+    if extra:
+        haystack_parts.append(str(extra))
+    haystack = " ".join(part for part in haystack_parts if part).lower()
+    if not haystack:
+        return [], []
+    tags: List[str] = []
+    tokens: List[str] = []
+    for slug, keywords, tag_tokens in _DOC_TAG_HINTS:
+        for keyword in keywords:
+            if keyword.lower() in haystack:
+                tags.append(slug)
+                for token in tag_tokens:
+                    cleaned = TextCleaner.clean(token)
+                    if cleaned:
+                        tokens.append(cleaned)
+                break
+    if not tags:
+        return [], []
+    # deduplicate while preserving order
+    seen_tags = set()
+    ordered_tags: List[str] = []
+    for tag in tags:
+        if tag not in seen_tags:
+            seen_tags.add(tag)
+            ordered_tags.append(tag)
+    seen_tokens = set()
+    ordered_tokens: List[str] = []
+    for token in tokens:
+        if token not in seen_tokens:
+            seen_tokens.add(token)
+            ordered_tokens.append(token)
+    return ordered_tags, ordered_tokens
+
+
 def _prepare_text_frame(df: "pd.DataFrame") -> "pd.DataFrame":
     if pd is None or df is None:
         return df
@@ -640,8 +770,14 @@ def _prepare_text_frame(df: "pd.DataFrame") -> "pd.DataFrame":
         get_metadata_for_path(str(paths.iat[idx]))
         for idx in range(len(df))
     ]
-    metadata_list = [
-        _metadata_text(
+    metadata_list: List[str] = []
+    doc_tags: List[List[str]] = []
+    doc_primary_tags: List[str] = []
+    for idx in range(len(df)):
+        tags, tag_tokens = _infer_doc_tags(paths.iat[idx], extra_texts[idx])
+        doc_tags.append(tags)
+        doc_primary_tags.append(tags[0] if tags else "")
+        metadata_value = _metadata_text(
             paths.iat[idx],
             exts.iat[idx],
             drives.iat[idx],
@@ -651,8 +787,12 @@ def _prepare_text_frame(df: "pd.DataFrame") -> "pd.DataFrame":
             owner=owners.iat[idx],
             extra=extra_texts[idx],
         )
-        for idx in range(len(df))
-    ]
+        if tag_tokens:
+            tag_text = " ".join(tag_tokens)
+            metadata_value = f"{metadata_value} {tag_text}".strip() if metadata_value else tag_text
+        metadata_list.append(metadata_value)
+    df["doc_tags"] = doc_tags
+    df["doc_primary_tag"] = doc_primary_tags
     df[MODEL_TEXT_COLUMN] = [
         _compose_model_text(base_texts[idx], metadata_list[idx])
         for idx in range(len(df))
@@ -965,12 +1105,62 @@ class PptExtractor(BaseExtractor):
         return {"ok": False, "text": "", "meta": {"error": "PPT/PPTX 추출을 위해 python-pptx 또는 Windows PowerPoint가 필요합니다."}}
 
 
+class PlainTextExtractor(BaseExtractor):
+    exts = (".txt", ".md", ".rst", ".log")
+
+    def extract(self, p: Path) -> Dict[str, Any]:
+        try:
+            raw_text = p.read_text(encoding="utf-8", errors="replace")
+        except Exception as exc:
+            return {"ok": False, "text": "", "meta": {"error": f"텍스트 파일 읽기 실패: {exc}"}}
+        cleaned = TextCleaner.clean(raw_text)
+        meta: Dict[str, Any] = {"engine": "plain-text"}
+        if p.suffix.lower() == ".md":
+            meta["format"] = "markdown"
+        return {
+            "ok": bool(cleaned),
+            "text": cleaned,
+            "text_original": raw_text,
+            "meta": meta,
+        }
+
+
+class CodeExtractor(BaseExtractor):
+    exts = (
+        ".py",
+        ".json",
+        ".yaml",
+        ".yml",
+        ".toml",
+        ".ini",
+        ".cfg",
+        ".sh",
+        ".bash",
+    )
+
+    def extract(self, p: Path) -> Dict[str, Any]:
+        try:
+            raw_text = p.read_text(encoding="utf-8", errors="replace")
+        except Exception as exc:
+            return {"ok": False, "text": "", "meta": {"error": f"코드 파일 읽기 실패: {exc}"}}
+        cleaned = TextCleaner.clean(raw_text)
+        meta: Dict[str, Any] = {"engine": "code", "extension": p.suffix.lower()}
+        return {
+            "ok": bool(cleaned),
+            "text": cleaned,
+            "text_original": raw_text,
+            "meta": meta,
+        }
+
+
 EXTRACTORS = [
     HwpExtractor(),
     DocDocxExtractor(),
     ExcelLikeExtractor(),
     PdfExtractor(),
     PptExtractor(),
+    PlainTextExtractor(),
+    CodeExtractor(),
 ]
 EXT_MAP={e:ex for ex in EXTRACTORS for e in ex.exts}
 

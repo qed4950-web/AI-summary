@@ -354,9 +354,97 @@ for keyword, exts in _DOMAIN_EXT_HINTS.items():
         if mapped_exts:
             _DOMAIN_KEYWORD_MAP.setdefault(form, set()).update(mapped_exts)
 
-# 의미 검색만 사용하도록 BM25 가중치를 비활성화
-_LEXICAL_WEIGHT = 0.2
+# 기본 BM25 가중치 (DocumentAgent 설정값과 동기화)
+_LEXICAL_WEIGHT = 0.35
 _EXTENSION_MATCH_BONUS = 0.05
+
+
+_LEXICAL_KEYWORD_HINTS_RAW: Tuple[Tuple[Set[str], float], ...] = (
+    (
+        {
+            "법령",
+            "법률",
+            "법규",
+            "조례",
+            "규정",
+            "규칙",
+            "지침",
+            "세칙",
+            "훈령",
+            "행정규칙",
+        },
+        0.55,
+    ),
+    (
+        {
+            "공고",
+            "공문",
+            "공지",
+            "입찰",
+            "계약",
+            "발주",
+            "고시",
+            "제안요청서",
+        },
+        0.5,
+    ),
+)
+
+
+def _build_keyword_hint_forms(keywords: Iterable[str]) -> Set[str]:
+    forms: Set[str] = set()
+    for keyword in keywords:
+        forms.update(_keyword_forms(keyword))
+    return {form for form in forms if form}
+
+
+_LEXICAL_KEYWORD_HINTS: Tuple[Tuple[Set[str], float], ...] = tuple(
+    (_build_keyword_hint_forms(keywords), weight)
+    for keywords, weight in _LEXICAL_KEYWORD_HINTS_RAW
+)
+
+
+def _looks_like_identifier(token: str) -> bool:
+    if not token:
+        return False
+    token = token.strip()
+    if not token:
+        return False
+    if re.search(r"\d{3,}", token):
+        return True
+    if re.search(r"[A-Za-z]{2,}\d{2,}", token):
+        return True
+    if "-" in token or "_" in token:
+        digits = sum(ch.isdigit() for ch in token)
+        letters = sum(ch.isalpha() for ch in token)
+        if digits >= 2 and (letters >= 1 or "-" in token):
+            return True
+    return False
+
+
+_NEGATIVE_TEMPLATE_HINTS: Tuple[Tuple[str, float], ...] = (
+    ("목차", 0.35),
+    ("차례", 0.3),
+    ("table of contents", 0.35),
+    ("contents page", 0.3),
+    ("cover page", 0.25),
+    ("표지", 0.25),
+    ("copyright", 0.2),
+    ("signature block", 0.2),
+)
+
+
+def _negative_template_penalty(hit: Dict[str, Any]) -> Tuple[float, List[str]]:
+    preview = str(hit.get("preview") or "").lower()
+    path = str(hit.get("path") or "").lower()
+    matched: List[str] = []
+    penalty = 0.0
+    for keyword, weight in _NEGATIVE_TEMPLATE_HINTS:
+        key_lower = keyword.lower()
+        if key_lower in preview or key_lower in path:
+            matched.append(keyword)
+            penalty = max(penalty, weight)
+    return penalty, matched
 
 
 def _resolve_sentence_transformer_location(model_name: str) -> str:
@@ -936,6 +1024,17 @@ def _annotate_hits(
             breakdown["rerank"] = round(rerank_score, 4)
             reasons.append(f"Cross-Encoder 점수 {breakdown['rerank']:.2f}")
 
+        negative_penalty = _safe_float(hit.get("negative_penalty"))
+        if negative_penalty is not None and negative_penalty > 0.0:
+            breakdown["negative_penalty"] = round(negative_penalty, 4)
+            negative_labels = hit.get("negative_reasons", [])
+            if isinstance(negative_labels, list) and negative_labels:
+                label_str = ", ".join(str(lbl) for lbl in negative_labels[:3])
+                reasons.append(f"서식/목차 패널티 -{negative_penalty:.2f} ({label_str})")
+                hit["negative_matches"] = list(negative_labels)
+            else:
+                reasons.append(f"서식/목차 패널티 -{negative_penalty:.2f}")
+
         total_score = _safe_float(hit.get("combined_score", hit.get("score")))
         if total_score is not None:
             breakdown["final"] = round(total_score, 4)
@@ -1402,6 +1501,15 @@ def _rerank_hits(
             if use_lexical_overlap:
                 base_score += float(lexical_score) * _LEXICAL_WEIGHT
 
+        negative_penalty, negative_matches = _negative_template_penalty(hit)
+        if negative_penalty > 0.0:
+            hit["negative_penalty"] = float(negative_penalty)
+            if negative_matches:
+                hit["negative_reasons"] = negative_matches
+            base_score = max(0.0, float(base_score) - negative_penalty)
+        else:
+            hit["negative_penalty"] = 0.0
+
         ext_raw = hit.get("ext")
         ext_norm = _normalize_ext(ext_raw)
         total_ext_bonus, desired_ext_bonus, session_ext_bonus = _compute_extension_bonus(
@@ -1548,41 +1656,45 @@ class CrossEncoderReranker:
                 ext_preferences,
                 session,
             )
-        owner_bonus = _compute_owner_bonus(hit.get("owner"), session)
-        temporal_factor = float(hit.get("temporal_weight", 1.0))
+            owner_bonus = _compute_owner_bonus(hit.get("owner"), session)
+            temporal_factor = float(hit.get("temporal_weight", 1.0))
 
-        combined = (
-            (alpha * rerank_component)
-            + (beta * vector_component)
-            + (gamma * lexical_component)
-            + total_ext_bonus
-            + owner_bonus
-        )
-        combined *= temporal_factor
+            combined = (
+                (alpha * rerank_component)
+                + (beta * vector_component)
+                + (gamma * lexical_component)
+                + total_ext_bonus
+                + owner_bonus
+            )
+            combined *= temporal_factor
 
-        original_vector = float(hit.get("vector_similarity", hit.get("similarity", 0.0)))
-        hit["vector_similarity"] = original_vector
-        hit.setdefault("pre_rerank_score", float(hit.get("score", 0.0)))
-        hit["rerank_score"] = float(rerank_score)
-        hit["combined_score"] = float(combined)
-        hit["score"] = float(combined)
-        hit["similarity"] = original_vector
-        hit["desired_extension_bonus"] = float(desired_ext_bonus)
-        hit["session_ext_bonus"] = float(session_ext_bonus)
-        hit["session_owner_bonus"] = float(owner_bonus)
-        hit["temporal_weight"] = temporal_factor
-        if total_ext_bonus:
-            hit["rerank_ext_bonus"] = total_ext_bonus
-        match_reasons = hit.get("match_reasons")
-        if match_reasons is not None and session_ext_bonus:
-            label = "세션 선호 확장자 가중치" if session_ext_bonus > 0 else "세션 비선호 확장자 페널티"
-            if label not in match_reasons:
-                match_reasons.append(label)
-        if match_reasons is not None and owner_bonus:
-            owner_label = "세션 선호 작성자 가중치" if owner_bonus > 0 else "세션 비선호 작성자 페널티"
-            if owner_label not in match_reasons:
-                match_reasons.append(owner_label)
-        combined_hits.append(hit)
+            negative_penalty = float(hit.get("negative_penalty", 0.0) or 0.0)
+            if negative_penalty > 0.0:
+                combined = max(0.0, combined - negative_penalty)
+
+            original_vector = float(hit.get("vector_similarity", hit.get("similarity", 0.0)))
+            hit["vector_similarity"] = original_vector
+            hit.setdefault("pre_rerank_score", float(hit.get("score", 0.0)))
+            hit["rerank_score"] = float(rerank_score)
+            hit["combined_score"] = float(combined)
+            hit["score"] = float(combined)
+            hit["similarity"] = original_vector
+            hit["desired_extension_bonus"] = float(desired_ext_bonus)
+            hit["session_ext_bonus"] = float(session_ext_bonus)
+            hit["session_owner_bonus"] = float(owner_bonus)
+            hit["temporal_weight"] = temporal_factor
+            if total_ext_bonus:
+                hit["rerank_ext_bonus"] = total_ext_bonus
+            match_reasons = hit.get("match_reasons")
+            if match_reasons is not None and session_ext_bonus:
+                label = "세션 선호 확장자 가중치" if session_ext_bonus > 0 else "세션 비선호 확장자 페널티"
+                if label not in match_reasons:
+                    match_reasons.append(label)
+            if match_reasons is not None and owner_bonus:
+                owner_label = "세션 선호 작성자 가중치" if owner_bonus > 0 else "세션 비선호 작성자 페널티"
+                if owner_label not in match_reasons:
+                    match_reasons.append(owner_label)
+            combined_hits.append(hit)
 
         combined_hits.sort(key=lambda item: item.get("score", 0.0), reverse=True)
         return combined_hits
@@ -3377,16 +3489,35 @@ class Retriever:
         base = max(0.0, float(getattr(self, "base_lexical_weight", 0.0)))
         if base <= 0.0:
             return 0.0
-        if not query_tokens:
+        tokens = [str(tok) for tok in (query_tokens or []) if str(tok).strip()]
+        if not tokens:
             return base
-        distinct = len({tok for tok in query_tokens if tok})
+
+        weight = base
+        lowered_tokens = {tok.lower() for tok in tokens if tok}
+
+        hint_applied = False
+        if any(_looks_like_identifier(tok) for tok in tokens):
+            weight = max(weight, 0.7)
+            hint_applied = True
+        else:
+            for keyword_forms, hint_weight in _LEXICAL_KEYWORD_HINTS:
+                if lowered_tokens & keyword_forms:
+                    weight = max(weight, hint_weight)
+                    hint_applied = True
+                    break
+
+        distinct = len(lowered_tokens)
         if distinct <= 2:
-            return min(0.75, max(base, 0.45))
+            weight = min(0.75, max(weight, 0.45))
+        elif distinct >= 8 and not hint_applied:
+            weight = max(0.15, min(weight, 0.30))
+
         if filters_active:
-            return min(0.85, max(base, 0.35))
-        if distinct >= 8:
-            return max(0.15, min(base, 0.30))
-        return base
+            weight = max(weight, 0.35)
+            weight = min(weight, 0.85)
+
+        return float(max(0.0, min(0.9, weight)))
 
     def _load_cached_index(self) -> Optional[VectorIndex]:
         emb_npy = self.cache_dir / "doc_embeddings.npy"
@@ -3476,25 +3607,47 @@ class Retriever:
         owner_list = work["owner"].fillna("").astype(str).tolist() if "owner" in work.columns else [""] * len(work)
         drive_list = work["drive"].fillna("").astype(str).tolist() if "drive" in work.columns else [""] * len(work)
 
-        extra_meta: Optional[List[Dict[str, Any]]] = None
-        chunk_columns = [col for col in ("chunk_id", "chunk_count", "chunk_tokens") if col in work.columns]
-        if chunk_columns:
-            extra_meta = []
-            for i in range(len(work)):
-                meta: Dict[str, Any] = {}
-                if "chunk_id" in work.columns:
-                    value = work["chunk_id"].iloc[i]
-                    if pd.notna(value):
-                        meta["chunk_id"] = int(value)
-                if "chunk_count" in work.columns:
-                    value = work["chunk_count"].iloc[i]
-                    if pd.notna(value):
-                        meta["chunk_count"] = int(value)
-                if "chunk_tokens" in work.columns:
-                    value = work["chunk_tokens"].iloc[i]
-                    if pd.notna(value):
-                        meta["chunk_tokens"] = int(value)
-                extra_meta.append(meta)
+        row_count = len(work)
+        extra_meta_payload: List[Dict[str, Any]] = [{} for _ in range(row_count)]
+        extra_fields_present = False
+        if "chunk_id" in work.columns:
+            for i in range(row_count):
+                value = work["chunk_id"].iloc[i]
+                if pd.notna(value):
+                    extra_meta_payload[i]["chunk_id"] = int(value)
+                    extra_fields_present = True
+        if "chunk_count" in work.columns:
+            for i in range(row_count):
+                value = work["chunk_count"].iloc[i]
+                if pd.notna(value):
+                    extra_meta_payload[i]["chunk_count"] = int(value)
+                    extra_fields_present = True
+        if "chunk_tokens" in work.columns:
+            for i in range(row_count):
+                value = work["chunk_tokens"].iloc[i]
+                if pd.notna(value):
+                    extra_meta_payload[i]["chunk_tokens"] = int(value)
+                    extra_fields_present = True
+        if "doc_tags" in work.columns:
+            for i in range(row_count):
+                value = work["doc_tags"].iloc[i]
+                if isinstance(value, list) and value:
+                    tags = [str(tag).strip() for tag in value if str(tag).strip()]
+                    if tags:
+                        extra_meta_payload[i]["doc_tags"] = tags
+                        extra_fields_present = True
+        if "doc_primary_tag" in work.columns:
+            for i in range(row_count):
+                value = work["doc_primary_tag"].iloc[i]
+                if pd.notna(value) and str(value).strip():
+                    extra_meta_payload[i]["doc_primary_tag"] = str(value).strip()
+                    extra_fields_present = True
+
+        extra_meta: Optional[List[Dict[str, Any]]]
+        if extra_fields_present:
+            extra_meta = extra_meta_payload
+        else:
+            extra_meta = None
 
         index = VectorIndex()
         index.build(

@@ -52,7 +52,7 @@ class FileFinder:
         ".xlsx", ".xls", ".xlsm", ".xlsb", ".xltx",
         ".pdf",
         ".ppt", ".pptx",
-        ".csv",
+        ".csv", ".txt", ".md", ".rst", ".json", ".py",
     }
     WINDOWS_SKIP_DIRS = {
         r"\$Recycle.Bin",
