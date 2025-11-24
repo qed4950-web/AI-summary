@@ -67,17 +67,17 @@ def test_summarize_hits_swallows_llm_failure(chat: LNPChat) -> None:
 
 def test_toolrouter_selects_summary_for_keywords() -> None:
     router = ToolRouter()
-    action = router.select_action("회의 내용을 요약해줘", use_translation=False, policy_active=False, llm_available=True)
+    action = router.select_action("/search 회의 내용을 요약해줘", use_translation=False, policy_active=False, llm_available=True)
     assert action == "search_and_summarize"
 
 
 def test_toolrouter_prefers_search_for_short_queries() -> None:
     router = ToolRouter()
     action = router.select_action("보고서", use_translation=False, policy_active=False, llm_available=True)
-    assert action == "search"
+    assert action == "dialogue"
 
 
 def test_toolrouter_respects_llm_unavailable() -> None:
     router = ToolRouter()
-    action = router.select_action("이 문서 정리해줘", use_translation=False, policy_active=False, llm_available=False)
+    action = router.select_action("/search 이 문서 정리해줘", use_translation=False, policy_active=False, llm_available=False)
     assert action == "search"

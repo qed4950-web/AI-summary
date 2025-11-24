@@ -7,7 +7,8 @@ from .models import (
     MeetingSummary,
     StreamingSummarySnapshot,
 )
-from .pipeline import MeetingPipeline, StreamingMeetingSession
+from .pipeline import MeetingPipeline
+from .streaming import StreamingMeetingSession
 
 __all__ = [
     "MeetingJobConfig",

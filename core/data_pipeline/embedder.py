@@ -71,7 +71,25 @@ class AsyncSentenceEmbedder:
         text_list = [str(t or "") for t in texts]
         if not text_list:
             return np.zeros((0, self.embedding_dim), dtype=self._numpy_dtype())
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+        if loop and loop.is_running():
+            return self._encode_direct(text_list)
         return asyncio.run(self._runner(text_list))
+
+    def _encode_direct(self, texts: Sequence[str]) -> np.ndarray:
+        """Fallback for environments with a running event loop."""
+        result = self.encoder.encode(
+            list(texts),
+            batch_size=min(self.batch_size, max(1, len(texts))),
+            show_progress_bar=False,
+            convert_to_numpy=True,
+            normalize_embeddings=False,
+            device=self.device,
+        )
+        return np.asarray(result, dtype=self._numpy_dtype(), copy=False)
 
     def _numpy_dtype(self):
         if self.target_dtype == "fp16":

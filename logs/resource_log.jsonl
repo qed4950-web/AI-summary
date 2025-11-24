@@ -1,0 +1,6 @@
+{"ts": 1763623239.535638, "context": "scan", "cpu_percent": 25.6, "memory_percent": 66.4, "rss": 476250112, "available": 5773721600}
+{"ts": 1763623269.5380569, "context": "scan", "cpu_percent": 0.0, "memory_percent": 68.6, "rss": 555892736, "available": 5395070976}
+{"ts": 1763623300.9533179, "context": "pipeline", "cpu_percent": 20.9, "memory_percent": 65.8, "rss": 475529216, "available": 5883838464}
+{"ts": 1763623330.961167, "context": "pipeline", "cpu_percent": 0.0, "memory_percent": 67.4, "rss": 1374912512, "available": 5593235456}
+{"ts": 1763623360.967325, "context": "pipeline", "cpu_percent": 22.6, "memory_percent": 65.4, "rss": 1243217920, "available": 5936873472}
+{"ts": 1763623390.977261, "context": "pipeline", "cpu_percent": 26.2, "memory_percent": 70.5, "rss": 1401454592, "available": 5073928192}

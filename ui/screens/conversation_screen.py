@@ -263,7 +263,7 @@ class ConversationScreen(ctk.CTkFrame):
 
         self.prompt_entry = ctk.CTkEntry(
             footer,
-            placeholder_text="안녕하세요? 무엇을 도와드릴까요?",
+            placeholder_text="안녕하세요? 대화를 시작하거나 '/search ...'로 문서를 찾아보세요.",
         )
         self.prompt_entry.grid(row=0, column=0, sticky="ew")
         self.prompt_entry.bind("<Return>", self._handle_send)
@@ -303,6 +303,8 @@ class ConversationScreen(ctk.CTkFrame):
             return
         try:
             config = self._effective_settings()
+            os.environ.setdefault("LNPCHAT_LLM_TIMEOUT", "6")
+            os.environ.setdefault("LNPCHAT_LLM_HEALTH_TIMEOUT", "5")
             document_agent = DocumentAgent(
                 DocumentAgentConfig(
                     model_path=TOPIC_MODEL_PATH,
@@ -313,6 +315,10 @@ class ConversationScreen(ctk.CTkFrame):
                     llm_backend=config["llm_backend"] or None,
                     llm_model=config["llm_model"],
                     llm_host=config["llm_host"] or None,
+                    auto_search=bool(config["auto_search"]),
+                    llm_health_timeout=config.get("llm_health_timeout"),
+                    llm_timeout=6.0,
+                    rerank=False,
                 )
             )
             meeting_agent = MeetingAgent()
@@ -321,13 +327,20 @@ class ConversationScreen(ctk.CTkFrame):
                 [document_agent, meeting_agent, photo_agent],
                 llm_client=document_agent.llm_client,
             )
+            try:
+                document_agent.prepare()
+            except Exception as exc:  # pragma: no cover - preload guard
+                self._append_message("system", f"엔진 예열 중 경고: {exc}")
             if document_agent.llm_client is None:
                 self._append_message(
                     "system",
                     "LLM이 설정되지 않아 문서 기반 안내만 제공됩니다. ⚙️ 설정에서 Ollama 등을 연결하면 자연어 답변을 받을 수 있습니다.",
                 )
             else:
-                self._append_message("system", "대화 비서가 준비되었습니다. 자유롭게 질문해 보세요.")
+                self._append_message(
+                    "system",
+                    "대화 비서가 준비되었습니다. 먼저 자유롭게 대화해 보고, 문서 검색이 필요하면 '/search 질문'처럼 입력해 보세요.",
+                )
         except FileNotFoundError:
             self._append_message("system", "학습된 모델이 없어 대화 기능을 사용할 수 없습니다. 먼저 전체 학습을 실행하세요.")
         except Exception as exc:
@@ -680,6 +693,10 @@ class ConversationScreen(ctk.CTkFrame):
             "top_k": int(self.settings.get("conversation", "top_k", default=DEFAULT_TOP_K) or DEFAULT_TOP_K),
             "min_similarity": float(self.settings.get("conversation", "min_similarity", default=DEFAULT_SIMILARITY_THRESHOLD) or DEFAULT_SIMILARITY_THRESHOLD),
             "include_references": bool(self.settings.get("conversation", "include_references", default=True)),
+            "auto_search": bool(self.settings.get("conversation", "auto_search", default=False)),
+            "llm_health_timeout": float(
+                self.settings.get("conversation", "llm_health_timeout", default=5.0) or 5.0
+            ),
         }
 
     # ------------------------------------------------------------------
@@ -763,6 +780,16 @@ class ConversationSettingsDialog(ctk.CTkToplevel):
         self.ref_switch.grid(row=row, column=0, sticky="w", padx=24, pady=(12, 12))
         row += 1
 
+        self.auto_search_switch = ctk.CTkSwitch(
+            self.content,
+            text="질문에 자동으로 문서 검색 실행",
+            onvalue="on",
+            offvalue="off",
+        )
+        self.auto_search_switch.select() if cfg.get("auto_search") else self.auto_search_switch.deselect()
+        self.auto_search_switch.grid(row=row, column=0, sticky="w", padx=24, pady=(0, 12))
+        row += 1
+
         button_row = ctk.CTkFrame(self, fg_color="transparent")
         button_row.grid(row=1, column=0, pady=(4, 12), padx=12, sticky="ew")
         button_row.grid_columnconfigure((0, 1), weight=1)
@@ -800,6 +827,7 @@ class ConversationSettingsDialog(ctk.CTkToplevel):
         top_k = int(self.topk_slider.get())
         min_sim = round(float(self.sim_slider.get()), 3)
         include_refs = self.ref_switch.get() == "on"
+        auto_search = self.auto_search_switch.get() == "on"
 
         self.settings.set(backend, "conversation", "llm_backend")
         self.settings.set(model, "conversation", "llm_model")
@@ -807,6 +835,12 @@ class ConversationSettingsDialog(ctk.CTkToplevel):
         self.settings.set(top_k, "conversation", "top_k")
         self.settings.set(min_sim, "conversation", "min_similarity")
         self.settings.set(include_refs, "conversation", "include_references")
+        self.settings.set(auto_search, "conversation", "auto_search")
+        try:
+            timeout_val = max(1.0, float(self.settings.get("conversation", "llm_health_timeout", default=5.0) or 5.0))
+        except Exception:
+            timeout_val = 5.0
+        self.settings.set(timeout_val, "conversation", "llm_health_timeout")
         self.saved = True
         self.destroy()
 

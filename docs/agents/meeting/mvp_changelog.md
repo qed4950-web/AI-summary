@@ -18,6 +18,11 @@
 - KoBART 기반 chunk summariser를 도입해 긴 회의록도 2단계 요약으로 처리할 수 있게 했습니다.
 - `summary.json`을 `meeting_meta` + `summary` 구조로 재정비하고, `attachments.transcript` 포인터와 선택적 `transcript.json` 생성을 지원합니다.
 
+## 2025-10-04
+- HuggingFace Wav2Vec2(`kresnik/wav2vec2-large-xlsr-korean`) 기반 STT 백엔드를 추가하고, `MEETING_WAV2VEC2_*` 환경 변수로 chunk/stride/device를 제어할 수 있도록 했습니다.
+- MeetingScreen STT 설정에 wav2vec2 옵션을 노출하고, chunk/stride 길이를 GUI에서 바로 조정할 수 있게 했습니다.
+- `core/config/meeting_agent.yaml` 기본값을 wav2vec2로 갱신하고, Whisper는 CPU-only 환경을 위한 대체 옵션으로 유지했습니다.
+
 ## 2025-09-26
 - `summary.json`의 `action_items`/`decisions` 항목에 HH:MM:SS 타임스탬프(`ref`)를 추가하고, 화자 라벨은 `SPEAKER_n` 형태로 저장합니다.
 - `MEETING_SAVE_TRANSCRIPT` 환경 변수를 통해 `transcript.json` 생성 여부를 제어하고, 생성 시 `attachments.transcript`로 경로를 노출합니다.

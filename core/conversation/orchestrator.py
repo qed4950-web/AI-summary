@@ -22,44 +22,31 @@ COMMAND_PREFIXES = {
 }
 
 
-DEFAULT_SYSTEM_PROMPT = """You are InfoPilot Orchestrator. Choose which specialised agent
-should handle the user's request.
+DEFAULT_SYSTEM_PROMPT = """당신은 InfoPilot 오케스트레이터입니다. 아래 에이전트 중 하나를 선택해 사용자의 요청을 처리하세요.
 
-Agents:
-
+에이전트:
 1. document_search
-   - Purpose: answer questions using the indexed document corpus
-   - When to use: general knowledge/document questions, follow-up clarifications
-   - Context requirements: none
-   - Typical reasons: "general_question", "document_follow_up"
+   - 역할: 일반 대화, 문서 검색, 요약, 후속 질문 지원.
+   - 기본 선택입니다. 확신이 서지 않을 때는 항상 document_search를 유지하세요.
 
 2. meeting_summary
-   - Purpose: transcribe and summarise meeting audio files
-   - When to use: the user references an audio recording or requests meeting notes
-   - Required context keys:
-        audio_path (absolute path to audio file, e.g. /Users/me/meeting.m4a)
-        optional output_dir, language, context_dirs (list of paths)
-   - If audio_path is missing, return agent="follow_up" with reason "needs_audio"
-   - Never request audio unless the user explicitly mentions a recording or meeting.
+   - 역할: 회의·녹음 파일을 전사하고 요약합니다.
+   - 사용자가 회의/녹음/오디오 파일을 명확히 언급하거나 "/meeting" 명령을 사용할 때만 선택하세요.
+   - context.audio_path가 없으면 agent="follow_up", reason="needs_audio", context.message에 요청 문장을 넣으세요.
 
 3. photo_manager
-   - Purpose: analyse photo folders, surface best shots and duplicates
-   - Required context keys:
-        roots (list of folder paths, e.g. ["/Users/me/Pictures"])
-        optional output_dir, prefer_gpu
-   - If roots are missing, return agent="follow_up" with reason "needs_roots"
-   - Only choose this agent when the user talks about photos/images/albums.
+   - 역할: 사진 폴더를 분석하고 정리합니다.
+   - 사용자가 사진/이미지/앨범을 명확히 언급하거나 "/photo" 명령을 사용할 때만 선택하세요.
+   - context.roots가 없으면 agent="follow_up", reason="needs_roots", context.message를 설정하세요.
 
-If you are unsure or the request is a general question, ALWAYS choose agent="document_search"
-with an empty context. Only choose other agents when the user explicitly uses the dedicated
-command (e.g. "/meeting", "/photo") or very clearly references those tasks.
+규칙:
+- 추가 정보가 정말 필요할 때만 follow_up을 사용하세요.
+- 명령("/meeting", "/photo", "/search", "/doc")이 있을 때는 해당 에이전트를 우선 고려하세요.
+- 그렇지 않으면 agent="document_search"와 빈 context를 반환하세요.
 
-Respond ONLY with a single compact JSON object matching exactly:
-{"agent": "<agent-name or follow_up>", "reason": "<short reason>", "context": {...}}
-The response MUST be one JSON object, on a single line, with no extra text before or after.
-
-If more information is needed before choosing an agent, set agent to "follow_up"
-and include context.message describing what the user must provide."""
+응답 형식은 반드시 한 줄 JSON 객체입니다.
+{"agent": "<agent-name 또는 follow_up>", "reason": "<선택 사항>", "context": {...}}
+agent가 "follow_up"인 경우 reason과 context.message를 포함해야 합니다."""
 
 
 @dataclass
@@ -88,6 +75,7 @@ class AssistantOrchestrator:
         self._system_prompt = system_prompt
         self._llm_client = llm_client
         self._last_reason: Optional[str] = None
+        self._last_agent: Optional[str] = None
         self._initialise_agents()
 
     def _initialise_agents(self) -> None:
@@ -116,6 +104,7 @@ class AssistantOrchestrator:
             missing_reason = self._missing_context_reason(agent_name, context)
             if missing_reason:
                 self._last_reason = missing_reason
+                self._last_agent = "follow_up"
                 message = self._default_follow_up_message(missing_reason)
                 self._history.append({"role": "assistant", "content": message})
                 LOGGER.info(
@@ -125,10 +114,12 @@ class AssistantOrchestrator:
                 )
                 return OrchestratorResponse(message=message, agent="follow_up", reason=missing_reason)
             self._last_reason = "command"
+            self._last_agent = agent_name
         else:
             agent_name, context = self._select_agent(query, base_context)
 
             query_for_agent = query
+            self._last_agent = agent_name
 
         if agent_name == "follow_up":
             message = context.get("message")
@@ -141,6 +132,7 @@ class AssistantOrchestrator:
                 self._last_reason,
                 message,
             )
+            self._last_agent = "follow_up"
             return OrchestratorResponse(message=message, agent="follow_up", reason=self._last_reason)
 
         agent = self._agents.get(agent_name, self._agents["document_search"])
@@ -162,6 +154,7 @@ class AssistantOrchestrator:
                 metadata_keys,
                 self._last_reason,
             )
+            self._last_agent = agent.name
             return OrchestratorResponse(
                 message=response_text,
                 agent=agent.name,
@@ -172,6 +165,7 @@ class AssistantOrchestrator:
         except ValueError as exc:
             message = str(exc)
             self._history.append({"role": "assistant", "content": message})
+            self._last_agent = agent.name
             LOGGER.info(
                 "agent %s returned validation message: %s (reason=%s)",
                 agent.name,
@@ -183,6 +177,7 @@ class AssistantOrchestrator:
             LOGGER.exception("agent %s execution failed", agent.name)
             fallback = "요청을 처리하는 중 오류가 발생했습니다. 다시 시도해 주세요."
             self._history.append({"role": "assistant", "content": fallback})
+            self._last_agent = agent.name
             return OrchestratorResponse(
                 message=fallback,
                 agent=agent.name,
@@ -215,6 +210,8 @@ class AssistantOrchestrator:
                 if agent == "meeting_summary" and remainder:
                     # Allow quick audio path specification
                     context["audio_path"] = remainder
+                if agent == "document_search":
+                    context["force_action"] = "search"
                 return agent, remainder or query, context
         return None, query, {}
 
@@ -264,9 +261,11 @@ class AssistantOrchestrator:
         agent_descriptions = "\n".join(
             f"- {agent.name}: {agent.description}" for agent in self._agents.values()
         )
+        last_agent = self._last_agent or "document_search"
         return (
             "대화 히스토리:\n"
             f"{history_text}\n\n"
+            f"최근 선택된 에이전트: {last_agent}\n"
             "사용 가능한 에이전트 설명:\n"
             f"{agent_descriptions}\n\n"
             f"사용자 요청: {query}\n"

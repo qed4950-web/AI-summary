@@ -1,0 +1,93 @@
+QMainWindow {
+    background-color: #0b1220;
+    color: #e5e7eb;
+}
+
+QLabel[badge="assistant"], QLabel[badge="system"] {
+    background: #1f2937;
+    color: #e5e7eb;
+    padding: 6px 10px;
+    border-radius: 8px;
+    font-weight: 600;
+}
+
+QLabel[badge="user"] {
+    background: #2563eb;
+    color: #fff;
+    padding: 6px 10px;
+    border-radius: 8px;
+    font-weight: 600;
+}
+
+QLabel[bubble="assistant"], QLabel[bubble="system"] {
+    background: #0f172a;
+    border: 1px solid #1f2937;
+    border-radius: 12px;
+    padding: 10px;
+}
+
+QLabel[bubble="user"] {
+    background: #111827;
+    border: 1px solid #1f2937;
+    border-radius: 12px;
+    padding: 10px;
+}
+
+QLabel[refs="true"] {
+    color: #9ca3af;
+    margin-top: 6px;
+}
+
+QLabel[refitem="true"] {
+    color: #cbd5e1;
+    padding-left: 10px;
+}
+
+QPushButton {
+    background-color: #2563eb;
+    color: white;
+    border: none;
+    padding: 10px 14px;
+    border-radius: 10px;
+    font-weight: 600;
+}
+
+QPushButton:disabled {
+    background-color: #374151;
+    color: #9ca3af;
+}
+
+QTextEdit {
+    background: #0f172a;
+    border: 1px solid #1f2937;
+    border-radius: 12px;
+    color: #e5e7eb;
+    font-size: 15px;
+    padding: 10px;
+}
+
+QListWidget {
+    background: #0f172a;
+    border: 1px solid #1f2937;
+    border-radius: 12px;
+    color: #e5e7eb;
+}
+
+QLabel[title="true"] {
+    font-size: 20px;
+    font-weight: 700;
+}
+
+QLabel[subtitle="true"] {
+    color: #9ca3af;
+    font-size: 13px;
+}
+
+QLabel[status="true"] {
+    color: #10b981;
+    font-weight: 600;
+    padding: 6px 10px;
+    border-radius: 8px;
+    background: #0f172a;
+    border: 1px solid #1f2937;
+}

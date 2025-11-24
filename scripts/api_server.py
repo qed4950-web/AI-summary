@@ -137,12 +137,14 @@ class PipelineRunner:
         self._thread: Optional[threading.Thread] = None
         self._cancel_event = threading.Event()
         self._tracker = StatusTracker()
+        self._use_prefect = False
 
     def start(self, config: PipelineConfig, *, use_prefect: bool = False) -> Dict[str, Any]:
         with self._lock:
             if self._thread and self._thread.is_alive():
                 raise RuntimeError("이미 실행 중인 파이프라인이 있습니다.")
             self._cancel_event.clear()
+            self._use_prefect = bool(use_prefect)
             tracker = StatusTracker()
             self._tracker = tracker
             self._thread = threading.Thread(
@@ -175,6 +177,8 @@ class PipelineRunner:
         with self._lock:
             if not self._thread or not self._thread.is_alive():
                 raise RuntimeError("실행 중인 파이프라인이 없습니다.")
+            if self._use_prefect:
+                raise RuntimeError("Prefect 실행은 현재 취소를 지원하지 않습니다.")
             self._cancel_event.set()
         return self._tracker.snapshot()
 

@@ -200,7 +200,7 @@ TOKEN_PATTERN = r'(?u)(?:[가-힣]{1,}|[A-Za-z0-9]{2,})'
 DEFAULT_N_COMPONENTS = 128
 MODEL_TEXT_COLUMN = "text_model"
 _META_SPLIT_RE = re.compile(r"[^0-9A-Za-z가-힣]+")
-DEFAULT_EMBED_MODEL = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+DEFAULT_EMBED_MODEL = "BAAI/bge-m3"
 MODEL_TYPE_SENTENCE_TRANSFORMER = "sentence-transformer"
 
 DEFAULT_CHUNK_MIN_TOKENS = 200
@@ -1821,6 +1821,8 @@ def run_step2(
             progress=use_tqdm,
             translate=translate,
             target_embed_dtype=target_embed_dtype,
+            # PyMuPDF가 다중 스레드에서 불안정하므로 macOS 기본은 워커 1개로 제한
+            max_workers=int(os.getenv("INFOPILOT_MAX_EXTRACT_WORKERS", "1")),
         )
         df_new = cb.build(to_process) if process_count else pd.DataFrame(columns=list(ExtractRecord.__annotations__.keys()))
 

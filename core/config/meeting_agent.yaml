@@ -1,7 +1,9 @@
 # Meeting agent default configuration
 stt:
-  backend: whisper
-  model: small
+  backend: wav2vec2
+  model: kresnik/wav2vec2-large-xlsr-korean
+  chunk_seconds: 20
+  stride_seconds: 5
   diarization: false
 summary:
   backend: llm

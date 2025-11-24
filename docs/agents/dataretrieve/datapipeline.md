@@ -10,7 +10,7 @@
 
 * ✅ 완전 오프라인 작동 (서버 無)
 * ⚙️ 지속적 증분 인덱싱 (3년치 문서까지 보존)
-* 🧩 Retriever 고도화 (SBERT + CrossEncoder + Temporal rerank)
+* 🧩 Retriever 고도화 (BGE-m3 + CrossEncoder + Temporal rerank)
 * 🧠 MLflow + psutil 기반 로컬 추적 및 리소스 프로파일링
 
 ---
@@ -20,7 +20,7 @@
 | 계층                     | 주요 역할                  | 구현 요소                                            | 주의점                      |
 | ---------------------- | ---------------------- | ------------------------------------------------ | ------------------------ |
 | **Data Pipeline**      | 3년치 문서에서 지속적 스캔·임베딩 생성 | `infopilot.py scan/train`, `core/data_pipeline/` | 증분 인덱싱으로 오래된 데이터 재처리 최소화 |
-| **Model Layer**        | 문맥 유사도 + 시맨틱 리랭크 검색    | `Sentence-BERT`, `CrossEncoder`, `FAISS`, `BM25` | 정확도 ↔ 속도 ↔ 메모리 균형 유지     |
+| **Model Layer**        | 문맥 유사도 + 시맨틱 리랭크 검색    | `BAAI/bge-m3`, `CrossEncoder`, `FAISS`, `BM25` | 정확도 ↔ 속도 ↔ 메모리 균형 유지     |
 | **Storage/Versioning** | 인덱스·코퍼스·정책 버전 관리       | MLflow local artifact (`.mlruns/`), corpus hash  | 정책 불일치 시 rollback 경고 필요  |
 | **Serving Layer**      | 검색 후 요약 및 출처 문서 연결     | `infopilot.py run chat`, `core/search/retriever.py`  | TTL 없이도 오래된 문서 검색 가능해야 함 |
 | **Monitoring/Drift**   | 품질·누락 문서·성능 저하 감시      | `core/monitor/`, MLflow metrics                  | 장기 문서 의미 drift 감지 필요     |
@@ -45,7 +45,7 @@ flowchart TD
 | 단계       | 명령                                                          | 동작                        |
 | -------- | ----------------------------------------------------------- | ------------------------- |
 | 🧾 Scan  | `python infopilot.py scan --out data/found_files.csv`       | 새 문서 탐색, hash 저장          |
-| 🧠 Train | `python infopilot.py train --scan_csv data/found_files.csv` | SBERT 임베딩 생성              |
+| 🧠 Train | `python infopilot.py train --scan_csv data/found_files.csv` | BGE-m3 임베딩 생성              |
 | 🧱 Index | `python infopilot.py index --corpus data/corpus.parquet`    | FAISS IVF-PQ 인덱스 빌드       |
 | 🔍 Chat  | `python infopilot.py run chat --cache data/cache`           | 검색 + CrossEncoder rerank  |
 | 🧭 Watch | `python infopilot.py watch`                                 | drift 감지 후 자동 partial 재학습 |
@@ -57,7 +57,7 @@ flowchart TD
 
 | 개선 항목                  | 구현 방식                                                               | 연계 포인트                 |
 | ---------------------- | ------------------------------------------------------------------- | ---------------------- |
-| **Semantic Rerank 추가** | `CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")` → 상위 20개 재정렬 | MLflow로 reranker 버전 기록 |
+| **Semantic Rerank 추가** | `bge-reranker`(기본: `BAAI/bge-reranker-large`)로 상위 20개 재정렬 | MLflow로 reranker 버전 기록 |
 | **Vector Compression** | `FAISS IVF-PQ`, PQ32, `nbits=8`                                     | CPU 추론, 메모리 절감         |
 | **Temporal Awareness** | 문서 메타데이터(`created_at`) 기반 time-weight 적용                            | 3년 전 문서 recall 유지      |
 | **Hybrid Scoring**     | `semantic + (bm25*0.35)`                                           | 실험적 가중 조정              |
@@ -137,7 +137,7 @@ python scripts/edge_adapter.py serve --database data/edge_corpus.sqlite --host 0
 
 | 구성 요소                     | 설명              | 메모리      |
 | ------------------------- | --------------- | -------- |
-| Sentence-BERT (quantized) | ONNX int8 변환 모델 | 약 120MB  |
+| BGE-m3 (quantized) | ONNX int8 변환 모델 | 약 120MB  |
 | FAISS IVF-PQ Index        | 200k 문서 기준      | 약 1.2GB  |
 | Cache / joblib store      | 임베딩 캐시          | 300MB 내외 |
 | MLflow + psutil 로그        | 메타데이터           | 50MB 이하  |
@@ -178,7 +178,7 @@ python -m onnxruntime.quantization \
 | ------------- | ----------- | -------------------- |
 | Indexing time | 10k 문서 ≤ 3분 | incremental 기준       |
 | 검색 속도         | < 400ms     | FAISS + CrossEncoder |
-| Idle RAM      | ≤ 1.2GB     | quantized SBERT 기준   |
+| Idle RAM      | ≤ 1.2GB     | quantized BGE 기준   |
 | recall@10     | ≥ 0.9       | nDCG ≥ 0.8           |
 | drift check   | < 10초       | 1일 1회 자동 수행          |
 
@@ -204,7 +204,7 @@ python -m onnxruntime.quantization \
 
 * 데이터 수집 → 임베딩 → 인덱싱 → 질의 → 드리프트 관리까지
   하나의 Python 기반 MLOps 사이클로 완결
-* 외부 서버 없이도 MLflow, psutil, FAISS, SBERT를 통해
+* 외부 서버 없이도 MLflow, psutil, FAISS, BGE를 통해
   **재현성·추적성·지속성**을 모두 확보했다.
 
 > 🧠 핵심: “증분 인덱싱 + 양자화 + 의미 드리프트 대응 = 장기 보존 문서 검색의 안정성”
@@ -378,7 +378,7 @@ if __name__ == "__main__":
 ```mermaid
 flowchart TD
     A[📂 Local Folders] --> B[🧾 scan]
-    B --> C[🧠 train (SBERT Embedding)]
+    B --> C[🧠 train (BGE-m3 Embedding)]
     C --> D[🧱 index (FAISS PQ)]
     D --> E[🔍 chat (Semantic Search + CrossEncoder)]
     E --> F[📊 MLflow Tracking]
@@ -392,9 +392,9 @@ flowchart TD
 | 기능                 | 주요 동작                           | 핵심 모듈                            |
 | ------------------ | ------------------------------- | -------------------------------- |
 | **Scan**           | 새 문서 탐색 및 hash 기반 증분 등록         | `core/data_pipeline/scanner.py`  |
-| **Train**          | SBERT 임베딩 생성 및 corpus 저장        | `core/data_pipeline/embedder.py` |
+| **Train**          | BGE-m3 임베딩 생성 및 corpus 저장        | `core/data_pipeline/embedder.py` |
 | **Index**          | FAISS IVF-PQ 인덱스 빌드             | `core/search/retriever.py`       |
-| **Chat**           | BM25 + SBERT + CrossEncoder 리랭크 | `core/search/retriever.py`       |
+| **Chat**           | BM25 + BGE-m3 + CrossEncoder 리랭크 | `core/search/retriever.py`       |
 | **Watch**          | psutil + drift 감시 루프            | `core/monitor/drift_checker.py`  |
 | **Log**            | MLflow run 기록, metric 로그 저장     | `.mlruns/`, `logs/`              |
 | **Model Quantize** | ONNX int8 변환으로 CPU 추론 최적화       | `scripts/utils/quantizer.py`     |

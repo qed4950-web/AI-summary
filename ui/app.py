@@ -7,9 +7,14 @@ import threading
 import time
 from datetime import datetime
 from pathlib import Path
+import sys
 from typing import Dict, List, Optional
 
 import customtkinter as ctk
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 from core.agents.document import DocumentAgent, DocumentAgentConfig
 from core.agents.meeting import MeetingAgent
@@ -34,7 +39,6 @@ from ui.utils import (
     rebuild_index,
 )
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
 THEME_PATH = Path(__file__).resolve().parent / "themes" / "dark.json"
 SETTINGS_PATH = REPO_ROOT / "data" / "ui_settings.json"
 
@@ -194,6 +198,8 @@ class AISummaryApp(ctk.CTk):
         try:
             config = self._effective_settings()
             llm_options = self._build_llm_options(config)
+            os.environ.setdefault("LNPCHAT_LLM_TIMEOUT", "6")
+            os.environ.setdefault("LNPCHAT_LLM_HEALTH_TIMEOUT", "5")
             document_agent = DocumentAgent(
                 DocumentAgentConfig(
                     model_path=TOPIC_MODEL_PATH,
@@ -207,19 +213,26 @@ class AISummaryApp(ctk.CTk):
                     llm_host=config["llm_host"],
                     llm_options=llm_options,
                     llm_health_timeout=config["llm_health_timeout"],
+                    llm_timeout=6.0,
+                    auto_search=bool(config["auto_search"]),
+                    rerank=False,
                 )
             )
             meeting_agent = MeetingAgent()
             photo_agent = PhotoAgent()
             orchestrator = AssistantOrchestrator(
                 [document_agent, meeting_agent, photo_agent],
-                llm_client=document_agent.llm_client,
+                llm_client=document_agent.llm_client if config["use_router_llm"] else None,
             )
             self.orchestrator = orchestrator
             if document_agent.llm_client is None:
                 message = "LLM이 설정되지 않아 문서 검색 응답만 제공합니다. ⚙️ 설정에서 Ollama 등을 연결하세요."
             else:
-                message = "대화 비서가 준비되었습니다. 자유롭게 질문해 보세요."
+                message = "대화 비서가 준비되었습니다. 먼저 자유롭게 대화해 보고, 문서 검색이 필요하면 '/search 질문'처럼 입력해 보세요."
+            try:
+                document_agent.prepare()
+            except Exception as exc:  # pragma: no cover - defensive preload
+                message = f"대화 비서 초기화 중 경고: {exc}"
         except FileNotFoundError:
             message = "학습된 모델을 찾을 수 없습니다. 먼저 전체 학습을 실행하세요."
         except Exception as exc:  # pragma: no cover - defensive
@@ -246,6 +259,8 @@ class AISummaryApp(ctk.CTk):
         except Exception:
             lexical_weight = 0.35
         include_refs = bool(convo.get("include_references", True))
+        auto_search = bool(convo.get("auto_search", False))
+        use_router_llm = bool(convo.get("use_router_llm", False))
         health_timeout = convo.get("llm_health_timeout")
         try:
             if health_timeout in ("", None):
@@ -254,8 +269,9 @@ class AISummaryApp(ctk.CTk):
                 parsed_timeout = float(health_timeout)
         except Exception:
             parsed_timeout = None
-        if parsed_timeout is not None and parsed_timeout < 1.0:
-            parsed_timeout = 1.0
+        if parsed_timeout is None:
+            parsed_timeout = 5.0
+        parsed_timeout = max(1.0, float(parsed_timeout))
         return {
             "llm_backend": backend,
             "llm_model": model,
@@ -265,7 +281,9 @@ class AISummaryApp(ctk.CTk):
             "min_similarity": min_sim,
             "lexical_weight": lexical_weight,
             "include_references": include_refs,
+            "auto_search": auto_search,
             "llm_health_timeout": parsed_timeout,
+            "use_router_llm": use_router_llm,
         }
 
     def _build_llm_options(self, config: Dict[str, object]) -> Dict[str, str]:
@@ -413,7 +431,11 @@ class AISummaryApp(ctk.CTk):
         if self.settings_panel and self.settings_panel.winfo_exists():
             self.settings_panel.lift()
             return
-        self.settings_panel = SettingsPanel(self, self.settings)
+        self.settings_panel = SettingsPanel(
+            self,
+            self.settings,
+            on_save=self._handle_settings_saved,
+        )
 
 
 # Backwards compatibility for scripts that import App from ui.app

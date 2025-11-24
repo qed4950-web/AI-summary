@@ -40,6 +40,12 @@ class MemoryStore:
                 return turn.text
         return None
 
+    def last_assistant_text(self) -> Optional[str]:
+        for turn in reversed(self._turns):
+            if turn.role == "assistant":
+                return turn.text
+        return None
+
 
 class PromptManager:
     def __init__(
@@ -143,30 +149,37 @@ class ToolRouter:
     ) -> str:
         trimmed = query.strip()
         if not trimmed:
-            return "search"
+            return "dialogue" if llm_available else "search"
 
         lowered = trimmed.lower()
+        has_command = lowered.startswith(("/search", "/doc"))
         keywords_summary = {
             "요약", "정리", "정리해줘", "설명", "설명해줘", "핵심", "한줄", "결론",
             "말해줘", "알려줘", "소개해줘",
             "summarize", "summary", "explain", "tell me", "tl;dr", "overview",
         }
         keywords_list = {"목록", "리스트", "파일", "문서", "보여줘", "검색"}
+        doc_terms = {
+            "문서", "자료", "파일", "보고서", "리포트", "레포트", "policy", "document", "documents",
+            "보고", "자료집", "dataset", "데이터셋", "pdf", "ppt", "pptx", "정책", "규정",
+        }
+        search_triggers = {
+            "찾아", "찾아줘", "검색", "search", "scan", "살펴", "추려", "추천", "list", "show", "요약",
+            "정리", "요약해", "정리해", "분석", "요약본",
+        }
 
         def _contains_any(source: str, vocab: Set[str]) -> bool:
             return any(token in source for token in vocab)
 
         ask_summary = _contains_any(trimmed, keywords_summary) or _contains_any(lowered, keywords_summary)
         ask_list = _contains_any(trimmed, keywords_list) or _contains_any(lowered, keywords_list)
+        doc_terms_hit = _contains_any(trimmed, doc_terms) or _contains_any(lowered, doc_terms)
+        search_terms_hit = _contains_any(trimmed, search_triggers) or _contains_any(lowered, search_triggers)
 
-        if not llm_available:
-            return "search"
-        if ask_summary and len(trimmed) >= 8:
-            return "search_and_summarize"
-        if ask_list and not ask_summary:
-            return "search"
-        if len(trimmed) < 24:
-            return "search"
-        if policy_active and len(trimmed) < 32:
-            return "search"
-        return "search_and_summarize"
+        # 검색/요약은 명시적 명령(/search, /doc)일 때만 트리거한다.
+        if not has_command:
+            return "dialogue" if llm_available else "search"
+
+        if ask_summary or ask_list or search_terms_hit or doc_terms_hit:
+            return "search_and_summarize" if ask_summary else "search"
+        return "search"

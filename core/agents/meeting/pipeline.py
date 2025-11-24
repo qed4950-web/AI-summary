@@ -6,8 +6,6 @@ import json
 import os
 import re
 import tempfile
-from collections import Counter
-from datetime import timedelta
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -27,6 +25,18 @@ from .analytics import MeetingAnalyticsRecorder
 from .audit import MeetingAuditLogger
 from .context_adapter import ContextBundle, MeetingContextAdapter
 from .context_store import MeetingContextStore
+from .constants import (
+    ACTION_KEYWORDS,
+    AVERAGE_SPEECH_WPM,
+    DEFAULT_LANGUAGE,
+    DECISION_KEYWORDS,
+    GENERIC_FALLBACK,
+    HIGHLIGHT_FALLBACK,
+    HIGHLIGHT_KEYWORDS,
+    LANGUAGE_ALIASES,
+    QUESTION_STOP_WORDS,
+)
+from .cache import audio_fingerprint, load_cached_summary
 from .integrations import IntegrationConfig, load_provider_config, sync_action_items
 from .llm.loader import OnDeviceModelLoader
 from .models import (
@@ -35,115 +45,28 @@ from .models import (
     MeetingTranscriptionResult,
     StreamingSummarySnapshot,
 )
+from .persistence import (
+    append_jsonl,
+    export_integrations,
+    record_analytics,
+    record_audit,
+    record_for_search,
+    record_quality_alerts,
+    sync_action_items_if_configured,
+)
+from .pii import mask_segments, mask_text
+from .quality import compute_quality_metrics
+from .reviewer import SummaryReviewer
 from .speaker_id import SpeakerIdentifier, load_speaker_identifier
+from .streaming import StreamingMeetingSession
 from .stt import TranscriptionPayload, create_stt_backend
 from .summarizer import SummariserConfig, available_summary_backends, create_summary_backend
+from core.agents.supervisor import SummarySupervisor, SupervisorDecision
 from .workflow import MeetingWorkflowEngine
 
 LOGGER = get_logger("meeting.pipeline")
 
 SENTENCE_BOUNDARY = re.compile(r"(?<=[.!?\n])\s+")
-
-LANGUAGE_ALIASES = {
-    "ko": "ko",
-    "kor": "ko",
-    "korean": "ko",
-    "ko-kr": "ko",
-    "kr": "ko",
-    "en": "en",
-    "eng": "en",
-    "english": "en",
-    "en-us": "en",
-    "en-gb": "en",
-    "ja": "ja",
-    "jpn": "ja",
-    "japanese": "ja",
-    "zh": "zh",
-    "zh-cn": "zh",
-    "zh-tw": "zh",
-    "cmn": "zh",
-    "chi": "zh",
-    "mandarin": "zh",
-}
-
-DEFAULT_LANGUAGE = "ko"
-
-ACTION_KEYWORDS = {
-    "default": ["action", "todo", "follow", "follow-up"],
-    "ko": ["action", "todo", "follow", "해야", "요청", "담당", "액션", "아이템", "후속"],
-    "en": ["action", "todo", "follow", "follow-up", "owner", "next step"],
-    "ja": ["対応", "タスク", "宿題", "確認", "引き続き"],
-    "zh": ["行动", "待办", "跟进", "负责人", "任务"],
-}
-
-DECISION_KEYWORDS = {
-    "default": ["decision", "decide", "approved", "agreed"],
-    "ko": ["결정", "승인", "확정", "정리", "합의"],
-    "en": ["decision", "approved", "agreed", "final"],
-    "ja": ["決定", "合意", "承認", "確定"],
-    "zh": ["决定", "批准", "确认", "定案"],
-}
-
-HIGHLIGHT_KEYWORDS = {
-    "default": ["key", "highlight", "important", "summary", "note"],
-    "ko": ["핵심", "하이라이트", "중요", "요약", "결론", "중점"],
-    "en": ["key", "highlight", "important", "summary", "notable"],
-    "ja": ["重要", "ハイライト", "要点", "まとめ"],
-    "zh": ["重点", "亮点", "总结", "重要"]
-}
-
-HIGHLIGHT_FALLBACK = {
-    "ko": "회의 주요 내용을 식별하지 못했습니다.",
-    "en": "No key highlights detected.",
-    "ja": "主要なハイライトを検出できませんでした。",
-    "zh": "未检测到关键要点。",
-}
-
-GENERIC_FALLBACK = {
-    "ko": "관련 항목이 발견되지 않았습니다.",
-    "en": "No related items found.",
-    "ja": "該当する項目が見つかりませんでした。",
-    "zh": "未找到相关条目。",
-}
-
-PII_EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
-PII_PHONE_RE = re.compile(r"\+?\d[\d\s\-]{7,}\d")
-
-AVERAGE_SPEECH_WPM = 130
-
-QUESTION_STOP_WORDS = {
-    "the",
-    "a",
-    "an",
-    "is",
-    "are",
-    "was",
-    "were",
-    "what",
-    "who",
-    "when",
-    "where",
-    "why",
-    "how",
-    "do",
-    "does",
-    "did",
-    "will",
-    "can",
-    "should",
-    "could",
-    "would",
-    "please",
-    "누가",
-    "무엇",
-    "언제",
-    "어디",
-    "왜",
-    "어떻게",
-    "무슨",
-    "어느",
-    "가능",
-}
 
 try:  # Optional dependency for spacing correction
     from pykospacing import Spacing  # type: ignore
@@ -220,9 +143,16 @@ class MeetingPipeline:
         self._context_store = MeetingContextStore.from_env()
         self._integration_config: Optional[IntegrationConfig] = load_provider_config()
         self._on_device_loader = OnDeviceModelLoader.from_env()
+        self._reviewer = SummaryReviewer.from_env()
+        self._supervisor = SummarySupervisor.from_env("MEETING")
         self._audit_logger = MeetingAuditLogger.from_env()
+        review_mode_env = (os.getenv("MEETING_SUMMARY_REVIEW_MODE") or "auto").strip().lower()
+        self._review_mode = review_mode_env if review_mode_env in {"auto", "always", "manual", "off"} else "auto"
+        supervisor_mode_env = (os.getenv("MEETING_SUPERVISOR_MODE") or "auto").strip().lower()
+        self._supervisor_mode = supervisor_mode_env if supervisor_mode_env in {"auto", "always", "manual", "off"} else "auto"
         self._cancel_event: Optional[Any] = None
         self._last_events: List[Dict[str, Any]] = []
+        self._last_review_backend: Optional[str] = None
 
     def start_streaming(
         self,
@@ -261,6 +191,8 @@ class MeetingPipeline:
 
         context_bundle: Optional[ContextBundle] = None
         summary: Optional[MeetingSummary] = None
+        self._last_review_backend = None
+        context.extras["review_backend_used"] = None
 
         if not workflow.should_run("summary"):
             summary = workflow.load_summary()
@@ -269,9 +201,40 @@ class MeetingPipeline:
                 if not isinstance(summary.attachments, dict):
                     summary.attachments = {}
 
+        context.extras["quality_metrics"] = None
+        context.extras["alerts"] = None
+        context.extras["supervisor_decision"] = None
+        review_performed = False
+
         if summary is None:
             context_bundle = self._collect_context_bundle(job)
             summary = self._summarise(job, transcript, context_bundle)
+            issues, focus_keywords = self._evaluate_summary_quality(job, transcript, summary)
+            if issues:
+                summary.structured_summary["review_issues"] = issues
+            if focus_keywords:
+                summary.structured_summary["review_focus"] = focus_keywords
+            if self._review_mode:
+                summary.structured_summary["review_mode"] = self._review_mode
+            review_enabled = self._reviewer.is_enabled() and self._review_mode not in {"off", "manual"}
+            should_review = review_enabled and (self._review_mode == "always" or bool(issues))
+            if should_review:
+                reviewed = self._reviewer.review(
+                    job,
+                    summary,
+                    transcript,
+                    issues=issues,
+                    focus_keywords=focus_keywords if focus_keywords else None,
+                )
+                if reviewed is not None:
+                    summary = reviewed
+                    review_performed = True
+                    self._last_review_backend = self._reviewer.backend
+                    context.extras["review_backend_used"] = self._reviewer.backend
+                    issues, focus_keywords = self._evaluate_summary_quality(job, transcript, summary)
+                    summary.structured_summary["review_issues"] = issues
+                    if focus_keywords:
+                        summary.structured_summary["review_focus"] = focus_keywords
             workflow.store_summary(summary)
             workflow.mark_completed("summary")
 
@@ -291,6 +254,57 @@ class MeetingPipeline:
                 if not summary.context:
                     summary.context = context_bundle.summary_prompt
 
+        metrics = compute_quality_metrics(transcript, summary)
+        alerts = self._detect_low_quality_summary(summary, metrics)
+        supervisor_info: Optional[Dict[str, Any]] = None
+        supervisor_enabled = self._supervisor.is_enabled() and self._supervisor_mode not in {"off", "manual"}
+
+        if supervisor_enabled:
+            decision = self._supervisor.decide(
+                agent="meeting",
+                summary=summary,
+                metrics=metrics,
+                issues=summary.structured_summary.get("review_issues"),
+                alerts=alerts,
+            )
+            supervisor_info = decision.as_dict()
+            summary.structured_summary["supervisor_decision"] = supervisor_info
+
+            if decision.action == "review":
+                can_review = self._reviewer.is_enabled() and self._review_mode not in {"off", "manual"}
+                if can_review and not review_performed:
+                    focus_override = decision.focus_keywords or summary.structured_summary.get("review_focus")
+                    reviewed = self._reviewer.review(
+                        job,
+                        summary,
+                        transcript,
+                        issues=summary.structured_summary.get("review_issues") or [],
+                        focus_keywords=focus_override,
+                    )
+                    if reviewed is not None:
+                        summary = reviewed
+                        review_performed = True
+                        self._last_review_backend = self._reviewer.backend
+                        context.extras["review_backend_used"] = self._reviewer.backend
+                        issues, focus_keywords = self._evaluate_summary_quality(job, transcript, summary)
+                        summary.structured_summary["review_issues"] = issues
+                        if focus_keywords:
+                            summary.structured_summary["review_focus"] = focus_keywords
+                        metrics = compute_quality_metrics(transcript, summary)
+                        alerts = self._detect_low_quality_summary(summary, metrics)
+                        supervisor_info["follow_up"] = "reviewer_rerun"
+            elif decision.action == "escalate":
+                summary.structured_summary["requires_manual_review"] = True
+                note = decision.notes or decision.reason
+                if note:
+                    summary.structured_summary["supervisor_notes"] = note
+
+        if alerts:
+            summary.structured_summary["alerts"] = alerts
+
+        context.extras["quality_metrics"] = metrics
+        context.extras["alerts"] = alerts
+        context.extras["supervisor_decision"] = supervisor_info
         context.set("context_bundle", context_bundle)
         context.set("summary", summary)
 
@@ -318,8 +332,26 @@ class MeetingPipeline:
 
         if self._mask_pii_enabled:
             self._mask_sensitive_content(transcription=transcript, summary=summary)
-        self._sync_action_items(job, summary)
-        self._persist(job, transcript, summary)
+        sync_action_items_if_configured(job, summary, self._integration_config)
+        review_backend = context.extras.get("review_backend_used") or self._last_review_backend
+        review_info: Optional[Dict[str, str]] = None
+        if review_backend:
+            review_info = {"backend": review_backend}
+            review_model = getattr(self._reviewer, "model", None)
+            if review_model:
+                review_info["model"] = str(review_model)
+        metrics = context.extras.get("quality_metrics")
+        alerts = context.extras.get("alerts")
+        supervisor_decision = context.extras.get("supervisor_decision")
+        self._persist(
+            job,
+            transcript,
+            summary,
+            review_info=review_info,
+            metrics=metrics,
+            alerts=alerts,
+            supervisor_info=supervisor_decision,
+        )
         workflow.mark_completed("persistence")
         context.set("result", summary)
 
@@ -986,6 +1018,11 @@ class MeetingPipeline:
         job: MeetingJobConfig,
         transcription: MeetingTranscriptionResult,
         summary: MeetingSummary,
+        *,
+        review_info: Optional[Dict[str, str]] = None,
+        metrics: Optional[Dict[str, float | int | str]] = None,
+        alerts: Optional[List[str]] = None,
+        supervisor_info: Optional[Dict[str, Any]] = None,
     ) -> None:
         job.output_dir.mkdir(parents=True, exist_ok=True)
         summary.transcript_path.write_text(transcription.text, encoding="utf-8")
@@ -993,7 +1030,7 @@ class MeetingPipeline:
         participants = self._extract_participants(transcription.segments)
         cache_info = {
             "version": 1,
-            "audio_fingerprint": self._audio_fingerprint(job.audio_path),
+            "audio_fingerprint": audio_fingerprint(job.audio_path),
             "stt_backend": self.stt_backend,
             "summary_backend": self.summary_backend,
             "options": {
@@ -1001,6 +1038,9 @@ class MeetingPipeline:
                 "speaker_count": job.speaker_count,
             },
         }
+        if metrics is None:
+            metrics = compute_quality_metrics(transcription, summary)
+        structured_summary = dict(summary.structured_summary) if isinstance(summary.structured_summary, dict) else {}
         summary_payload = {
             "meeting_meta": {
                 "title": job.audio_path.stem or "meeting",
@@ -1023,14 +1063,19 @@ class MeetingPipeline:
             "raw_summary": summary.raw_summary,
             "cache": cache_info,
             "pii_masked": self._mask_pii_enabled,
-            "quality_metrics": self._compute_quality_metrics(transcription, summary),
+            "quality_metrics": metrics,
+            "structured_summary": structured_summary,
         }
+        if review_info:
+            summary_payload["generated_by"]["review"] = dict(review_info)
         if summary.context:
             summary_payload["context_prompt"] = summary.context
         if summary.attachments:
             attachments = summary_payload.setdefault("attachments", {})
             for key, value in summary.attachments.items():
                 attachments[key] = value
+        if supervisor_info:
+            summary_payload["supervisor"] = dict(supervisor_info)
         feedback_info = self._queue_feedback_request(job, summary)
         if feedback_info:
             summary_payload["feedback"] = feedback_info
@@ -1058,6 +1103,18 @@ class MeetingPipeline:
         metadata["cache"] = cache_info
         metadata["quality_metrics"] = summary_payload["quality_metrics"]
         metadata["pii_masked"] = self._mask_pii_enabled
+        if structured_summary.get("requires_manual_review"):
+            metadata["requires_manual_review"] = True
+        if review_info:
+            metadata.setdefault("generated_by", {})["review"] = dict(review_info)
+        if supervisor_info:
+            metadata.setdefault("supervisor", {})["decision"] = supervisor_info
+        if alerts is None:
+            alerts = self._detect_low_quality_summary(summary, summary_payload["quality_metrics"])
+        if alerts:
+            summary_payload["alerts"] = alerts
+            metadata["alerts"] = alerts
+            record_quality_alerts(job, alerts)
         if feedback_info:
             metadata["feedback"] = feedback_info
         metadata_path = job.output_dir / "metadata.json"
@@ -1102,18 +1159,33 @@ class MeetingPipeline:
             metadata_path,
         )
 
-        self._record_for_search(job, transcription, summary, summary_payload["quality_metrics"])
-        self._export_integrations(job, transcription, summary)
-        self._record_analytics(job, transcription, summary, summary_payload["quality_metrics"])
-        self._record_audit(
-            job,
-            transcription,
-            summary,
-            summary_payload,
-            summary_path,
-            metadata_path,
-            segments_path,
-        )
+        try:
+            record_for_search(job, transcription, summary, summary_payload["quality_metrics"])
+        except Exception as exc:  # pragma: no cover - diagnostics only
+            LOGGER.debug("failed to record meeting entry for search: %s", exc)
+        try:
+            export_integrations(job, transcription, summary)
+        except Exception as exc:  # pragma: no cover - defensive
+            LOGGER.warning("integration export failed: %s", exc)
+        try:
+            record_analytics(self._analytics_recorder, job, transcription, summary, summary_payload["quality_metrics"])
+        except Exception as exc:  # pragma: no cover - analytics optional
+            LOGGER.warning("analytics recording failed: %s", exc)
+        try:
+            record_audit(
+                self._audit_logger,
+                job,
+                transcription,
+                summary,
+                summary_payload,
+                summary_path,
+                metadata_path,
+                segments_path,
+                summary_backend=self.summary_backend,
+                stt_backend=self.stt_backend,
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            LOGGER.warning("audit logging failed: %s", exc)
 
     # ------------------------------------------------------------------
     # Post-processing helpers
@@ -1201,125 +1273,96 @@ class MeetingPipeline:
     def _fallback_message(self, language: str, mapping: Dict[str, str]) -> str:
         return mapping.get(language) or mapping.get(DEFAULT_LANGUAGE) or ""
 
-    def _compute_quality_metrics(
-        self,
+    @staticmethod
+    def _transcript_contains_keywords(
         transcription: MeetingTranscriptionResult,
-        summary: MeetingSummary,
-    ) -> Dict[str, float | int | str]:
-        transcript_chars = len(transcription.text or "")
-        summary_chars = len(summary.raw_summary or "")
-        compression = summary_chars / transcript_chars if transcript_chars else 0.0
-        rouge_scores = self._compute_rouge_metrics(transcription.text, summary.raw_summary)
-        lfqa_scores = self._estimate_lfqa_metrics(transcription.text, summary.raw_summary)
+        keywords: Sequence[str],
+    ) -> bool:
+        lowered_keywords = [kw.lower() for kw in keywords if kw]
+        if not lowered_keywords:
+            return False
 
-        metrics: Dict[str, float | int | str] = {
-            "transcript_chars": transcript_chars,
-            "summary_chars": summary_chars,
-            "compression_ratio": round(compression, 4) if compression else 0.0,
-            "highlight_count": len(summary.highlights),
-            "action_count": len(summary.action_items),
-            "decision_count": len(summary.decisions),
-        }
-        metrics.update(rouge_scores)
-        metrics.update(lfqa_scores)
-        return metrics
+        segments = transcription.segments or []
+        for segment in segments:
+            text = str(segment.get("text") or "").lower()
+            if any(keyword in text for keyword in lowered_keywords):
+                return True
 
-    def _record_for_search(
+        text = (transcription.text or "").lower()
+        return any(keyword in text for keyword in lowered_keywords)
+
+    def _evaluate_summary_quality(
         self,
         job: MeetingJobConfig,
         transcription: MeetingTranscriptionResult,
         summary: MeetingSummary,
-        quality_metrics: Dict[str, float | int | str],
-    ) -> None:
-        index_env = os.getenv("MEETING_VECTOR_INDEX")
-        if index_env:
-            index_path = Path(index_env)
-        else:
-            index_path = job.output_dir.parent / "meeting_vector_index.jsonl"
+    ) -> Tuple[List[str], List[str]]:
+        issues: List[str] = []
+        focus_keywords: set[str] = set()
+        language = (
+            self._map_language_code(transcription.language)
+            or self._map_language_code(job.language)
+            or DEFAULT_LANGUAGE
+        )
 
-        entry = {
-            "meeting_id": job.audio_path.stem,
-            "created_at": job.created_at.isoformat(),
-            "language": transcription.language,
-            "summary": summary.raw_summary,
-            "highlights": summary.structured_summary.get("highlights", []),
-            "action_items": summary.structured_summary.get("action_items", []),
-            "decisions": summary.structured_summary.get("decisions", []),
-            "quality_metrics": quality_metrics,
-            "source": str(job.audio_path),
-            "output_dir": str(job.output_dir),
-        }
+        metrics = compute_quality_metrics(transcription, summary)
+        compression = float(metrics.get("compression_ratio") or 0.0)
+        transcript_chars = int(metrics.get("transcript_chars") or 0)
+        summary_chars = int(metrics.get("summary_chars") or 0)
 
-        try:
-            index_path.parent.mkdir(parents=True, exist_ok=True)
-            with index_path.open("a", encoding="utf-8") as handle:
-                handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
-        except Exception as exc:  # pragma: no cover - diagnostic only
-            LOGGER.debug("failed to record meeting entry for search: %s", exc)
+        highlight_keywords = self._keywords_for(language, HIGHLIGHT_KEYWORDS)
+        action_keywords = self._keywords_for(language, ACTION_KEYWORDS)
+        decision_keywords = self._keywords_for(language, DECISION_KEYWORDS)
 
-    def _record_analytics(
+        if not (summary.highlights and any(item.strip() for item in summary.highlights)):
+            if self._transcript_contains_keywords(transcription, highlight_keywords):
+                issues.append("핵심 요약이 비어 있어 주요 논점을 bullet 형태로 보완해 주세요.")
+                focus_keywords.update(highlight_keywords)
+
+        if not (summary.action_items and any(item.strip() for item in summary.action_items)):
+            if self._transcript_contains_keywords(transcription, action_keywords):
+                issues.append("액션 아이템이 누락되었습니다. 담당자와 후속 조치를 식별해 주세요.")
+                focus_keywords.update(action_keywords)
+
+        if not (summary.decisions and any(item.strip() for item in summary.decisions)):
+            if self._transcript_contains_keywords(transcription, decision_keywords):
+                issues.append("결정 사항이 비어 있습니다. 합의된 사항을 bullet 형태로 정리해 주세요.")
+                focus_keywords.update(decision_keywords)
+
+        if transcript_chars and compression < 0.01:
+            issues.append("요약이 지나치게 짧습니다. 중요한 내용을 더 포함해 주세요.")
+            focus_keywords.update(highlight_keywords)
+            focus_keywords.update(action_keywords)
+            focus_keywords.update(decision_keywords)
+
+        if transcript_chars and compression > 0.5:
+            issues.append("요약이 너무 길어 간결하지 않습니다. 핵심만 유지해 주세요.")
+
+        if summary_chars == 0:
+            issues.append("요약 텍스트가 비어 있습니다. 회의 내용을 간단히라도 요약해 주세요.")
+
+        ordered_keywords = list(dict.fromkeys(kw for kw in focus_keywords if kw))
+        return issues, ordered_keywords
+
+    def _detect_low_quality_summary(
         self,
-        job: MeetingJobConfig,
-        transcription: MeetingTranscriptionResult,
         summary: MeetingSummary,
-        quality_metrics: Dict[str, float | int | str],
-    ) -> None:
-        try:
-            self._analytics_recorder.record(job, transcription, summary, quality_metrics)
-        except Exception as exc:  # pragma: no cover - analytics is optional
-            LOGGER.warning("analytics recording failed: %s", exc)
-
-    def _record_audit(
-        self,
-        job: MeetingJobConfig,
-        transcription: MeetingTranscriptionResult,
-        summary: MeetingSummary,
-        summary_payload: Dict[str, object],
-        summary_path: Path,
-        metadata_path: Path,
-        segments_path: Path,
-    ) -> None:
-        if not self._audit_logger.is_enabled():
-            return
-        payload: Dict[str, object] = {
-            "event_type": "meeting_pipeline.completed",
-            "meeting_id": job.audio_path.stem,
-            "audio_path": str(job.audio_path),
-            "output_dir": str(job.output_dir),
-            "summary_path": str(summary_path),
-            "metadata_path": str(metadata_path),
-            "segments_path": str(segments_path),
-            "summary_backend": self.summary_backend,
-            "stt_backend": self.stt_backend,
-            "language": transcription.language,
-            "duration_seconds": transcription.duration_seconds,
-            "highlight_count": len(summary.highlights),
-            "action_count": len(summary.action_items),
-            "decision_count": len(summary.decisions),
-            "quality_metrics": summary_payload.get("quality_metrics"),
-            "status": "completed",
-        }
-        if job.policy_tag:
-            payload["policy_tag"] = job.policy_tag
-        if job.created_at:
-            payload["created_at"] = job.created_at.isoformat()
-        if summary.context:
-            payload["context_snippet"] = summary.context[:500]
-        try:
-            self._audit_logger.record(payload)
-        except Exception as exc:  # pragma: no cover - defensive
-            LOGGER.warning("audit logging failed: %s", exc)
-
-    def _sync_action_items(self, job: MeetingJobConfig, summary: MeetingSummary) -> None:
-        if not self._integration_config:
-            return
-        entries = summary.structured_summary.get("action_items") or []
-        if not entries:
-            return
-        try:
-            sync_action_items(entries, self._integration_config, output_dir=job.output_dir)
-        except Exception as exc:  # pragma: no cover - defensive
-            LOGGER.warning("action item sync failed: %s", exc)
+        metrics: Dict[str, float | int | str],
+    ) -> List[str]:
+        alerts: List[str] = []
+        if not (summary.highlights and any(item.strip() for item in summary.highlights)):
+            alerts.append("highlight_missing")
+        if not (summary.action_items and any(item.strip() for item in summary.action_items)):
+            alerts.append("action_items_missing")
+        if not (summary.decisions and any(item.strip() for item in summary.decisions)):
+            alerts.append("decisions_missing")
+        compression = float(metrics.get("compression_ratio") or 0.0)
+        transcript_chars = int(metrics.get("transcript_chars") or 0)
+        if transcript_chars and compression < 0.01:
+            alerts.append("summary_too_short")
+        if transcript_chars and compression > 0.5:
+            alerts.append("summary_too_long")
+        return alerts
 
     def _mask_sensitive_content(
         self,
@@ -1327,135 +1370,17 @@ class MeetingPipeline:
         transcription: MeetingTranscriptionResult,
         summary: MeetingSummary,
     ) -> None:
-        transcription.text = self._mask_text(transcription.text)
-        for segment in transcription.segments:
-            segment["text"] = self._mask_text(segment.get("text"))
-        summary.raw_summary = self._mask_text(summary.raw_summary)
-        summary.highlights = [self._mask_text(text) for text in summary.highlights]
-        summary.action_items = [self._mask_text(text) for text in summary.action_items]
-        summary.decisions = [self._mask_text(text) for text in summary.decisions]
+        transcription.text = mask_text(transcription.text)
+        transcription.segments = mask_segments(transcription.segments)
+        summary.raw_summary = mask_text(summary.raw_summary)
+        summary.highlights = [mask_text(text) for text in summary.highlights]
+        summary.action_items = [mask_text(text) for text in summary.action_items]
+        summary.decisions = [mask_text(text) for text in summary.decisions]
         for section in summary.structured_summary.values():
             if isinstance(section, list):
                 for item in section:
                     if isinstance(item, dict) and "text" in item:
-                        item["text"] = self._mask_text(item.get("text"))
-
-    def _mask_text(self, text: Optional[str]) -> str:
-        if not text:
-            return ""
-        masked = PII_EMAIL_RE.sub("[REDACTED_EMAIL]", text)
-        masked = PII_PHONE_RE.sub("[REDACTED_PHONE]", masked)
-        return masked
-
-    def _export_integrations(
-        self,
-        job: MeetingJobConfig,
-        transcription: MeetingTranscriptionResult,
-        summary: MeetingSummary,
-    ) -> None:
-        attachments: Dict[str, str] = {}
-
-        tasks_path = job.output_dir / "tasks.json"
-        tasks_payload = [
-            {
-                "title": item.get("text", ""),
-                "reference": item.get("ref"),
-                "status": "pending",
-                "source_meeting": job.audio_path.stem,
-            }
-            for item in summary.structured_summary.get("action_items", [])
-            if isinstance(item, dict)
-        ]
-        tasks_path.write_text(
-            json.dumps(tasks_payload, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-        attachments["tasks"] = tasks_path.name
-
-        action_items_path = job.output_dir / "action_items.json"
-        action_entries = [
-            item
-            for item in summary.structured_summary.get("action_items", [])
-            if isinstance(item, dict)
-        ]
-        action_items_payload = {
-            "meeting_id": job.audio_path.stem,
-            "generated_at": job.created_at.isoformat(),
-            "items": action_entries,
-        }
-        action_items_path.write_text(
-            json.dumps(action_items_payload, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-        attachments["action_items"] = action_items_path.name
-
-        calendar_path = job.output_dir / "meeting.ics"
-        calendar_path.write_text(
-            self._build_calendar_event(job, transcription, summary),
-            encoding="utf-8",
-        )
-        attachments["calendar"] = calendar_path.name
-
-        integrations_path = job.output_dir / "integrations.json"
-        integrations_payload = {
-            "meeting_id": job.audio_path.stem,
-            "generated_at": job.created_at.isoformat(),
-            "tasks_file": tasks_path.name,
-            "calendar_file": calendar_path.name,
-            "action_items_file": action_items_path.name,
-            "action_items": summary.structured_summary.get("action_items", []),
-            "decisions": summary.structured_summary.get("decisions", []),
-        }
-        integrations_path.write_text(
-            json.dumps(integrations_payload, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-        attachments["integrations"] = integrations_path.name
-
-        summary_json = job.output_dir / "summary.json"
-        if summary_json.exists():
-            try:
-                payload = json.loads(summary_json.read_text(encoding="utf-8"))
-            except Exception:
-                payload = {}
-            payload.setdefault("attachments", {}).update(attachments)
-            summary_json.write_text(
-                json.dumps(payload, ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
-
-    def _build_calendar_event(
-        self,
-        job: MeetingJobConfig,
-        transcription: MeetingTranscriptionResult,
-        summary: MeetingSummary,
-    ) -> str:
-        start = job.created_at
-        duration = transcription.duration_seconds or 0.0
-        if duration <= 0:
-            duration = 3600.0
-        end = start + timedelta(seconds=duration)
-        dtstamp = start.strftime("%Y%m%dT%H%M%SZ")
-        dtstart = dtstamp
-        dtend = end.strftime("%Y%m%dT%H%M%SZ")
-        description = summary.raw_summary.replace("\n", "\\n")
-        uid = f"{job.audio_path.stem}-{int(start.timestamp())}@infopilot.local"
-
-        lines = [
-            "BEGIN:VCALENDAR",
-            "VERSION:2.0",
-            "PRODID:-//InfoPilot//Meeting Agent//EN",
-            "BEGIN:VEVENT",
-            f"UID:{uid}",
-            f"DTSTAMP:{dtstamp}",
-            f"DTSTART:{dtstart}",
-            f"DTEND:{dtend}",
-            f"SUMMARY:{job.audio_path.stem or 'Meeting'}",
-            f"DESCRIPTION:{description}",
-            "END:VEVENT",
-            "END:VCALENDAR",
-        ]
-        return "\r\n".join(lines) + "\r\n"
+                        item["text"] = mask_text(item.get("text"))
 
     def _queue_feedback_request(
         self,
@@ -1473,13 +1398,13 @@ class MeetingPipeline:
         }
 
         local_queue = job.output_dir / "feedback_queue.jsonl"
-        self._append_jsonl(local_queue, feedback_entry)
+        append_jsonl(local_queue, feedback_entry)
 
         global_queue_env = os.getenv("MEETING_FEEDBACK_INBOX")
         global_path: Optional[Path] = None
         if global_queue_env:
             global_path = Path(global_queue_env)
-            self._append_jsonl(global_path, feedback_entry)
+            append_jsonl(global_path, feedback_entry)
 
         return {
             "queue": local_queue.name,
@@ -1487,228 +1412,16 @@ class MeetingPipeline:
             "global_queue": str(global_path) if global_path else None,
         }
 
-
-    # ------------------------------------------------------------------
-    # Quality & feedback helpers
-    # ------------------------------------------------------------------
-
-    def _compute_rouge_metrics(self, reference: Optional[str], summary: Optional[str]) -> Dict[str, float]:
-        reference_tokens = self._tokenize_for_metrics(reference)
-        summary_tokens = self._tokenize_for_metrics(summary)
-        if not reference_tokens or not summary_tokens:
-            return {
-                "rouge1_precision": 0.0,
-                "rouge1_recall": 0.0,
-                "rouge1_f": 0.0,
-                "rougeL_precision": 0.0,
-                "rougeL_recall": 0.0,
-                "rougeL_f": 0.0,
-            }
-
-        rouge1 = self._rouge_n(reference_tokens, summary_tokens, n=1)
-        rouge_l = self._rouge_l(reference_tokens, summary_tokens)
-
-        return {
-            "rouge1_precision": round(rouge1[0], 4),
-            "rouge1_recall": round(rouge1[1], 4),
-            "rouge1_f": round(rouge1[2], 4),
-            "rougeL_precision": round(rouge_l[0], 4),
-            "rougeL_recall": round(rouge_l[1], 4),
-            "rougeL_f": round(rouge_l[2], 4),
-        }
-
-    def _estimate_lfqa_metrics(self, transcript: Optional[str], summary: Optional[str]) -> Dict[str, float | int]:
-        questions = self._extract_question_keywords(transcript)
-        if not questions:
-            return {
-                "lfqa_question_count": 0,
-                "lfqa_coverage": 1.0,
-            }
-
-        summary_tokens = set(self._tokenize_for_metrics(summary))
-        covered = 0
-        for keywords in questions:
-            if not keywords:
-                covered += 1
-                continue
-            if any(token in summary_tokens for token in keywords):
-                covered += 1
-
-        coverage = covered / len(questions) if questions else 0.0
-        return {
-            "lfqa_question_count": len(questions),
-            "lfqa_coverage": round(coverage, 4),
-        }
-
-    def _extract_question_keywords(self, text: Optional[str]) -> List[List[str]]:
-        if not text:
-            return []
-        raw_questions = re.findall(r"[^?\n]+\?", text)
-        questions: List[List[str]] = []
-        for question in raw_questions:
-            tokens = [token for token in self._tokenize_for_metrics(question) if token not in QUESTION_STOP_WORDS]
-            questions.append(tokens)
-        return questions
-
-    def _tokenize_for_metrics(self, text: Optional[str]) -> List[str]:
-        if not text:
-            return []
-        return re.findall(r"[\w']+", text.lower())
-
-    def _rouge_n(
-        self,
-        reference: Sequence[str],
-        summary: Sequence[str],
-        *,
-        n: int,
-    ) -> Tuple[float, float, float]:
-        if n <= 0:
-            return (0.0, 0.0, 0.0)
-
-        def ngrams(tokens: Sequence[str]) -> Counter:
-            return Counter(tuple(tokens[i : i + n]) for i in range(len(tokens) - n + 1))
-
-        ref_counts = ngrams(reference)
-        sum_counts = ngrams(summary)
-        if not ref_counts or not sum_counts:
-            return (0.0, 0.0, 0.0)
-
-        overlap = sum((ref_counts & sum_counts).values())
-        precision = overlap / max(sum(sum_counts.values()), 1)
-        recall = overlap / max(sum(ref_counts.values()), 1)
-        f_score = self._safe_f1(precision, recall)
-        return (precision, recall, f_score)
-
-    def _rouge_l(self, reference: Sequence[str], summary: Sequence[str]) -> Tuple[float, float, float]:
-        lcs = self._lcs_length(reference, summary)
-        if lcs == 0:
-            return (0.0, 0.0, 0.0)
-        precision = lcs / len(summary) if summary else 0.0
-        recall = lcs / len(reference) if reference else 0.0
-        f_score = self._safe_f1(precision, recall)
-        return (precision, recall, f_score)
-
-    def _lcs_length(self, reference: Sequence[str], summary: Sequence[str]) -> int:
-        if not reference or not summary:
-            return 0
-        prev_row = [0] * (len(summary) + 1)
-        for ref_token in reference:
-            current = [0]
-            for idx, sum_token in enumerate(summary, start=1):
-                if ref_token == sum_token:
-                    current.append(prev_row[idx - 1] + 1)
-                else:
-                    current.append(max(prev_row[idx], current[-1]))
-            prev_row = current
-        return prev_row[-1]
-
-    @staticmethod
-    def _safe_f1(precision: float, recall: float) -> float:
-        if precision + recall == 0:
-            return 0.0
-        return 2 * precision * recall / (precision + recall)
-
-    def _append_jsonl(self, path: Path, payload: Dict[str, object]) -> None:
-        try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            with path.open("a", encoding="utf-8") as handle:
-                handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
-        except Exception as exc:  # pragma: no cover - diagnostics only
-            LOGGER.debug("failed to append feedback entry to %s: %s", path, exc)
-
-    # ------------------------------------------------------------------
-    # Cache helpers
-    # ------------------------------------------------------------------
-    def _audio_fingerprint(self, audio_path: Path) -> Dict[str, int]:
-        try:
-            stat = audio_path.stat()
-        except FileNotFoundError:
-            return {}
-        return {
-            "size": stat.st_size,
-            "mtime_ns": getattr(stat, "st_mtime_ns", int(stat.st_mtime * 1_000_000_000)),
-        }
-
-    def _matches_fingerprint(self, audio_path: Path, fingerprint: Dict[str, int]) -> bool:
-        if not fingerprint:
-            return False
-        current = self._audio_fingerprint(audio_path)
-        if not current:
-            return False
-        return (
-            current.get("size") == fingerprint.get("size")
-            and current.get("mtime_ns") == fingerprint.get("mtime_ns")
-        )
-
     def _load_cache(self, job: MeetingJobConfig) -> Optional[MeetingSummary]:
-        if not self._cache_enabled:
-            return None
-
-        summary_path = job.output_dir / "summary.json"
-        segments_path = job.output_dir / "segments.json"
-        metadata_path = job.output_dir / "metadata.json"
-        transcript_path = job.output_dir / "transcript.txt"
-
-        required = [summary_path, segments_path, metadata_path, transcript_path]
-        if not all(path.exists() for path in required):
-            return None
-
-        try:
-            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-        except Exception as exc:
-            LOGGER.debug("failed to read meeting cache metadata: %s", exc)
-            return None
-
-        cache_info = metadata.get("cache") or {}
-        if cache_info.get("version") != 1:
-            return None
-        if cache_info.get("stt_backend") != self.stt_backend:
-            return None
-        if cache_info.get("summary_backend") != self.summary_backend:
-            return None
-
-        options = cache_info.get("options", {})
-        if bool(options.get("diarize")) != bool(job.diarize):
-            return None
-        if options.get("speaker_count") != job.speaker_count:
-            return None
-
-        if not self._matches_fingerprint(job.audio_path, cache_info.get("audio_fingerprint", {})):
-            return None
-
-        try:
-            summary_payload = json.loads(summary_path.read_text(encoding="utf-8"))
-        except Exception as exc:
-            LOGGER.debug("failed to read cached summary payload: %s", exc)
-            return None
-
-        summary_section = summary_payload.get("summary", {})
-        highlights = [entry.get("text", "") for entry in summary_section.get("highlights", [])]
-        action_items = [entry.get("text", "") for entry in summary_section.get("action_items", [])]
-        decisions = [entry.get("text", "") for entry in summary_section.get("decisions", [])]
-        raw_summary = summary_section.get("raw_summary") or summary_payload.get("raw_summary", "")
-
-        structured_summary = {
-            "highlights": summary_section.get("highlights", []),
-            "action_items": summary_section.get("action_items", []),
-            "decisions": summary_section.get("decisions", []),
-        }
-
-        attachments = summary_payload.get("attachments") or {}
-        if not isinstance(attachments, dict):
-            attachments = {}
-        context_prompt = summary_payload.get("context_prompt")
-
-        return MeetingSummary(
-            highlights=highlights,
-            action_items=action_items,
-            decisions=decisions,
-            raw_summary=raw_summary,
-            transcript_path=transcript_path,
-            structured_summary=structured_summary,
-            context=context_prompt,
-            attachments=attachments,
+        return load_cached_summary(
+            job,
+            stt_backend=self.stt_backend,
+            summary_backend=self.summary_backend,
+            cache_enabled=self._cache_enabled,
         )
+
+    def _audio_fingerprint(self, audio_path: Path) -> Dict[str, int]:
+        return audio_fingerprint(audio_path)
 
 
 def get_backend_diagnostics() -> Dict[str, Dict[str, bool]]:
@@ -1741,296 +1454,74 @@ def _resource_diagnostics() -> Dict[str, object]:
         info["gpu_available"] = False
     return info
 
-class StreamingMeetingSession:
-    """Stateful helper that supports streaming meeting transcription snapshots."""
+    def _sync_action_items(self, job: MeetingJobConfig, summary: MeetingSummary) -> None:
+        if not self._integration_config:
+            return
+        entries = summary.structured_summary.get("action_items") or []
+        if not entries:
+            return
+        try:
+            sync_action_items(entries, self._integration_config, output_dir=job.output_dir)
+        except Exception as exc:  # pragma: no cover - defensive
+            LOGGER.warning("action item sync failed: %s", exc)
 
-    def __init__(
+    def _mask_sensitive_content(
         self,
-        pipeline: "MeetingPipeline",
-        job: MeetingJobConfig,
         *,
-        update_interval: float,
+        transcription: MeetingTranscriptionResult,
+        summary: MeetingSummary,
     ) -> None:
-        self._pipeline = pipeline
-        self._job = job
-        self._update_interval = max(update_interval, 0.0)
-        self._segments: List[dict] = []
-        self._text_chunks: List[str] = []
-        self._elapsed = 0.0
-        self._since_snapshot = 0.0
-        self._speaker_alias: Dict[str, str] = {}
-        self._next_alias = 1
-        self._final_summary: Optional[MeetingSummary] = None
-        self._finalised = False
+        transcription.text = mask_text(transcription.text)
+        transcription.segments = mask_segments(transcription.segments)
+        summary.raw_summary = mask_text(summary.raw_summary)
+        summary.highlights = [mask_text(text) for text in summary.highlights]
+        summary.action_items = [mask_text(text) for text in summary.action_items]
+        summary.decisions = [mask_text(text) for text in summary.decisions]
+        for section in summary.structured_summary.values():
+            if isinstance(section, list):
+                for item in section:
+                    if isinstance(item, dict) and "text" in item:
+                        item["text"] = mask_text(item.get("text"))
 
-    def ingest(
+    def _queue_feedback_request(
         self,
-        text: str,
-        *,
-        speaker: Optional[str] = None,
-        start: Optional[float] = None,
-        end: Optional[float] = None,
-    ) -> Optional[StreamingSummarySnapshot]:
-        if self._finalised:
-            raise RuntimeError("streaming session already finalised")
-
-        cleaned = (text or "").strip()
-        if not cleaned:
-            return None
-
-        start_time, end_time = self._resolve_window(cleaned, start, end)
-        speaker_label = self._normalise_speaker(speaker)
-
-        segment = {
-            "start": start_time,
-            "end": end_time,
-            "speaker": speaker_label,
-            "text": cleaned,
-        }
-        self._segments.append(segment)
-        self._text_chunks.append(cleaned)
-
-        self._elapsed = max(self._elapsed, end_time)
-        segment_duration = max(end_time - start_time, 0.0)
-        self._since_snapshot += segment_duration
-
-        if self._update_interval == 0 or self._since_snapshot >= self._update_interval:
-            self._since_snapshot = 0.0
-            return self.snapshot()
-        return None
-
-    def snapshot(self) -> StreamingSummarySnapshot:
-        language = self._detect_language()
-        highlights = self._pipeline._extract_highlights(self._segments, language)
-        action_entries = self._pipeline._extract_action_items(self._segments, language)
-        decision_entries = self._pipeline._extract_decisions(self._segments, language)
-        summary_text = self._pipeline._build_summary_text(highlights, action_entries, decision_entries)
-
-        return StreamingSummarySnapshot(
-            summary_text=summary_text,
-            highlights=[entry.get("text", "") for entry in highlights],
-            action_items=[entry.get("text", "") for entry in action_entries],
-            decisions=[entry.get("text", "") for entry in decision_entries],
-            elapsed_seconds=self._elapsed,
-            language=language,
-        )
-
-    def finalize(self) -> MeetingSummary:
-        if self._final_summary is not None:
-            return self._final_summary
-
-        transcription = self._build_transcription_result()
-        context_bundle = self._pipeline._collect_context_bundle(self._job)
-        summary = self._pipeline._summarise(self._job, transcription, context_bundle)
-        if self._pipeline._mask_pii_enabled:
-            self._pipeline._mask_sensitive_content(transcription=transcription, summary=summary)
-        self._pipeline._persist(self._job, transcription, summary)
-
-        self._final_summary = summary
-        self._finalised = True
-        return summary
-
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
-
-    def _resolve_window(
-        self,
-        text: str,
-        start: Optional[float],
-        end: Optional[float],
-    ) -> Tuple[float, float]:
-        if start is None:
-            start_time = self._elapsed
-        else:
-            start_time = max(float(start), 0.0)
-
-        if end is not None:
-            end_time = max(float(end), start_time)
-        else:
-            duration = self._pipeline._estimate_text_duration(text)
-            end_time = max(start_time + duration, start_time)
-
-        return (round(start_time, 2), round(end_time, 2))
-
-    def _normalise_speaker(self, speaker: Optional[str]) -> str:
-        if not speaker:
-            alias = self._speaker_alias.get("__default__")
-            if alias:
-                return alias
-            alias = "speaker_1"
-            self._speaker_alias["__default__"] = alias
-            self._next_alias = max(self._next_alias, 2)
-            return alias
-
-        key = speaker.strip().lower()
-        if key in self._speaker_alias:
-            return self._speaker_alias[key]
-
-        alias = f"speaker_{self._next_alias}"
-        self._next_alias += 1
-        self._speaker_alias[key] = alias
-        return alias
-
-    def _detect_language(self) -> str:
-        text = " ".join(self._text_chunks)
-        return self._pipeline._detect_language(text, self._job.language)
-
-    def _build_transcription_result(self) -> MeetingTranscriptionResult:
-        text = " ".join(self._text_chunks).strip()
-        language = self._pipeline._detect_language(text, self._job.language)
-        normalised_segments = self._pipeline._normalise_segments(self._segments, self._job)
-        duration = self._elapsed if self._elapsed > 0 else self._pipeline._estimate_text_duration(text)
-        return MeetingTranscriptionResult(
-            text=text,
-            segments=normalised_segments,
-            duration_seconds=duration,
-            language=language,
-        )
-
-class StreamingMeetingSession:
-    """Stateful helper that supports streaming meeting transcription snapshots."""
-
-    def __init__(
-        self,
-        pipeline: "MeetingPipeline",
         job: MeetingJobConfig,
-        *,
-        update_interval: float,
-    ) -> None:
-        self._pipeline = pipeline
-        self._job = job
-        self._update_interval = max(update_interval, 0.0)
-        self._segments: List[dict] = []
-        self._text_chunks: List[str] = []
-        self._elapsed = 0.0
-        self._since_snapshot = 0.0
-        self._speaker_alias: Dict[str, str] = {}
-        self._next_alias = 1
-        self._final_summary: Optional[MeetingSummary] = None
-        self._finalised = False
-
-    def ingest(
-        self,
-        text: str,
-        *,
-        speaker: Optional[str] = None,
-        start: Optional[float] = None,
-        end: Optional[float] = None,
-    ) -> Optional[StreamingSummarySnapshot]:
-        if self._finalised:
-            raise RuntimeError("streaming session already finalised")
-
-        cleaned = (text or "").strip()
-        if not cleaned:
-            return None
-
-        start_time, end_time = self._resolve_window(cleaned, start, end)
-        speaker_label = self._normalise_speaker(speaker)
-
-        segment = {
-            "start": start_time,
-            "end": end_time,
-            "speaker": speaker_label,
-            "text": cleaned,
+        summary: MeetingSummary,
+    ) -> Optional[Dict[str, object]]:
+        feedback_entry = {
+            "meeting_id": job.audio_path.stem,
+            "created_at": job.created_at.isoformat(),
+            "summary_backend": self.summary_backend,
+            "status": "pending",
+            "highlights": summary.highlights,
+            "action_items": summary.structured_summary.get("action_items", []),
+            "decisions": summary.structured_summary.get("decisions", []),
         }
-        self._segments.append(segment)
-        self._text_chunks.append(cleaned)
 
-        self._elapsed = max(self._elapsed, end_time)
-        segment_duration = max(end_time - start_time, 0.0)
-        self._since_snapshot += segment_duration
+        local_queue = job.output_dir / "feedback_queue.jsonl"
+        append_jsonl(local_queue, feedback_entry)
 
-        if self._update_interval == 0 or self._since_snapshot >= self._update_interval:
-            self._since_snapshot = 0.0
-            return self.snapshot()
-        return None
+        global_queue_env = os.getenv("MEETING_FEEDBACK_INBOX")
+        global_path: Optional[Path] = None
+        if global_queue_env:
+            global_path = Path(global_queue_env)
+            append_jsonl(global_path, feedback_entry)
 
-    def snapshot(self) -> StreamingSummarySnapshot:
-        language = self._detect_language()
-        highlights = self._pipeline._extract_highlights(self._segments, language)
-        action_entries = self._pipeline._extract_action_items(self._segments, language)
-        decision_entries = self._pipeline._extract_decisions(self._segments, language)
-        summary_text = self._pipeline._build_summary_text(highlights, action_entries, decision_entries)
+        return {
+            "queue": local_queue.name,
+            "status": "pending",
+            "global_queue": str(global_path) if global_path else None,
+        }
 
-        return StreamingSummarySnapshot(
-            summary_text=summary_text,
-            highlights=[entry.get("text", "") for entry in highlights],
-            action_items=[entry.get("text", "") for entry in action_entries],
-            decisions=[entry.get("text", "") for entry in decision_entries],
-            elapsed_seconds=self._elapsed,
-            language=language,
-        )
-
-    def finalize(self) -> MeetingSummary:
-        if self._final_summary is not None:
-            return self._final_summary
-
-        transcription = self._build_transcription_result()
-        context_bundle = self._pipeline._collect_context_bundle(self._job)
-        summary = self._pipeline._summarise(self._job, transcription, context_bundle)
-        if self._pipeline._mask_pii_enabled:
-            self._pipeline._mask_sensitive_content(transcription=transcription, summary=summary)
-        self._pipeline._persist(self._job, transcription, summary)
-
-        self._final_summary = summary
-        self._finalised = True
-        return summary
 
     # ------------------------------------------------------------------
-    # Helpers
+    # Quality & feedback helpers
     # ------------------------------------------------------------------
 
-    def _resolve_window(
-        self,
-        text: str,
-        start: Optional[float],
-        end: Optional[float],
-    ) -> Tuple[float, float]:
-        if start is None:
-            start_time = self._elapsed
-        else:
-            start_time = max(float(start), 0.0)
-
-        if end is not None:
-            end_time = max(float(end), start_time)
-        else:
-            duration = self._pipeline._estimate_text_duration(text)
-            end_time = max(start_time + duration, start_time)
-
-        return (round(start_time, 2), round(end_time, 2))
-
-    def _normalise_speaker(self, speaker: Optional[str]) -> str:
-        if not speaker:
-            alias = self._speaker_alias.get("__default__")
-            if alias:
-                return alias
-            alias = "speaker_1"
-            self._speaker_alias["__default__"] = alias
-            self._next_alias = max(self._next_alias, 2)
-            return alias
-
-        key = speaker.strip().lower()
-        if key in self._speaker_alias:
-            return self._speaker_alias[key]
-
-        alias = f"speaker_{self._next_alias}"
-        self._next_alias += 1
-        self._speaker_alias[key] = alias
-        return alias
-
-    def _detect_language(self) -> str:
-        text = " ".join(self._text_chunks)
-        return self._pipeline._detect_language(text, self._job.language)
-
-    def _build_transcription_result(self) -> MeetingTranscriptionResult:
-        text = " ".join(self._text_chunks).strip()
-        language = self._pipeline._detect_language(text, self._job.language)
-        normalised_segments = self._pipeline._normalise_segments(self._segments, self._job)
-        duration = self._elapsed if self._elapsed > 0 else self._pipeline._estimate_text_duration(text)
-        return MeetingTranscriptionResult(
-            text=text,
-            segments=normalised_segments,
-            duration_seconds=duration,
-            language=language,
+    def _load_cache(self, job: MeetingJobConfig) -> Optional[MeetingSummary]:
+        return load_cached_summary(
+            job,
+            stt_backend=self.stt_backend,
+            summary_backend=self.summary_backend,
+            cache_enabled=self._cache_enabled,
         )

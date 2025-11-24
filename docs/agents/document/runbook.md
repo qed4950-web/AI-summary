@@ -18,8 +18,17 @@ ls data/corpus.parquet
 
 ```bash
 export LNPCHAT_LLM_BACKEND=ollama        # 또는 openai / groq 등
-export LNPCHAT_LLM_MODEL=llama3          # 설치된 모델 이름
+export LNPCHAT_LLM_MODEL=eeve_korean_v2  # 설치된 한국어 특화 모델 권장
 export LNPCHAT_LLM_HOST=127.0.0.1:11434  # 기본값이면 생략 가능
+
+# 선택: 결과 감독자 활성화 (자동 품질 체크)
+export DOCUMENT_SUPERVISOR_BACKEND=ollama
+export DOCUMENT_SUPERVISOR_MODE=auto
+export SUMMARY_SUPERVISOR_MODEL=eeve_korean_v2
+
+# 선택: LLM 출력을 간결하게 제한
+export DOCUMENT_LLM_NUM_PREDICT=192
+export DOCUMENT_LLM_TEMPERATURE=0.1
 ```
 
 스마트 폴더 정책을 사용하려면 `POLICY_PATH` 대신 CLI 인자를 활용하거나 UI에서 선택합니다.

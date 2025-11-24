@@ -8,9 +8,9 @@ audit:
   log_dir: logs/audit
 
 models:
-  default: sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2
+  default: BAAI/bge-m3
   registry:
-    default: sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2
+    default: BAAI/bge-m3
     meeting_default: meeting-model-small
     photo_default: photo-model-lite
     meeting_default:gpu: meeting-model-large

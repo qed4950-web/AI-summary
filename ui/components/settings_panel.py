@@ -41,7 +41,8 @@ class SettingsPanel(ctk.CTkToplevel):
         self.model_var = ctk.StringVar(value=self._get_setting("llm_model"))
         self.host_var = ctk.StringVar(value=self._get_setting("llm_host"))
         self.api_var = ctk.StringVar(value=self._get_setting("llm_api_key"))
-        self.health_timeout_var = ctk.StringVar(value=self._get_setting("llm_health_timeout") or "20")
+        self.health_timeout_var = ctk.StringVar(value=self._get_setting("llm_health_timeout") or "5")
+        self.auto_search_var = ctk.BooleanVar(value=bool(self.settings.get("conversation", "auto_search", default=False)))
 
         ctk.CTkLabel(container, text="LLM Backend").grid(row=0, column=0, sticky="w", pady=(0, 8))
         backend_menu = ctk.CTkOptionMenu(
@@ -90,8 +91,17 @@ class SettingsPanel(ctk.CTkToplevel):
         )
         timeout_hint.grid(row=5, column=0, columnspan=2, sticky="w", pady=(0, 12))
 
+        auto_search_switch = ctk.CTkSwitch(
+            container,
+            text="질문 시 자동으로 문서 검색 수행",
+            variable=self.auto_search_var,
+            onvalue=True,
+            offvalue=False,
+        )
+        auto_search_switch.grid(row=6, column=0, columnspan=2, sticky="w", pady=(0, 12))
+
         button_row = ctk.CTkFrame(container, fg_color="transparent")
-        button_row.grid(row=6, column=0, columnspan=2, sticky="e", pady=(10, 0))
+        button_row.grid(row=7, column=0, columnspan=2, sticky="e", pady=(10, 0))
         ctk.CTkButton(button_row, text="취소", width=90, command=self._cancel).pack(side="right", padx=(8, 0))
         ctk.CTkButton(button_row, text="저장", width=90, command=self._save).pack(side="right")
 
@@ -108,6 +118,7 @@ class SettingsPanel(ctk.CTkToplevel):
         self.settings.set(self.host_var.get().strip(), "conversation", "llm_host")
         self.settings.set(self.api_var.get().strip(), "conversation", "llm_api_key")
         self.settings.set(self._parse_timeout(self.health_timeout_var.get()), "conversation", "llm_health_timeout")
+        self.settings.set(bool(self.auto_search_var.get()), "conversation", "auto_search")
         self._close()
         if self._on_save:
             self._on_save()

@@ -103,7 +103,7 @@ class LNPChat:
     topk: int = 5
     translate: bool = False  # 기본은 다국어 Sentence-BERT로 번역 없이 처리
     rerank: bool = False
-    rerank_model: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+    rerank_model: str = "BAAI/bge-reranker-large"
     rerank_depth: int = 80
     rerank_batch_size: int = 16
     rerank_device: Optional[str] = None
@@ -111,6 +111,7 @@ class LNPChat:
     lexical_weight: float = 0.2
     show_translation: bool = False
     translation_lang: str = "en"
+    auto_search: bool = True
     min_similarity: float = 0.35
     policy_engine: Optional[PolicyEngine] = None
     policy_scope: str = "auto"  # auto|policy|global
@@ -120,6 +121,7 @@ class LNPChat:
     llm_host: str = field(default_factory=lambda: os.getenv("LNPCHAT_LLM_HOST", ""))
     llm_options: Dict[str, str] = field(default_factory=dict)
     llm_health_timeout: Optional[float] = field(default=None)
+    llm_timeout: float = field(default_factory=lambda: float(os.getenv("LNPCHAT_LLM_TIMEOUT", "12") or 12.0))
 
     retr: Optional[Retriever] = field(init=False, default=None)
     translator: Optional[Any] = field(init=False, default=None)
@@ -137,6 +139,7 @@ class LNPChat:
     tool_router: ToolRouter = field(init=False)
     llm_client: Optional[LLMClient] = field(init=False, default=None)
     pending_search: Optional[Dict[str, Any]] = field(init=False, default=None)
+    last_selected_hit_index: Optional[int] = field(init=False, default=None)
 
     def __post_init__(self) -> None:
         self.memory = MemoryStore(capacity=20)
@@ -144,7 +147,7 @@ class LNPChat:
         self.tool_router = ToolRouter()
         self.llm_client = self._init_llm_client()
 
-    def _init_llm_client(self) -> Optional[LLMClient]:
+    def _init_llm_client(self, *, require_health: bool = True) -> Optional[LLMClient]:
         backend = (self.llm_backend or "").strip()
         if not backend:
             return None
@@ -158,24 +161,24 @@ class LNPChat:
             if raw in {"1", "true", "yes", "on"}:
                 return True
             return default
-        require_llm = _env_flag("LNPCHAT_REQUIRE_LLM", default=True)
+        require_llm = _env_flag("LNPCHAT_REQUIRE_LLM", default=False) if require_health else False
         health_timeout_env = os.getenv("LNPCHAT_LLM_HEALTH_TIMEOUT", "").strip()
         health_timeout_s: float
         if self.llm_health_timeout is not None:
             try:
                 health_timeout_s = float(self.llm_health_timeout)
             except (TypeError, ValueError):
-                health_timeout_s = 20.0
+                health_timeout_s = 5.0
         elif health_timeout_env:
             try:
                 health_timeout_s = float(health_timeout_env)
             except ValueError:
-                health_timeout_s = 20.0
+                health_timeout_s = 5.0
         else:
-            health_timeout_s = 20.0
+            health_timeout_s = 5.0
         if not math.isfinite(health_timeout_s) or health_timeout_s <= 0:
-            health_timeout_s = 20.0
-        health_timeout_s = max(1.0, health_timeout_s)
+            health_timeout_s = 5.0
+        health_timeout_s = max(1.0, min(30.0, health_timeout_s))
         try:
             client = create_llm_client(
                 backend,
@@ -188,7 +191,7 @@ class LNPChat:
                 raise SystemExit(f"LLM 백엔드 '{backend}' 초기화에 실패했습니다: {exc}") from exc
             print(f"⚠️ 로컬 LLM 초기화 실패: {exc}")
             return None
-        if require_llm:
+        if require_health and require_llm:
             health_prompt = os.getenv("LNPCHAT_LLM_HEALTH_PROMPT", "ping")
             system_prompt = "You are a health check responder. Reply briefly."
             try:
@@ -202,6 +205,21 @@ class LNPChat:
             except Exception as exc:
                 raise SystemExit(f"LLM 백엔드 '{backend}'에 연결하는 중 오류가 발생했습니다: {exc}") from exc
         return client
+
+    def _reset_llm_client(self) -> bool:
+        backend = (self.llm_backend or "").strip()
+        if not backend:
+            return False
+        try:
+            client = self._init_llm_client(require_health=False)
+        except SystemExit as exc:
+            print(f"⚠️ 로컬 LLM 재연결 실패: {exc}")
+            return False
+        if client is None:
+            return False
+        self.llm_client = client
+        print("ℹ️ 로컬 LLM 세션을 다시 연결했습니다.")
+        return True
 
     # 초기화: Retriever 및 번역기 준비
     def ready(self, rebuild: bool = False):
@@ -432,15 +450,33 @@ class LNPChat:
 
         return lines
 
-    # 한 턴 처리
-    def ask(self, query: str, topk: Optional[int] = None) -> Dict[str, Any]:
+    def _ensure_ready(self) -> None:
         if not self.ready_done:
             self.ready(rebuild=False)
+        if self.retr is None:
+            raise RuntimeError("검색기 초기화에 실패했습니다. LNPChat.ready() 호출 결과를 확인하세요.")
+
+    # 한 턴 처리
+    def ask(self, query: str, topk: Optional[int] = None, *, force_action: Optional[str] = None) -> Dict[str, Any]:
         k = topk or self.topk
         query_tokens = {tok.lower() for tok in _split_tokens(query) if tok}
         consent_ack: Optional[str] = None
         stored_action: Optional[str] = None
         log_user_query = True
+
+        normalized_query = query.strip().lower()
+        normalized_head = normalized_query.split(maxsplit=1)[0] if normalized_query else ""
+        if normalized_head in {"/quit", "/exit", "/dialogue"}:
+            self.pending_search = None
+            self._reset_llm_client()
+            response = "검색 모드를 종료했어요. 이제 자유롭게 대화를 이어가세요."
+            self.memory.add_turn(role="user", text=query)
+            self.memory.add_turn(role="assistant", text=response)
+            return {
+                "answer": response,
+                "hits": [],
+                "suggestions": ["무엇을 도와드릴까요?"],
+            }
 
         if self.pending_search:
             if self._is_affirmative(query_tokens):
@@ -468,7 +504,15 @@ class LNPChat:
             else:
                 self.pending_search = None
 
-        if self.llm_client is None and self._is_small_talk(query_tokens):
+        hit_reference = self._respond_to_hit_reference(query)
+        if hit_reference is not None:
+            return hit_reference
+
+        followup_reference = self._respond_to_selected_hit_followup(query)
+        if followup_reference is not None:
+            return followup_reference
+
+        if self.llm_client is None and self._is_small_talk(query, query_tokens):
             friendly_answer = self._small_talk_reply(query)
             self.memory.add_turn(role="user", text=query)
             self.memory.add_turn(role="assistant", text=friendly_answer)
@@ -477,24 +521,20 @@ class LNPChat:
                 "hits": [],
                 "suggestions": ["문서를 검색하려면 궁금한 내용을 조금 더 구체적으로 적어 주세요."],
             }
-        if self.llm_client is not None and self._is_small_talk(query_tokens):
+        if self.llm_client is not None and self._is_small_talk(query, query_tokens):
             llm_reply = self._llm_chat_reply(query, mode="small_talk")
-            if llm_reply:
-                self.memory.add_turn(role="user", text=query)
-                self.memory.add_turn(role="assistant", text=llm_reply)
-                return {
-                    "answer": llm_reply,
-                    "hits": [],
-                    "suggestions": [],
-                    "llm_summary": llm_reply,
-                }
+            if not llm_reply:
+                llm_reply = self._small_talk_reply(query)
+            self.memory.add_turn(role="user", text=query)
+            self.memory.add_turn(role="assistant", text=llm_reply)
+            return {
+                "answer": llm_reply,
+                "hits": [],
+                "suggestions": [],
+                "llm_summary": llm_reply,
+            }
         effective_policy = self._resolve_policy_engine()
         self._policy_effective = bool(effective_policy)
-
-        # [번역 기능] 사용자 질문을 영어로 번역
-        contextual_query, used_context = self._rewrite_query(query, query_tokens)
-        if used_context:
-            print(f"  (이전 질문 맥락을 반영해 '{contextual_query}'로 검색합니다.)")
 
         if stored_action is not None:
             action = stored_action
@@ -506,11 +546,53 @@ class LNPChat:
                 llm_available=self.llm_client is not None,
             )
 
+        if force_action:
+            forced = force_action.strip().lower()
+            if forced in {"dialogue", "search", "search_and_summarize"}:
+                action = forced
+        elif (
+            not self.auto_search
+            and stored_action is None
+            and action not in {"search", "search_and_summarize"}
+        ):
+            action = "dialogue"
+
+        # 검색/요약이 실제로 필요할 때만 준비 비용을 지불한다.
+        search_mode = action in {"search", "search_and_summarize"}
+        if search_mode:
+            self._ensure_ready()
+
+        # [번역 기능] 사용자 질문을 영어로 번역
+        contextual_query, used_context = self._rewrite_query(query, query_tokens)
+        if used_context and search_mode:
+            print(f"  (이전 질문 맥락을 반영해 '{contextual_query}'로 검색합니다.)")
+
+        debug_query = query.strip().replace("\n", " ")
+        if len(debug_query) > 60:
+            debug_query = debug_query[:57] + "..."
+        print(
+            f"[LNPChat] action={action} search_mode={search_mode} "
+            f"pending={bool(self.pending_search)} force_action={force_action} query='{debug_query}'"
+        )
+
+        if self.llm_client is not None and action == "dialogue":
+            llm_reply = self._llm_chat_reply(query, mode="dialogue")
+            if not llm_reply:
+                llm_reply = self._fallback_dialogue_reply(query)
+            self.memory.add_turn(role="user", text=query)
+            self.memory.add_turn(role="assistant", text=llm_reply)
+            return {
+                "answer": llm_reply,
+                "hits": [],
+                "suggestions": [],
+                "llm_summary": llm_reply,
+            }
+
         if (
             stored_action is None
             and self.llm_client is not None
             and self.pending_search is None
-            and self._should_request_search_consent(action)
+            and self._should_request_search_consent(action, query=query, tokens=query_tokens)
         ):
             dialogue = self._llm_chat_reply(query, mode="dialogue")
             if not dialogue:
@@ -528,7 +610,7 @@ class LNPChat:
             }
 
         query_for_search = contextual_query
-        if self.translator:
+        if search_mode and self.translator:
             try:
                 translated = self.translator.translate(query_for_search)
                 query_for_search = translated if isinstance(translated, str) else getattr(translated, "text", query_for_search)
@@ -536,7 +618,8 @@ class LNPChat:
             except Exception as e:
                 print(f"\n[경고] 질문 번역 실패. 원본 질문으로 검색합니다. 오류: {e}")
 
-        self.session_state.add_query(contextual_query)
+        if search_mode:
+            self.session_state.add_query(contextual_query)
 
         # 스피너로 즉시 “살아있음” 표시
         index_ready = False
@@ -562,6 +645,7 @@ class LNPChat:
         filtered_hits, filtered_count = self._apply_policy_scope(hits)
         self.last_hits = filtered_hits
         self.last_query_text = contextual_query
+        self.last_selected_hit_index = None
 
         self._augment_translations(filtered_hits)
         hits = filtered_hits
@@ -685,20 +769,104 @@ class LNPChat:
         return result
 
     @staticmethod
-    def _is_small_talk(tokens: set[str]) -> bool:
+    def _is_small_talk(query: str, tokens: Set[str]) -> bool:
         if not tokens:
             return False
         if len(tokens) > 5:
             return False
-        normalized = {token.strip("!?.") for token in tokens}
-        return any(token in _GREETINGS for token in normalized)
+        normalized = {token.strip("!?.") for token in tokens if token}
+        if any(token in _GREETINGS for token in normalized):
+            return True
+        for token in normalized:
+            for greeting in _GREETINGS:
+                if greeting and greeting in token:
+                    return True
+        compact_query = "".join(query.split()).strip("!?.")
+        if compact_query and compact_query in _GREETINGS:
+            return True
+        if normalized and normalized.issubset({"안녕", "하세요"}):
+            return True
+        return False
 
-    @staticmethod
-    def _small_talk_reply(query: str) -> str:
+    def _small_talk_reply(self, query: str) -> str:
         stripped = query.strip()
-        if stripped:
-            return f"안녕하세요! '{stripped}'에 대해 도와드릴 내용이 있으면 말씀해 주세요."
-        return "안녕하세요! 궁금한 내용을 알려주시면 관련 정보를 찾아 드릴게요."
+        if not stripped:
+            return "안녕하세요! 무슨 이야기를 나눠볼까요?"
+        if len(stripped) <= 6:
+            return "그 말이 재미있네요! 이어서 어떤 이야기를 나누면 좋을까요?"
+        return f"{stripped}라는 이야기, 더 들려주시면 함께 생각해 볼게요."
+
+    def _fallback_dialogue_reply(self, query: str) -> str:
+        stripped = (query or "").strip()
+        last_assistant = self.memory.last_assistant_text() or ""
+        if not stripped:
+            return "무엇이 궁금하신지 이야기해 주시면 함께 생각해 볼게요."
+        if len(stripped) <= 8:
+            return "방금 이야기가 인상적이었어요. 어떤 마음으로 말한 건지 조금 더 들려줄래?"
+        if "재밌" in stripped:
+            return "나도 웃음이 나네! 어떤 부분이 그렇게 재미있었는지 궁금해."
+        if "말하고" in stripped or "대화" in stripped:
+            return "나도 지금 계속 대화 중이야. 이어서 궁금한 걸 이야기해 줄래?"
+        if stripped.endswith("?") and len(stripped) <= 18:
+            return f"{stripped.rstrip('?')}에 대해서는 네 생각이 어때? 조금 더 얘기해 줘."
+        if last_assistant:
+            sample = " ".join(last_assistant.split())
+            if len(sample) > 28:
+                sample = sample[:28].rstrip() + "..."
+            return f"방금 내가 \"{sample}\"이라고 했는데, 이어서 어떤 얘기를 나누면 좋을까?"
+        return f"{stripped}라고 말해줘서 고마워. 조금만 더 자세히 이야기해 줄래?"
+
+    def _compose_prompt(self, query: str, *, mode: str, include_history: bool, limit: int = 6) -> str:
+        current = (query or "").strip()
+        instruction_map = {
+            "small_talk": (
+                "친근하고 가볍게 대화를 이어가세요. 간결하면 좋지만 필요하면 최대 1000자까지 자세히 설명해도 됩니다. "
+                "사실이 아닌 내용을 지어내지 말고, 모르는 내용은 솔직히 모른다고 답하세요."
+            ),
+            "no_hits": (
+                "사용자에게 도움이 될 일반 지식을 한국어로 알려주세요. 핵심 위주로 정리하되 필요하면 1000자 이내에서 충분히 풀어 설명하세요. "
+                "근거가 없는 내용은 절대 만들지 말고, 확실하지 않다면 모른다고 말하세요."
+            ),
+            "dialogue": (
+                "이전 대화 흐름을 이어 자연스럽게 한국어로 답하세요. 가능한 간결하게, 하지만 필요한 경우 최대 1000자까지 자세히 쓸 수 있습니다. "
+                "문서 검색이나 시스템 설명은 언급하지 말고, 사실이 확인되지 않은 내용은 지어내지 마세요."
+            ),
+        }
+        instruction = instruction_map.get(
+            mode,
+            "친근하고 명확하게 한국어로 답하세요. 필요하면 최대 1000자까지 자세히 설명하되, 확인되지 않은 정보를 지어내지 말고 모르면 모른다고 답하세요.",
+        )
+        if include_history:
+            turns = []
+            for turn in self.memory.recent(limit=limit):
+                text = (turn.text or "").strip()
+                if not text:
+                    continue
+                if turn.hits:
+                    first_line = text.splitlines()[0][:160]
+                    text = f"[문서 추천 {len(turn.hits)}건] {first_line}"
+                else:
+                    collapsed = " ".join(text.split())
+                    if len(collapsed) > 360:
+                        text = collapsed[:360].rstrip() + " …"
+                    else:
+                        text = collapsed
+                role = "사용자" if turn.role == "user" else "비서"
+                turns.append(f"{role}: {text}")
+            if turns:
+                history = "\n".join(turns)
+                return textwrap.dedent(
+                    f"""
+                    이전 대화 기록:
+                    {history}
+
+                    사용자의 새 메시지: {current if current else '...'}
+
+                    {instruction}
+                    """
+                ).strip()
+        base = current if current else "..."
+        return f"{base}\n\n{instruction}"
 
     @staticmethod
     def _is_affirmative(tokens: Set[str]) -> bool:
@@ -711,43 +879,81 @@ class LNPChat:
         return any(token in negatives for token in tokens)
 
     @staticmethod
-    def _should_request_search_consent(action: str) -> bool:
-        return action in {"search", "search_and_summarize"}
+    def _has_document_intent(query: str, tokens: Set[str]) -> bool:
+        lowered_query = query.lower()
+        normalized_tokens = {token.lower() for token in tokens if token}
+        if lowered_query.startswith(("/search", "/doc")):
+            return True
+
+        doc_terms = {
+            "문서", "자료", "파일", "보고서", "리포트", "레포트", "policy", "document", "documents",
+            "documentation", "pdf", "ppt", "pptx", "자료집", "dataset", "데이터셋", "정책", "규정",
+        }
+        action_terms = {
+            "찾아", "찾아줘", "검색", "search", "scan", "살펴", "추려", "추천", "list", "show",
+            "요약", "요약해", "정리", "정리해", "정리해줘", "요약본", "알려줘",
+        }
+
+        has_doc = any(term in lowered_query for term in doc_terms) or bool(normalized_tokens & doc_terms)
+        has_action = any(term in lowered_query for term in action_terms) or bool(normalized_tokens & action_terms)
+        return has_doc and has_action
+
+    def _should_use_llm_chat(self, query: str, tokens: Set[str]) -> bool:
+        stripped = (query or "").strip()
+        if not stripped:
+            return False
+        if self._has_document_intent(query, tokens):
+            return False
+        if self._is_small_talk(query, tokens):
+            return True
+        if len(stripped) <= 48:
+            return True
+        return "?" in stripped
+
+    def _should_request_search_consent(self, action: str, *, query: str, tokens: Set[str]) -> bool:
+        if action not in {"search", "search_and_summarize"}:
+            return False
+        normalized = (query or "").strip()
+        if not normalized:
+            return False
+        if normalized.lower().startswith(("/search", "/doc")):
+            return False
+        if self._is_small_talk(query, tokens):
+            return False
+        if not self._has_document_intent(query, tokens):
+            return False
+        return True
 
     def _llm_chat_reply(self, query: str, *, mode: str) -> Optional[str]:
         client = self.llm_client
         if client is None:
             return None
-        if mode == "small_talk":
-            system_prompt = (
-                "You are InfoPilot's conversational assistant. Reply in Korean, be concise and friendly. "
-                "Answer the user's request directly without asking for documents."
-            )
-            prompt = query.strip()
-        elif mode == "no_hits":
-            system_prompt = (
-                "You are InfoPilot's assistant. No matching documents were found for the user query. "
-                "Provide a brief helpful reply in Korean using general knowledge, and optionally suggest "
-                "how the user might rephrase the question. Do not mention unavailable features."
-            )
-            prompt = query.strip()
-        elif mode == "dialogue":
-            system_prompt = (
-                "You are InfoPilot's assistant. Provide a concise, friendly reply in Korean addressing the user's request. "
-                "Do not mention document search. Keep the response within two sentences."
-            )
-            prompt = query.strip()
-        else:
+        valid_modes = {"small_talk", "no_hits", "dialogue"}
+        if mode not in valid_modes:
+            mode = "dialogue"
+
+        def _generate_with_retry(include_history: bool) -> Optional[str]:
+            attempts = 0
+            while attempts < 2:
+                attempts += 1
+                active = self.llm_client
+                if active is None:
+                    return None
+                prompt = self._compose_prompt(query, mode=mode, include_history=include_history)
+                try:
+                    return active.generate(prompt, timeout=self._llm_timeout()).strip()
+                except (LLMClientError, Exception) as exc:
+                    label = "응답 실패" if isinstance(exc, LLMClientError) else "예외"
+                    print(f"⚠️ 로컬 LLM {label}({mode}): {exc}")
+                    if attempts >= 2 or not self._reset_llm_client():
+                        return None
+                    print("⟳ 로컬 LLM을 재연결한 뒤 다시 시도합니다...")
             return None
-        try:
-            reply = client.generate(prompt, system=system_prompt, timeout=30.0).strip()
-        except LLMClientError as exc:
-            print(f"⚠️ 로컬 LLM 응답 실패({mode}): {exc}")
-            return None
-        except Exception as exc:
-            print(f"⚠️ 로컬 LLM 예외({mode}): {exc}")
-            return None
-        return reply or None
+
+        reply = _generate_with_retry(include_history=True)
+        if reply:
+            return reply
+        return _generate_with_retry(include_history=False)
 
     def _summarize_hits(self, query: str, hits: List[Dict[str, Any]]) -> Optional[str]:
         client = self.llm_client
@@ -781,7 +987,7 @@ class LNPChat:
         ).strip()
         system_prompt = "You are a helpful assistant that summarises enterprise documents in Korean."
         try:
-            summary = client.generate(prompt, system=system_prompt, timeout=30.0).strip()
+            summary = client.generate(prompt, system=system_prompt, timeout=self._llm_timeout()).strip()
         except LLMClientError as exc:
             print(f"⚠️ 로컬 LLM 응답 실패: {exc}")
             return None
@@ -789,6 +995,185 @@ class LNPChat:
             print(f"⚠️ 로컬 LLM 예외: {exc}")
             return None
         return summary or None
+
+    def _respond_to_hit_reference(self, query: str) -> Optional[Dict[str, Any]]:
+        if not self.last_hits:
+            return None
+        ref_index = self._parse_hit_reference(query)
+        if ref_index is None:
+            return None
+        total_hits = len(self.last_hits)
+        if ref_index < 0 or ref_index >= total_hits:
+            response = f"{ref_index + 1}번 문서는 찾을 수 없어요. 최근 검색 결과는 {total_hits}건입니다."
+            self.memory.add_turn(role="user", text=query)
+            self.memory.add_turn(role="assistant", text=response)
+            return {
+                "answer": response,
+                "hits": self.last_hits,
+                "suggestions": ["다른 번호를 지정해줘", "새로 검색해줘"],
+            }
+        hit = self.last_hits[ref_index]
+        summary = self._summarize_hit_reference(query, hit, ref_index)
+        self.memory.add_turn(role="user", text=query)
+        self.memory.add_turn(role="assistant", text=summary, hits=[hit])
+        self.last_selected_hit_index = ref_index
+        suggestions = ["다른 문서도 설명해줘", "새 검색 시작"] if total_hits > 1 else ["새 검색 시작"]
+        return {
+            "answer": summary,
+            "hits": [hit],
+            "suggestions": suggestions,
+        }
+
+    def _respond_to_selected_hit_followup(self, query: str) -> Optional[Dict[str, Any]]:
+        if (
+            self.last_selected_hit_index is None
+            or not self.last_hits
+            or self.last_selected_hit_index >= len(self.last_hits)
+        ):
+            return None
+        if self._parse_hit_reference(query) is not None:
+            return None
+        lowered = query.strip().lower()
+        if not lowered:
+            return None
+        if not any(token in lowered for token in {"파일", "문서", "자료"}):
+            return None
+        verb_markers = {"열어", "확인", "보여", "설명", "읽어", "자세히", "다시", "봐봐", "검토"}
+        if not any(marker in lowered for marker in verb_markers):
+            return None
+        idx = self.last_selected_hit_index
+        hit = self.last_hits[idx]
+        summary = self._summarize_hit_reference(query, hit, idx)
+        self.memory.add_turn(role="user", text=query)
+        self.memory.add_turn(role="assistant", text=summary, hits=[hit])
+        return {
+            "answer": summary,
+            "hits": [hit],
+            "suggestions": ["다른 문서도 설명해줘", "새 검색 시작"],
+        }
+
+    def _parse_hit_reference(self, query: str) -> Optional[int]:
+        if not (query and query.strip()):
+            return None
+        trimmed = query.strip()
+        lowered = trimmed.lower()
+        if lowered.startswith("/doc"):
+            parts = lowered.split()
+            for part in parts[1:]:
+                if part.isdigit():
+                    return int(part) - 1
+        match = re.search(r"(\d{1,3})\s*(?:번|번째)\s*(?:문서|파일|자료)?", trimmed)
+        if match:
+            return int(match.group(1)) - 1
+        match = re.search(r"(?:file|doc)\s*(\d{1,3})", lowered)
+        if match:
+            return int(match.group(1)) - 1
+        return None
+
+    def _summarize_hit_reference(self, query: str, hit: Dict[str, Any], index: int) -> str:
+        doc_path = str(hit.get("path") or "")
+        doc_name = Path(doc_path).name or doc_path or f"{index + 1}번 문서"
+        llm_summary = None
+        if self._should_use_llm_for_hit(hit):
+            llm_summary = self._summarize_hits(query, [hit])
+        preview = (
+            hit.get("preview")
+            or hit.get("summary")
+            or hit.get("chunk_text")
+            or hit.get("text")
+            or ""
+        ).strip()
+        if not preview:
+            preview = self._load_hit_preview_from_file(hit) or ""
+        snippet = ""
+        if preview:
+            snippet = preview[:800].strip()
+        detail_lines: List[str] = [f"{index + 1}번 문서 '{doc_name}' 요약:"]
+        if llm_summary:
+            detail_lines.append(llm_summary.strip())
+        elif snippet:
+            detail_lines.append(snippet)
+        else:
+            detail_lines.append("문서 내용을 미리보기에서 찾지 못했습니다. 원본 파일을 직접 열어보세요.")
+        extra_bits: List[str] = []
+        similarity = hit.get("similarity", hit.get("vector_similarity"))
+        similarity_pct = _similarity_to_percent(similarity) if similarity is not None else None
+        if similarity_pct:
+            extra_bits.append(f"유사도 {similarity_pct}")
+        chunk_id = hit.get("chunk_id")
+        chunk_count = hit.get("chunk_count")
+        if chunk_id is not None and chunk_count:
+            try:
+                idx_val = int(chunk_id)
+                extra_bits.append(f"chunk {idx_val}/{chunk_count}")
+            except (TypeError, ValueError):
+                pass
+        if extra_bits:
+            detail_lines.append("")
+            detail_lines.append("세부 정보: " + " · ".join(extra_bits))
+        if doc_path:
+            detail_lines.append(f"파일 경로: {doc_path}")
+        return "\n".join(detail_lines)
+
+    def _load_hit_preview_from_file(self, hit: Dict[str, Any], *, max_chars: int = 1600) -> Optional[str]:
+        path = hit.get("path")
+        if not path:
+            return None
+        try:
+            file_path = Path(path)
+        except Exception:
+            return None
+        if not file_path.exists() or not file_path.is_file():
+            return None
+        text_extensions = {
+            ".txt",
+            ".md",
+            ".rst",
+            ".log",
+            ".json",
+            ".yaml",
+            ".yml",
+            ".csv",
+            ".tsv",
+            ".py",
+            ".ipynb",
+            ".sql",
+        }
+        if file_path.suffix.lower() not in text_extensions:
+            return None
+        try:
+            with file_path.open("r", encoding="utf-8", errors="ignore") as fh:
+                chunk = fh.read(max_chars)
+                return chunk.strip()
+        except Exception as exc:
+            print(f"⚠️ 파일 미리보기 로드 실패: {file_path}: {exc}")
+            return None
+
+    def _should_use_llm_for_hit(self, hit: Dict[str, Any]) -> bool:
+        if self.llm_client is None:
+            return False
+        ext = str(hit.get("ext") or "").lower()
+        text_extensions = {
+            ".txt",
+            ".md",
+            ".rst",
+            ".log",
+            ".json",
+            ".yaml",
+            ".yml",
+            ".csv",
+            ".tsv",
+            ".py",
+            ".ipynb",
+            ".sql",
+        }
+        return ext not in text_extensions
+
+    def _llm_timeout(self) -> float:
+        try:
+            return max(1.0, min(30.0, float(self.llm_timeout)))
+        except Exception:
+            return 8.0
 
     def _resolve_policy_engine(self) -> Optional[PolicyEngine]:
         engine = self.policy_engine

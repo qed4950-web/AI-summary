@@ -12,6 +12,7 @@ python-pptx>=1.0.0,<1.1
 pdfminer.six==20231228
 PyMuPDF>=1.26.4,<1.27
 pdfplumber==0.11.4
+soundfile>=0.12,<0.14
 
 # === 번역/텍스트 유틸 ===
 deep-translator>=1.11.4,<2
@@ -23,7 +24,7 @@ scikit-learn>=1.7.2,<1.8
 sentence-transformers==3.0.1
 faiss-cpu==1.9.0.post1
 transformers>=4.44,<5
-faster-whisper>=1.0,<1.1
+faster-whisper>=1.0,<1.1   # wav2vec2 기본, whisper는 대체 STT
 pykospacing>=0.5,<0.6; python_version < "3.12"
 kosspacing>=0.5,<0.6; python_version >= "3.12"
 py-hanspell>=1.1,<1.2

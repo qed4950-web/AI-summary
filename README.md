@@ -6,7 +6,7 @@ AI-summary는 로컬 문서 컬렉션을 스캔·학습하고, 의미 기반 검
 
 - **파이프라인**: `infopilot.py` 
 로 스캔 → 학습 → 대화 모드를 일괄 실행  
-- **검색/대화**: `core/search/retriever.py`, `core/conversation/lnp_chat.py`가 Sentence-BERT 임베딩과 정책 필터링을 결합  
+- **검색/대화**: `core/search/retriever.py`, `core/conversation/lnp_chat.py`가 BGE-m3 SentenceTransformer 임베딩과 정책 필터링을 결합  
 - **도메인 에이전트**: 회의(STT→요약), 사진(중복/태깅) 비서를 `core/agents/`에서 제공  
 - **UI**: `ui/`의 CustomTkinter 앱으로 주요 기능을 한 화면에서 제어  
 - **문서화**: 아키텍처, 가이드, 실험 기록은 `docs/` 하위 폴더에 정리
@@ -57,7 +57,7 @@ cp .env.example .env   # scripts/setup_env.sh 실행 시 자동 생성되기도 
 
 - `LNPCHAT_LLM_BACKEND`, `LNPCHAT_LLM_MODEL`, `LNPCHAT_LLM_HOST`
 - `MEETING_OUTPUT_DIR`, `MEETING_ANALYTICS_DIR`
-- `MEETING_SUMMARY_*`, `MEETING_STT_*`, `MEETING_RAG_*` 등 회의 비서 옵션
+- `MEETING_SUMMARY_*`, `MEETING_STT_*`, `MEETING_WAV2VEC2_*`, `MEETING_RAG_*` 등 회의 비서 옵션
 
 필요한 값만 유지하고 나머지는 공란으로 두어도 됩니다.
 
@@ -108,6 +108,25 @@ python infopilot.py drift reembed --path /docs/2023/report.docx --scan-csv ... -
 
 > 대화 비서에서 회의나 사진 정리를 요청하면 자동으로 해당 전용 비서를 호출합니다. CLI는 최근에 사용한 경로 목록을 보여 주고, 번호 선택 또는 직접 입력으로 오디오/폴더를 지정할 수 있는 프롬프트를 제공합니다. 추가 정보가 필요한 경우 후속 질문이 이어집니다.
 
+### 3.4.1 자주 쓰는 명령 모음 (하단 북마크)
+
+```bash
+# 1) 임베딩 스캔 + 코퍼스/모델 학습
+python infopilot.py run scan   --out data/found_files.csv
+python infopilot.py run train  --scan_csv data/found_files.csv --corpus data/corpus.parquet --model data/topic_model.joblib --state-file data/scan_state.json --chunk-cache data/cache/chunk_cache.json --async-embed --embedding-concurrency 2
+
+# 2) 통합 파이프라인 한 번에 + 완료 후 CLI 켜기
+python infopilot.py pipeline all --out data/found_files.csv --corpus data/corpus.parquet --model data/topic_model.joblib --cache data/cache --state-file data/scan_state.json --chunk-cache data/cache/chunk_cache.json --launch-chat
+
+# 3) 로컬 대화/검색 에이전트 실행
+python infopilot.py run chat   --model data/topic_model.joblib --corpus data/corpus.parquet --cache data/cache --lexical-weight 0.35
+python infopilot.py run watch  --cache data/cache --corpus data/corpus.parquet --model data/topic_model.joblib  # 신규 파일 자동 스캔·증분 임베딩
+
+# 4) 회의 요약/파이프라인 UI 실행
+python ui/app.py           # 데스크톱 UI (PySide6)
+python scripts/run_all.sh  # FastAPI 백엔드 + webapp(Vite) 동시 실행
+```
+
 ### 3.5 Prefect DAG 실행
 
 `scripts/prefect_dag.py`는 scan→train→index→(선택)평가 단계를 Prefect 2.x Flow로 래핑합니다. Prefect를 설치했다면 아래와 같이 단일 명령으로 실행하거나 Prefect UI/에이전트에 배포할 수 있습니다.
@@ -157,6 +176,7 @@ python scripts/launch_desktop.py          # 개발 중에는 python ui/app.py
 ## 5. 데이터 & 모델 관리
 
 - `data/정답지/metadata.json`에 문서별 `"document_title"`, `"description"`, `"file_name"`을 기록하면 파이프라인이 메타데이터를 자동으로 병합합니다.
+- 기본 문서 임베딩 모델은 `BAAI/bge-m3`이며, `DEFAULT_EMBED_MODEL`(infopilot CLI `--embedding-model`)로 다른 SentenceTransformer를 쉽게 대체할 수 있습니다.
 - SentenceTransformer 모델을 `models/sentence_transformers/` 아래에 복사하면 CLI가 `HF_HOME`, `SENTENCE_TRANSFORMERS_HOME`, `HF_HUB_OFFLINE`, `TRANSFORMERS_OFFLINE`을 자동 설정하여 오프라인에서 임베딩을 로드합니다.
 
 ## 6. 유지 보수

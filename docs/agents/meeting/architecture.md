@@ -8,11 +8,11 @@
 | --- | --- | --- |
 | 워크플로 제어 | `pipeline.py`, `workflow.py` | 파이프라인 단계(TaskGraph) 실행, 재시작·취소 처리, 체크포인트 관리 |
 | 작업 정의 | `agent.py`, `models.py` | 파이프라인 설정(`MeetingJobConfig`), 결과 구조(`MeetingSummary`, `StreamingSummarySnapshot`) 선언 |
-| 전사(STT) | `stt/` | Whisper/Faster-Whisper 및 외부 STT 백엔드를 래핑하고, chunk 분할·재시도 로직을 제공 |
+| 전사(STT) | `stt/` | Wav2Vec2(기본)와 Whisper(faster-whisper)를 공용 인터페이스로 래핑하고 chunk 분할·재시도 로직을 제공 |
 | 요약/QA | `summarizer.py`, `llm/` | KoBART·Ollama 등 요약 백엔드 생성, 고정 프롬프트 관리, 후처리 |
 | 컨텍스트 | `context_store.py`, `context_adapter.py` | 회의 전/후 문맥, 사용자 메모, 정책 기반 추가 입력 수집 |
 | 화자 식별 | `speaker_id.py` | 화자 프로필 로딩, diarisation 결과 정규화 |
-| 결과 분석 | `analytics.py` | 발화 비중, 품질 지표, 재학습 큐 등 부가 산출물 기록 |
+| 결과 분석/저장 | `analytics.py`, `persistence.py` | 발화 비중, 품질 지표, 재학습 큐, 검색/통합 저장 헬퍼 |
 | 감시/감사 | `audit.py` | 단계별 로그, 실패/성공 이력, 정책 준수 여부 기록 |
 | 통합 | `integrations/` | 캘린더·업무 도구 연동을 위한 액션 아이템 내보내기, 공급자 설정 로더 |
 
@@ -47,3 +47,11 @@
 - 비용 가이드: `cost_hedging_strategy.md`
 - 변경 이력: `mvp_changelog.md`
 - 반복 계획: `iteration_plan_round6.md`
+
+
+`pipeline.py` 내부의 품질·검색·통합 로직은 모듈로 분리되었습니다:
+- `constants.py`: 언어 매핑 및 키워드/정규식 상수
+- `streaming.py`: 스트리밍 세션 관리
+- `pii.py`: PII 마스킹 헬퍼
+- `cache.py`: 캐시 판별 및 로드
+- `persistence.py`: 검색 인덱스/통합/분석/감사/품질 알림 저장 헬퍼

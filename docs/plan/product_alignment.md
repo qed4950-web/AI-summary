@@ -72,8 +72,8 @@
 #### 5.2.1 단계별 계획 요약
 | 단계 | 작업 | 설명 |
 | --- | --- | --- |
-| **1️⃣ Retriever 개선** | BM25 + SBERT 구조에 `semantic rerank` 추가 (`cross-encoder/ms-marco-MiniLM-L-6-v2` 등) | 문서 유사도 정밀도 향상 (RAM 영향 500MB 내 검토) |
-| **2️⃣ Agent별 모델 세분화** | Meeting→Whisper+Llama3, Photo→CLIP/ONNX, Knowledge→SBERT/Reranker | 각 Agent 최적화 모델 구성 (모델 수 늘어나므로 관리 주의) |
+| **1️⃣ Retriever 개선** | BM25 + BGE 구조에 `semantic rerank` 추가 (`cross-encoder/ms-marco-MiniLM-L-6-v2` 등) | 문서 유사도 정밀도 향상 (RAM 영향 500MB 내 검토) |
+| **2️⃣ Agent별 모델 세분화** | Meeting→Whisper+Llama3, Photo→CLIP/ONNX, Knowledge→BGE/Reranker | 각 Agent 최적화 모델 구성 (모델 수 늘어나므로 관리 주의) |
 | **3️⃣ Model Manager 확장** | GPU/CPU 자동 전환, lazy-load, 로컬 우선 캐시 | 로드 속도 및 자원 최적화 (초기화 복잡도 증가) |
 | **4️⃣ 데스크톱 패키징** | PyInstaller 기반 단일 실행 파일/디렉터리 생성 | 배포 편의성 확보 |
 | **5️⃣ 로컬 빌드 및 배포** | 스크립트로 코드 서명(`--sign-cmd`)·압축·릴리스 노트 생성 | 내부 배포 혹은 개인용 앱 완성 |
@@ -82,13 +82,13 @@
 ### 5.3 모델별 메모리 목표
 | Agent | 모델 구성 | 비고 | 목표 메모리 |
 | --- | --- | --- | --- |
-| Knowledge | SBERT + Reranker | 의미 검색 + 정밀 재정렬 | ≤ 500MB |
+| Knowledge | BGE + Reranker | 의미 검색 + 정밀 재정렬 | ≤ 500MB |
 | Meeting | Whisper + Llama3 | 음성→요약, 액션 아이템 | ≤ 1.5GB |
 | Photo | CLIP/ONNX | 태깅·중복 정리 | ≤ 1GB |
 | ModelManager | Lazy Load | GPU/CPU 자동 전환 | Idle 300–500MB |
 
 ### 5.4 추가 테스트 항목 (검토 단계)
-- SBERT-only vs SBERT+Reranker 정확도 비교.
+- BGE-only vs BGE+Reranker 정확도 비교.
 - 모델 매니저의 lazy-loading 및 GPU/CPU 전환 시나리오.
 - PyInstaller 패키지 실행 시 CLI와 동등하게 동작하는지 확인.
 - 빌드 아티팩트(.exe/.dmg) 실행 및 CLI와의 동등성 확인.

@@ -888,6 +888,7 @@ def _build_train_config(args) -> TrainConfig:
         embedding_batch_size=getattr(args, "embedding_batch_size", 32),
         async_embeddings=getattr(args, "async_embed", True),
         embedding_concurrency=max(1, int(getattr(args, "embedding_concurrency", 1))),
+        embedding_dtype=getattr(args, "embedding_dtype", "auto"),
     )
 
 
@@ -1046,7 +1047,9 @@ def cmd_pipeline(args):
     rows = _maybe_limit_rows(filtered_rows, args.limit_files)
 
     if not rows:
-        raise ValueError("유효한 학습 대상 행이 없습니다. 스캔 결과를 확인해주세요.")
+        print("⚠️ 스캔 결과가 없어 파이프라인을 종료합니다. (목록에 포함될 문서가 없습니다.)")
+        print("   → 다른 루트를 지정하거나 스마트 폴더 정책을 확인하세요.")
+        return {}
 
     cfg = _build_train_config(args)
     out_corpus = Path(args.corpus)
@@ -1083,7 +1086,7 @@ def cmd_pipeline(args):
             translate=args.translate,
             auto_train=True,
             rerank=True,
-            rerank_model="cross-encoder/ms-marco-MiniLM-L-6-v2",
+            rerank_model="BAAI/bge-reranker-large",
             rerank_depth=80,
             rerank_batch_size=16,
             rerank_device=None,
@@ -1334,7 +1337,7 @@ def cmd_chat(args):
             _print_response(response)
         return
 
-    print("\n💬 InfoPilot Chat 모드입니다. (종료하려면 'exit' 또는 '종료' 입력)")
+    print("\n💬 InfoPilot Chat 모드입니다. 자유롭게 대화하고, 문서 검색이 필요하면 '/search 질문'처럼 입력해 보세요. (종료하려면 'exit' 또는 '종료' 입력)")
     print("   명령어: /search <질문>, /meeting, /photo")
     while True:
         try:
@@ -1356,7 +1359,7 @@ def cmd_chat(args):
 
 def cmd_watch(args):
     if Observer is None:
-        raise RuntimeError("watchdog 라이브러리가 필요합니다. pip install watchdog")
+        raise click.ClickException("watchdog 라이브러리가 필요합니다. pip install watchdog")
 
     encoder, batch_size, model_name = _load_sentence_encoder(Path(args.model))
     if encoder is None:
@@ -1696,7 +1699,7 @@ def _chat_options(func):
     func = click.option("--min-similarity", type=float, default=0.35, show_default=True)(func)
     func = click.option("--lexical-weight", type=float, default=0.35, show_default=True)(func)
     func = click.option("--rerank/--no-rerank", default=True, show_default=True)(func)
-    func = click.option("--rerank-model", default="cross-encoder/ms-marco-MiniLM-L-6-v2", show_default=True)(func)
+    func = click.option("--rerank-model", default="BAAI/bge-reranker-large", show_default=True)(func)
     func = click.option("--rerank-depth", type=int, default=80, show_default=True)(func)
     func = click.option("--rerank-batch-size", type=int, default=16, show_default=True)(func)
     func = click.option("--rerank-device", default=None)(func)
@@ -1934,9 +1937,9 @@ def _run_reembed_pipeline(
 @click.command("scan")
 @_scan_options
 @click.pass_context
-def scan_command(ctx: click.Context, out: str, roots: Tuple[str, ...], policy: str) -> None:
+def scan_command(ctx: click.Context, out: str, roots: Tuple[str, ...], exts: Tuple[str, ...], policy: str) -> None:
     _require_pandas()
-    args = SimpleNamespace(out=out, roots=list(roots) if roots else None, policy=policy)
+    args = SimpleNamespace(out=out, roots=list(roots) if roots else None, policy=policy, exts=list(exts) if exts else None)
     with _command_session(ctx, "scan") as session:
         count = cmd_scan(args) or 0
         if session:
@@ -1968,6 +1971,7 @@ def train_command(
     chunk_cache: str,
     embedding_concurrency: int,
     async_embed: bool,
+    embedding_dtype: str,
 ) -> None:
     _require_pandas()
     args = SimpleNamespace(
@@ -1989,6 +1993,7 @@ def train_command(
         chunk_cache=chunk_cache,
         embedding_concurrency=embedding_concurrency,
         async_embed=async_embed,
+        embedding_dtype=embedding_dtype,
     )
     with _command_session(ctx, "train") as session:
         stats = cmd_train(args) or {}
@@ -2037,6 +2042,7 @@ def pipeline_command(
     chunk_cache: str,
     embedding_concurrency: int,
     async_embed: bool,
+    embedding_dtype: str,
 ) -> None:
     _require_pandas()
     normalized = (target or "all").strip().lower()
@@ -2066,6 +2072,7 @@ def pipeline_command(
         chunk_cache=resolved_chunk_cache,
         embedding_concurrency=embedding_concurrency,
         async_embed=async_embed,
+        embedding_dtype=embedding_dtype,
     )
     with _command_session(ctx, "pipeline") as session:
         stats = cmd_pipeline(args) or {}

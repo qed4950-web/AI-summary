@@ -247,6 +247,18 @@ class OllamaSummariser:
         env = os.environ.copy()
         if self.config.ollama_host:
             env["OLLAMA_HOST"] = self.config.ollama_host
+        env.setdefault(
+            "OLLAMA_NUM_PREDICT",
+            os.getenv("MEETING_SUMMARY_OLLAMA_NUM_PREDICT")
+            or os.getenv("SUMMARY_OLLAMA_NUM_PREDICT")
+            or "192",
+        )
+        env.setdefault(
+            "OLLAMA_TEMPERATURE",
+            os.getenv("MEETING_SUMMARY_OLLAMA_TEMPERATURE")
+            or os.getenv("SUMMARY_OLLAMA_TEMPERATURE")
+            or "0.08",
+        )
 
         try:
             result = subprocess.run(

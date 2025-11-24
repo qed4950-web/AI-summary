@@ -50,7 +50,7 @@ class DataPipelinePanel(ctk.CTkToplevel):
 
         self._on_activity = on_activity
         self._on_pipeline_complete = on_pipeline_complete
-        self._roots: List[str] = []
+        self._roots: List[str] = self._default_user_roots()
         self._task_thread: Optional[threading.Thread] = None
 
         self._build_layout()
@@ -236,6 +236,9 @@ class DataPipelinePanel(ctk.CTkToplevel):
 
     def _on_roots_mode_changed(self) -> None:
         if self.roots_only_switch.get():
+            if not self._roots:
+                self._roots = self._default_user_roots()
+                self._refresh_roots_list()
             # 스마트 폴더 모드에서는 정책을 기본값(사용)으로 돌린다.
             self.ignore_policy_switch.deselect()
         else:
@@ -344,7 +347,7 @@ class DataPipelinePanel(ctk.CTkToplevel):
     def _execute_pipeline_all(self) -> None:
         try:
             pipeline_args = self._build_pipeline_args()
-            self._run_cli(["run", "pipeline", *pipeline_args], label="pipeline")
+            self._run_cli(["pipeline", *pipeline_args, "all"], label="pipeline")
         except Exception as exc:
             self._log(f"ERROR: 전체 파이프라인 실패 - {exc}")
             self._notify_activity(f"ERROR · pipeline failed: {exc}")
@@ -474,3 +477,19 @@ class DataPipelinePanel(ctk.CTkToplevel):
             self._log("INFO: 작업이 끝난 후 창이 닫힙니다.")
             return
         self.destroy()
+
+    # ------------------------------------------------------------------
+    # Defaults
+    # ------------------------------------------------------------------
+    def _default_user_roots(self) -> List[str]:
+        home = Path.home()
+        candidates = [
+            home / "Documents",
+            home / "Desktop",
+            home / "Downloads",
+            home / "Library" / "CloudStorage",
+        ]
+        roots = [str(path) for path in candidates if path.exists()]
+        if not roots:
+            roots = [str(home)]
+        return roots

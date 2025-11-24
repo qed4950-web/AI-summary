@@ -114,7 +114,7 @@ from .index_manager import IndexManager
 
 MODEL_TEXT_COLUMN = "text_model"
 MODEL_TYPE_SENTENCE_TRANSFORMER = "sentence-transformer"
-DEFAULT_EMBED_MODEL = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+DEFAULT_EMBED_MODEL = "BAAI/bge-m3"
 MAX_BM25_TOKENS = 8000
 MAX_PREVIEW_CHARS = 180
 DEFAULT_MMR_LAMBDA = 0.7
@@ -457,13 +457,13 @@ def _resolve_sentence_transformer_location(model_name: str) -> str:
         cache_dir = base_dir / f"models--{model_name.replace('/', '--')}"
         snapshots = cache_dir / "snapshots"
         if snapshots.exists():
-            candidates = sorted(
-                snapshots.iterdir(),
-                key=lambda item: item.stat().st_mtime,
-                reverse=True,
-            )
-            if candidates:
-                return str(candidates[0])
+            candidates = sorted(snapshots.iterdir(), key=lambda item: item.stat().st_mtime, reverse=True)
+            for candidate in candidates:
+                if any(
+                    (candidate / marker).exists()
+                    for marker in ("config.json", "modules.json", "config_sentence_transformers.json")
+                ):
+                    return str(candidate)
     return model_name
 
 
@@ -1890,6 +1890,7 @@ class IndexPaths:
 
 
 class VectorIndex:
+    LEXICAL_SCHEMA_VERSION = 2.0
     def __init__(self) -> None:
         self.dimension: Optional[int] = None
         self.doc_ids: List[int] = []
@@ -2253,6 +2254,7 @@ class VectorIndex:
         with meta_path.open("w", encoding="utf-8") as f:
             json.dump(
                 {
+                    "schema_version": self.LEXICAL_SCHEMA_VERSION,
                     "doc_ids": self.doc_ids,
                     "paths": self.paths,
                     "exts": self.exts,
@@ -2292,6 +2294,12 @@ class VectorIndex:
 
         with meta_json.open("r", encoding="utf-8") as f:
             meta = json.load(f)
+
+        schema_version = float(meta.get("schema_version", 1.0))
+        if schema_version < self.LEXICAL_SCHEMA_VERSION:
+            raise ValueError(
+                f"index schema v{schema_version:.1f} detected; requires v{self.LEXICAL_SCHEMA_VERSION:.1f}"
+            )
 
         paths = meta.get("paths", [])
         exts = meta.get("exts", [])
@@ -3044,7 +3052,7 @@ class Retriever:
         *,
         search_wait_timeout: float = 0.5,
         use_rerank: bool = True,
-        rerank_model: str = "cross-encoder/ms-marco-MiniLM-L-6-v2",
+        rerank_model: str = "BAAI/bge-reranker-large",
         rerank_depth: int = 80,
         rerank_batch_size: int = 16,
         rerank_device: Optional[str] = None,
@@ -3083,7 +3091,7 @@ class Retriever:
             builder=self._rebuild_index,
         )
 
-        self._cache_signature: Optional[Tuple[float, float, float]] = self._compute_cache_signature()
+        self._cache_signature: Optional[Tuple[float, float, float, float]] = self._compute_cache_signature()
         self._cache_monitor: Optional[CacheSignatureMonitor] = None
         self._auto_refresh = bool(auto_refresh)
         self._refresh_interval = max(0.1, float(refresh_interval)) if refresh_interval else 0.0
@@ -3543,7 +3551,6 @@ class Retriever:
             return None
 
         logger.info("index loaded: cache=%s", _mask_path(str(self.cache_dir)))
-        self._cache_signature = self._compute_cache_signature()
         return index
 
     def _rebuild_index(self) -> VectorIndex:
@@ -3573,6 +3580,13 @@ class Retriever:
             preview_source = work[MODEL_TEXT_COLUMN]
         preview_list = preview_source.fillna("").astype(str).tolist()
 
+        token_source = work.get(MODEL_TEXT_COLUMN)
+        if token_source is None:
+            token_source = work.get("text")
+        if token_source is None:
+            token_source = work.get("preview")
+        token_texts = token_source.fillna("").astype(str).tolist()
+
         token_lists: Optional[List[List[str]]] = None
         if BM25Okapi is not None:
             tokens_raw = work.get("tokens")
@@ -3580,7 +3594,7 @@ class Retriever:
                 token_lists = [tokens_raw.iloc[i] if isinstance(tokens_raw.iloc[i], list) else _split_tokens(tokens_raw.iloc[i]) for i in range(len(work))]
             else:
                 token_lists = [
-                    [tok for tok in _split_tokens(preview_list[idx].lower()) if tok]
+                    [tok for tok in _split_tokens(token_texts[idx].lower()) if tok]
                     for idx in range(len(work))
                 ]
                 total_tokens = sum(len(tokens) for tokens in token_lists)
@@ -3717,7 +3731,7 @@ class Retriever:
             return False
         return True
 
-    def _compute_cache_signature(self) -> Tuple[float, float, float]:
+    def _compute_cache_signature(self) -> Tuple[float, float, float, float]:
         def _mtime(path: Path) -> float:
             try:
                 return path.stat().st_mtime
@@ -3727,7 +3741,7 @@ class Retriever:
         emb = self.cache_dir / "doc_embeddings.npy"
         meta = self.cache_dir / "doc_meta.json"
         faiss_path = self.cache_dir / "doc_index.faiss"
-        return (_mtime(meta), _mtime(emb), _mtime(faiss_path))
+        return (VectorIndex.LEXICAL_SCHEMA_VERSION, _mtime(meta), _mtime(emb), _mtime(faiss_path))
 
     def _refresh_if_cache_changed(self) -> None:
         current = self._compute_cache_signature()
@@ -3743,8 +3757,8 @@ class Retriever:
 
     def _on_cache_signature_change(
         self,
-        previous: Tuple[float, float, float],
-        current: Tuple[float, float, float],
+        previous: Tuple[float, float, float, float],
+        current: Tuple[float, float, float, float],
     ) -> None:
         self._cache_signature = current
         result_cache = getattr(self, "_result_cache", None)

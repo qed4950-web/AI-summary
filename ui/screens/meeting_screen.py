@@ -151,7 +151,7 @@ class MeetingScreen(ctk.CTkFrame):
         stt_row.grid_columnconfigure(1, weight=1)
         self.stt_backend_menu = ctk.CTkOptionMenu(
             stt_row,
-            values=["auto", "whisper", "off"],
+            values=["auto", "wav2vec2", "whisper", "off"],
             variable=self.stt_backend_var,
             command=self.on_stt_backend_change,
             width=130,
@@ -197,7 +197,7 @@ class MeetingScreen(ctk.CTkFrame):
 
         help_label = ctk.CTkLabel(
             stt_row,
-            text="auto=환경 변수 사용, whisper=faster-whisper (CPU 실행 시 느릴 수 있습니다). 설정 값은 자동 저장됩니다.",
+            text="auto=환경 변수 사용, wav2vec2=HuggingFace(Wav2Vec2), whisper=faster-whisper. 설정 값은 자동 저장됩니다.",
             font=ctk.CTkFont(size=11),
             text_color=("#636363", "#bdbdbd"),
             wraplength=420,
@@ -643,14 +643,26 @@ class MeetingScreen(ctk.CTkFrame):
     def _update_stt_entry_states(self) -> None:
         backend = self.stt_backend_var.get()
         is_whisper = backend == "whisper"
-        state = "normal" if is_whisper else "disabled"
-        for entry in (
-            self.stt_model_entry,
-            self.stt_device_entry,
-            self.stt_compute_entry,
-            self.stt_download_entry,
-        ):
-            entry.configure(state=state)
+        is_wav2vec = backend == "wav2vec2"
+        model_state = "normal" if is_whisper or is_wav2vec else "disabled"
+        device_state = model_state
+        compute_state = "normal" if is_whisper or is_wav2vec else "disabled"
+        download_state = "normal" if is_whisper or is_wav2vec else "disabled"
+
+        model_placeholder = "모델(ex: small)"
+        device_placeholder = "디바이스(auto)"
+        compute_placeholder = "연산 타입(int8)"
+        download_placeholder = "모델 다운로드 경로 (선택)"
+
+        if is_wav2vec:
+            model_placeholder = "모델(ex: kresnik/wav2vec2-large-xlsr-korean)"
+            compute_placeholder = "chunk(초, 기본 20)"
+            download_placeholder = "stride(초, 기본 5)"
+
+        self.stt_model_entry.configure(state=model_state, placeholder_text=model_placeholder)
+        self.stt_device_entry.configure(state=device_state, placeholder_text=device_placeholder)
+        self.stt_compute_entry.configure(state=compute_state, placeholder_text=compute_placeholder)
+        self.stt_download_entry.configure(state=download_state, placeholder_text=download_placeholder)
 
     def _persist_stt_preferences(self) -> None:
         payload = {
@@ -674,6 +686,10 @@ class MeetingScreen(ctk.CTkFrame):
         self._sync_optional_env("MEETING_STT_DEVICE", payload["device"], backend == "whisper")
         self._sync_optional_env("MEETING_STT_COMPUTE", payload["compute"], backend == "whisper")
         self._sync_optional_env("MEETING_STT_MODEL_DIR", payload["download_dir"], backend == "whisper")
+        self._sync_optional_env("MEETING_WAV2VEC2_MODEL", payload["model"], backend == "wav2vec2")
+        self._sync_optional_env("MEETING_WAV2VEC2_DEVICE", payload["device"], backend == "wav2vec2")
+        self._sync_optional_env("MEETING_WAV2VEC2_CHUNK", payload["compute"], backend == "wav2vec2")
+        self._sync_optional_env("MEETING_WAV2VEC2_STRIDE", payload["download_dir"], backend == "wav2vec2")
 
     def _sync_optional_env(self, key: str, value: str, enabled: bool) -> None:
         if enabled and value:
@@ -715,6 +731,25 @@ class MeetingScreen(ctk.CTkFrame):
             download = self.stt_download_var.get().strip()
             if download:
                 stt_options["download_root"] = download
+        elif backend == "wav2vec2":
+            model = self.stt_model_var.get().strip()
+            if model:
+                stt_options["model_id"] = model
+            device = self.stt_device_var.get().strip()
+            if device:
+                stt_options["device"] = device
+            chunk = self.stt_compute_var.get().strip()
+            if chunk:
+                try:
+                    stt_options["chunk_length_s"] = float(chunk)
+                except ValueError:
+                    self.append_log("⚠️ chunk 길이는 숫자로 입력해주세요.")
+            stride = self.stt_download_var.get().strip()
+            if stride:
+                try:
+                    stt_options["stride_length_s"] = float(stride)
+                except ValueError:
+                    self.append_log("⚠️ stride 길이는 숫자로 입력해주세요.")
 
         pipeline = MeetingPipeline(stt_backend=backend, stt_options=stt_options)
         resource_info = getattr(pipeline, "_resource_info", {})
@@ -1101,6 +1136,7 @@ class MeetingScreen(ctk.CTkFrame):
         mapping = {
             "auto": "auto (환경 설정)",
             "whisper": "whisper (faster-whisper)",
+            "wav2vec2": "wav2vec2 (HuggingFace)",
             "off": "off (비활성화)",
         }
         return mapping.get(self.stt_backend_var.get(), self.stt_backend_var.get())

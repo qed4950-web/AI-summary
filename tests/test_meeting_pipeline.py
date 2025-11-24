@@ -1,12 +1,17 @@
 from __future__ import annotations
 
+import argparse
 import json
 import os
 from pathlib import Path
 
-import argparse
-
+import numpy as np
 import pytest
+
+try:  # Optional dependency for wav2vec2 tests.
+    import soundfile as sf  # type: ignore
+except ModuleNotFoundError:  # pragma: no cover - optional dependency guard
+    sf = None  # type: ignore[assignment]
 
 from core.agents.meeting import cli as meeting_cli
 from core.agents.meeting import pipeline as meeting_pipeline_module
@@ -20,6 +25,7 @@ from core.agents.meeting import (
     MeetingTranscriptionResult,
     StreamingSummarySnapshot,
 )
+from core.agents.supervisor import SupervisorDecision
 
 
 @pytest.mark.smoke
@@ -291,6 +297,135 @@ def test_workflow_resume_skips_summary_recompute(monkeypatch, tmp_path: Path) ->
 
     assert summary.raw_summary
     assert (output_dir / "checkpoints" / "summary.json").exists()
+
+
+@pytest.mark.smoke
+def test_summary_reviewer_updates_output(tmp_path: Path, monkeypatch) -> None:
+    audio = tmp_path / "meeting.wav"
+    audio.write_bytes(b"placeholder")
+    transcript = tmp_path / "meeting.wav.txt"
+    transcript.write_text(
+        "회의를 검토했습니다. 액션 아이템으로 담당자가 후속 조치를 진행합니다.",
+        encoding="utf-8",
+    )
+
+    output_dir = tmp_path / "out"
+    job = MeetingJobConfig(audio_path=audio, output_dir=output_dir)
+    pipeline = MeetingPipeline(stt_backend="placeholder", summary_backend="heuristic")
+
+    monkeypatch.setattr(
+        MeetingPipeline,
+        "_evaluate_summary_quality",
+        lambda self, job_cfg, transcription, summary: (["요약 보완 필요"], ["후속"]),
+    )
+    class StubReviewer:
+        backend = "stub-review"
+
+        @staticmethod
+        def is_enabled() -> bool:
+            return True
+
+        @staticmethod
+        def review(job_config, summary, transcription, **_kwargs):  # type: ignore[override]
+            summary.highlights = ["검수 완료"]
+            summary.action_items = ["후속 점검 진행"]
+            summary.decisions = ["검토 승인"]
+            summary.raw_summary = "검수자가 보완한 요약"
+            summary.structured_summary["highlights"] = [{"text": "검수 완료"}]
+            summary.structured_summary["action_items"] = [{"text": "후속 점검 진행"}]
+            summary.structured_summary["decisions"] = [{"text": "검토 승인"}]
+            summary.structured_summary["review_notes"] = "stub reviewer applied updates"
+            return summary
+
+    pipeline._reviewer = StubReviewer()  # type: ignore[assignment]
+
+    summary = pipeline.run(job)
+
+    assert summary.raw_summary == "검수자가 보완한 요약"
+    assert summary.highlights == ["검수 완료"]
+    assert summary.structured_summary.get("review_issues") == ["요약 보완 필요"]
+
+    summary_payload = json.loads((output_dir / "summary.json").read_text(encoding="utf-8"))
+    assert summary_payload["summary"]["highlights"][0]["text"] == "검수 완료"
+    assert summary_payload["summary"]["action_items"][0]["text"] == "후속 점검 진행"
+    review_meta = summary_payload["generated_by"].get("review")
+    assert review_meta and review_meta.get("backend") == "stub-review"
+
+
+@pytest.mark.smoke
+def test_summary_supervisor_escalation(tmp_path: Path, monkeypatch) -> None:
+    audio = tmp_path / "meeting.wav"
+    audio.write_bytes(b"placeholder")
+    transcript = tmp_path / "meeting.wav.txt"
+    transcript.write_text("회의에서 중요한 결정을 내렸지만 요약에 반영되지 않았습니다.", encoding="utf-8")
+
+    output_dir = tmp_path / "out"
+    job = MeetingJobConfig(audio_path=audio, output_dir=output_dir)
+    pipeline = MeetingPipeline(stt_backend="placeholder", summary_backend="heuristic")
+
+    class DisabledReviewer:
+        backend = "stub-review"
+        model = "stub"
+
+        @staticmethod
+        def is_enabled() -> bool:
+            return False
+
+        @staticmethod
+        def review(*_args, **_kwargs):  # type: ignore[override]
+            return None
+
+    class StubSupervisor:
+        backend = "stub-supervisor"
+        model = "stub"
+
+        def __init__(self) -> None:
+            self.called = False
+
+        @staticmethod
+        def is_enabled() -> bool:
+            return True
+
+        def decide(  # type: ignore[override]
+            self,
+            agent: str,
+            summary,
+            metrics,
+            issues=None,
+            alerts=None,
+        ) -> SupervisorDecision:
+            self.called = True
+            return SupervisorDecision(action="escalate", reason="manual check", notes="사람 검토 필요")
+
+    pipeline._reviewer = DisabledReviewer()  # type: ignore[assignment]
+    supervisor_stub = StubSupervisor()
+    pipeline._supervisor = supervisor_stub  # type: ignore[assignment]
+    pipeline._supervisor_mode = "auto"
+
+    monkeypatch.setattr(
+        MeetingPipeline,
+        "_evaluate_summary_quality",
+        lambda self, job_cfg, transcription, summary: (["결정 사항 누락"], ["결정", "승인"]),
+    )
+    monkeypatch.setattr(
+        MeetingPipeline,
+        "_detect_low_quality_summary",
+        lambda self, summary_obj, metrics: ["summary_too_short"],
+    )
+
+    summary = pipeline.run(job)
+
+    assert supervisor_stub.called
+    assert summary.structured_summary.get("requires_manual_review") is True
+    decision = summary.structured_summary.get("supervisor_decision")
+    assert decision and decision.get("action") == "escalate"
+
+    metadata = json.loads((output_dir / "metadata.json").read_text(encoding="utf-8"))
+    supervisor_meta = metadata.get("supervisor", {}).get("decision")
+    assert supervisor_meta and supervisor_meta.get("action") == "escalate"
+
+    alerts_path = output_dir / "summary_alerts.json"
+    assert alerts_path.exists()
 
 
 @pytest.mark.full
@@ -578,6 +713,58 @@ def test_pipeline_reuses_cache(monkeypatch, tmp_path: Path) -> None:
     assert second_summary.transcript_path == first_summary.transcript_path
 
 
+@pytest.mark.smoke
+def test_cache_restores_structured_summary(tmp_path: Path) -> None:
+    audio = tmp_path / "meeting.wav"
+    audio.write_bytes(b"audio")
+    output_dir = tmp_path / "out"
+    output_dir.mkdir()
+
+    pipeline = MeetingPipeline(stt_backend="placeholder", summary_backend="heuristic")
+    cache_info = {
+        "version": 1,
+        "audio_fingerprint": pipeline._audio_fingerprint(audio),
+        "stt_backend": pipeline.stt_backend,
+        "summary_backend": pipeline.summary_backend,
+        "options": {"diarize": False, "speaker_count": None},
+    }
+
+    summary_payload = {
+        "summary": {
+            "highlights": [{"text": "first highlight"}],
+            "action_items": [{"text": "follow up"}],
+            "decisions": [{"text": "ship soon"}],
+            "raw_summary": "raw summary text",
+        },
+        "structured_summary": {
+            "highlights": [{"text": "first highlight"}],
+            "action_items": [{"text": "follow up"}],
+            "decisions": [{"text": "ship soon"}],
+            "review_issues": ["too short"],
+            "requires_manual_review": True,
+        },
+        "raw_summary": "raw summary text",
+        "alerts": ["summary_too_short"],
+    }
+
+    (output_dir / "summary.json").write_text(json.dumps(summary_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    (output_dir / "segments.json").write_text(json.dumps([{"start": 0.0, "end": 1.0, "text": "hello", "speaker": "speaker_1"}], ensure_ascii=False, indent=2), encoding="utf-8")
+    (output_dir / "transcript.txt").write_text("hello world", encoding="utf-8")
+    metadata = {"cache": cache_info}
+    (output_dir / "metadata.json").write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    job = MeetingJobConfig(audio_path=audio, output_dir=output_dir)
+    cached_summary = pipeline._load_cache(job)
+
+    assert cached_summary is not None
+    assert cached_summary.structured_summary.get("requires_manual_review") is True
+    assert cached_summary.structured_summary.get("review_issues") == ["too short"]
+    assert cached_summary.structured_summary.get("alerts") == ["summary_too_short"]
+    assert cached_summary.highlights == ["first highlight"]
+    assert cached_summary.action_items == ["follow up"]
+    assert cached_summary.decisions == ["ship soon"]
+
+
 def test_backend_diagnostics_structure(monkeypatch) -> None:
     monkeypatch.setattr(
         MeetingPipeline,
@@ -623,3 +810,64 @@ def test_pii_masking_enabled(monkeypatch, tmp_path: Path) -> None:
     assert metadata.get("pii_masked") is True
 
     monkeypatch.delenv("MEETING_MASK_PII", raising=False)
+
+
+def _write_silence(tmp_path: Path, *, seconds: float = 1.0, sample_rate: int = 16000) -> Path:
+    if sf is None:
+        pytest.skip("soundfile is required for wav2vec2 backend tests")
+    samples = max(1, int(sample_rate * seconds))
+    data = np.zeros(samples, dtype=np.float32)
+    audio_path = tmp_path / "wav2vec_fixture.wav"
+    sf.write(audio_path, data, sample_rate)
+    return audio_path
+
+
+def test_wav2vec2_backend_transcribe_with_chunks(tmp_path: Path) -> None:
+    from core.agents.meeting.stt.wav2vec2_service import Wav2Vec2STTBackend
+
+    audio_path = _write_silence(tmp_path)
+    backend = Wav2Vec2STTBackend(model_id="dummy-wav2vec2")
+
+    class DummyPipe:
+        def __call__(self, *args, **kwargs):
+            return {
+                "text": "hello world",
+                "chunks": [
+                    {"text": "hello", "timestamp": (0.0, 0.5)},
+                    {"text": "world", "timestamp": (0.5, 1.0)},
+                ],
+            }
+
+    backend._pipeline = DummyPipe()  # type: ignore[assignment]
+    result = backend.transcribe(audio_path, language="ko")
+
+    assert result.text == "hello world"
+    assert len(result.segments) == 2
+    assert result.segments[0]["text"] == "hello"
+    assert result.segments[1]["text"] == "world"
+
+
+def test_wav2vec2_backend_fallback_segments(tmp_path: Path) -> None:
+    from core.agents.meeting.stt.wav2vec2_service import Wav2Vec2STTBackend
+
+    audio_path = _write_silence(tmp_path, seconds=0.5)
+    backend = Wav2Vec2STTBackend(model_id="dummy-wav2vec2")
+
+    class RaisingPipe:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def __call__(self, *args, **kwargs):
+            self.calls += 1
+            if "return_timestamps" in kwargs:
+                raise TypeError("unsupported argument")
+            return {"text": "fallback segment only"}
+
+    pipe = RaisingPipe()
+    backend._pipeline = pipe  # type: ignore[assignment]
+    result = backend.transcribe(audio_path, language="en")
+
+    assert pipe.calls == 2  # once with timestamps, once without
+    assert result.text == "fallback segment only"
+    assert len(result.segments) == 1
+    assert result.segments[0]["text"] == "fallback segment only"

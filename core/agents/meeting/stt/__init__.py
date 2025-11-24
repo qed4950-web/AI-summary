@@ -65,5 +65,13 @@ def create_stt_backend(name: str | None, **kwargs) -> Optional[STTBackend]:
             return None
         return WhisperSTTBackend(**kwargs)
 
+    if normalized in {"wav2vec2", "wav2vec"}:
+        try:
+            from .wav2vec2_service import Wav2Vec2STTBackend
+        except ImportError as exc:  # pragma: no cover - optional dependency
+            LOGGER.error("transformers wav2vec2 backend unavailable: %s", exc)
+            return None
+        return Wav2Vec2STTBackend(**kwargs)
+
     LOGGER.warning("Unknown STT backend '%s'; falling back to placeholder", name)
     return None

@@ -13,3 +13,6 @@ _os.environ.setdefault("KMP_SETTINGS", "1")
 
 _impl = _import_module("scripts.pipeline.infopilot")
 _sys.modules[__name__] = _impl
+
+if __name__ == "__main__":
+    _impl.cli()  # type: ignore[attr-defined]

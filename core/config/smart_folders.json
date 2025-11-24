@@ -16,10 +16,34 @@
     "policy": "core/config/meeting_agent.yaml"
   },
   {
-    "id": "documents-default",
-    "label": "문서 자료",
+    "id": "documents-docs",
+    "label": "문서 자료 (Documents)",
     "type": "documents",
-    "path": "~/Desktop/AI Summary/문서",
+    "path": "/Users/david/Documents",
+    "scope": "policy",
+    "policy": "core/config/hybrid.yaml"
+  },
+  {
+    "id": "documents-desktop",
+    "label": "문서 자료 (Desktop)",
+    "type": "documents",
+    "path": "/Users/david/Desktop",
+    "scope": "policy",
+    "policy": "core/config/hybrid.yaml"
+  },
+  {
+    "id": "documents-downloads",
+    "label": "문서 자료 (Downloads)",
+    "type": "documents",
+    "path": "/Users/david/Downloads",
+    "scope": "policy",
+    "policy": "core/config/hybrid.yaml"
+  },
+  {
+    "id": "documents-cloud",
+    "label": "문서 자료 (CloudStorage)",
+    "type": "documents",
+    "path": "/Users/david/Library/CloudStorage",
     "scope": "policy",
     "policy": "core/config/hybrid.yaml"
   },
