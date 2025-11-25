@@ -52,3 +52,9 @@ python infopilot.py pipeline all \
   --policy core/config/smart_folders.json \
   --embedding-concurrency 2
 
+## 7) UI 실행
+# 데스크톱 UI(PySide6)
+python ui/app.py
+
+# FastAPI 백엔드 + 웹앱(개발 모드) 동시 실행
+bash scripts/run_all.sh
