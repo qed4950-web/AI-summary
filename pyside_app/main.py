@@ -66,8 +66,8 @@ class ChatWindow(QtWidgets.QMainWindow):
         self._load_engine()
 
     def _build_agent(self) -> DocumentAgent:
-        llm_backend = (os.getenv("UI_LLM_BACKEND") or "ollama").strip()
-        llm_model = (os.getenv("UI_LLM_MODEL") or "gemma3:4b").strip()
+        llm_backend = (os.getenv("UI_LLM_BACKEND") or "local_llamacpp").strip()
+        llm_model = (os.getenv("UI_LLM_MODEL") or "models/gguf/gemma3-4b.gguf").strip()
         return DocumentAgent(
             DocumentAgentConfig(
                 model_path=TOPIC_MODEL_PATH,

@@ -179,11 +179,6 @@ class ConversationScreen(ctk.CTkFrame):
         self.app = app
         self.settings = SettingsManager(SETTINGS_PATH.resolve())
         backend_default = (self.settings.get("conversation", "llm_backend", default="") or "").strip()
-        if not backend_default and shutil.which("ollama"):
-            self.settings.set("ollama", "conversation", "llm_backend")
-            model_default = (self.settings.get("conversation", "llm_model", default="") or "").strip()
-            if not model_default:
-                self.settings.set("llama3", "conversation", "llm_model")
         self.orchestrator: Optional[AssistantOrchestrator] = None
         self.history: List[tuple[str, str]] = []
         self.last_copyable_text: str = ""
@@ -687,8 +682,9 @@ class ConversationScreen(ctk.CTkFrame):
     # ------------------------------------------------------------------
     def _effective_settings(self) -> Dict[str, any]:
         return {
-            "llm_backend": self.settings.get("conversation", "llm_backend", default="").strip(),
-            "llm_model": self.settings.get("conversation", "llm_model", default="").strip() or "llama3",
+            "llm_backend": self.settings.get("conversation", "llm_backend", default="local_llamacpp").strip(),
+            "llm_model": self.settings.get("conversation", "llm_model", default="models/gguf/gemma3-4b.gguf").strip()
+            or "models/gguf/gemma3-4b.gguf",
             "llm_host": self.settings.get("conversation", "llm_host", default="").strip(),
             "top_k": int(self.settings.get("conversation", "top_k", default=DEFAULT_TOP_K) or DEFAULT_TOP_K),
             "min_similarity": float(self.settings.get("conversation", "min_similarity", default=DEFAULT_SIMILARITY_THRESHOLD) or DEFAULT_SIMILARITY_THRESHOLD),
@@ -730,7 +726,12 @@ class ConversationSettingsDialog(ctk.CTkToplevel):
         cfg = parent._effective_settings()
 
         row = 0
-        self.backend = ctk.CTkComboBox(self.content, values=["", "ollama"], state="normal", command=self._on_backend_change)
+        self.backend = ctk.CTkComboBox(
+            self.content,
+            values=["", "local_llamacpp", "local_gemma", "ollama"],
+            state="normal",
+            command=self._on_backend_change,
+        )
         self.backend.set(cfg["llm_backend"])
         self._add_labeled_field("LLM 백엔드", self.backend, row)
         row += 1
@@ -822,7 +823,7 @@ class ConversationSettingsDialog(ctk.CTkToplevel):
 
     def _save(self) -> None:
         backend = self.backend.get().strip()
-        model = self.model_combo.get().strip() or "llama3"
+        model = self.model_combo.get().strip() or "models/gguf/gemma3-4b.gguf"
         host = self.host_entry.get().strip()
         top_k = int(self.topk_slider.get())
         min_sim = round(float(self.sim_slider.get()), 3)

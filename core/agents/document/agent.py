@@ -59,12 +59,13 @@ class DocumentAgent(ConversationalAgent):
         llm_options.setdefault("thinking", False)
 
         env_backend = os.getenv("DOCUMENT_LLM_BACKEND", "")
-        effective_model = config.llm_model or os.getenv("DOCUMENT_LLM_MODEL", "qwen3:4b")
+        effective_model = config.llm_model or os.getenv("DOCUMENT_LLM_MODEL", "models/gguf/gemma3-4b.gguf")
         effective_backend = (config.llm_backend or env_backend or "").strip()
-        if not effective_backend and effective_model:
-            known_local = {"qwen3:4b", "eeve_korean_v2", "eeve_korean", "llama3", "mistral", "phi3"}
-            if ":" in effective_model or effective_model in known_local:
-                effective_backend = "ollama"
+        if not effective_backend:
+            if effective_model.endswith(".gguf") or "/" in effective_model:
+                effective_backend = "local_llamacpp"
+            else:
+                effective_backend = "local_llamacpp"
 
         self._chat = LNPChat(
             model_path=config.model_path,

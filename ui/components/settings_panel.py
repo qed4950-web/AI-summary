@@ -13,7 +13,16 @@ from ui.settings_manager import SettingsManager
 
 _STATIC_MODEL_CHOICES = {
     "openai": ["", "gpt-4o", "gpt-4o-mini", "gpt-4-turbo", "gpt-3.5-turbo"],
-    "local": ["", "llama3", "phi3", "mistral"],
+    "local_llamacpp": [
+        "",
+        "models/gguf/gemma3-4b.gguf",
+        "models/gguf/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf",
+    ],
+    "local": [
+        "",
+        "models/gguf/gemma3-4b.gguf",
+        "models/gguf/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf",
+    ],
 }
 
 
@@ -37,7 +46,10 @@ class SettingsPanel(ctk.CTkToplevel):
         container.pack(fill="both", expand=True, padx=20, pady=20)
         container.grid_columnconfigure(1, weight=1)
 
-        self.backend_var = ctk.StringVar(value=self._get_setting("llm_backend"))
+        backend_value = self._get_setting("llm_backend")
+        if backend_value == "local":
+            backend_value = "local_llamacpp"
+        self.backend_var = ctk.StringVar(value=backend_value)
         self.model_var = ctk.StringVar(value=self._get_setting("llm_model"))
         self.host_var = ctk.StringVar(value=self._get_setting("llm_host"))
         self.api_var = ctk.StringVar(value=self._get_setting("llm_api_key"))
@@ -47,7 +59,7 @@ class SettingsPanel(ctk.CTkToplevel):
         ctk.CTkLabel(container, text="LLM Backend").grid(row=0, column=0, sticky="w", pady=(0, 8))
         backend_menu = ctk.CTkOptionMenu(
             container,
-            values=["", "ollama", "openai", "local"],
+            values=["", "local_llamacpp", "ollama", "openai"],
             variable=self.backend_var,
             command=self._on_backend_change,
         )
@@ -85,7 +97,7 @@ class SettingsPanel(ctk.CTkToplevel):
         timeout_entry.grid(row=4, column=1, sticky="ew", pady=8)
         timeout_hint = ctk.CTkLabel(
             container,
-            text="초기 Ollama 로딩이 길면 값을 늘려 주세요 (기본 20초).",
+            text="로컬/원격 LLM 초기 로딩이 길면 값을 늘려 주세요 (기본 20초).",
             font=ctk.CTkFont(size=11),
             text_color="#6b6b6b",
         )
@@ -108,9 +120,13 @@ class SettingsPanel(ctk.CTkToplevel):
         self._populate_model_values(self.backend_var.get(), host=self.host_var.get(), force_refresh=True)
 
     def _get_setting(self, key: str) -> str:
-        return str(
-            self.settings.get("conversation", key, default="") or ""
-        ).strip()
+        if key == "llm_backend":
+            default = "local_llamacpp"
+        elif key == "llm_model":
+            default = "models/gguf/gemma3-4b.gguf"
+        else:
+            default = ""
+        return str(self.settings.get("conversation", key, default=default) or default).strip()
 
     def _save(self) -> None:
         self.settings.set(self.backend_var.get().strip(), "conversation", "llm_backend")
