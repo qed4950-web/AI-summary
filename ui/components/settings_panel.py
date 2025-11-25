@@ -10,6 +10,7 @@ from typing import Callable, Optional
 import customtkinter as ctk
 
 from ui.settings_manager import SettingsManager
+from core.config.llm_defaults import DEFAULT_LLM_BACKEND, DEFAULT_LLM_MODEL
 
 _STATIC_MODEL_CHOICES = {
     "openai": ["", "gpt-4o", "gpt-4o-mini", "gpt-4-turbo", "gpt-3.5-turbo"],
@@ -121,9 +122,9 @@ class SettingsPanel(ctk.CTkToplevel):
 
     def _get_setting(self, key: str) -> str:
         if key == "llm_backend":
-            default = "local_llamacpp"
+            default = DEFAULT_LLM_BACKEND
         elif key == "llm_model":
-            default = "models/gguf/gemma3-4b.gguf"
+            default = DEFAULT_LLM_MODEL
         else:
             default = ""
         return str(self.settings.get("conversation", key, default=default) or default).strip()

@@ -12,6 +12,7 @@ import threading
 import time
 
 from core.agents.document import DocumentAgent, DocumentAgentConfig
+from core.config.llm_defaults import DEFAULT_LLM_BACKEND, DEFAULT_LLM_MODEL
 from core.agents.meeting import MeetingAgent
 from core.agents.photo import PhotoAgent
 from core.conversation.orchestrator import AssistantOrchestrator
@@ -682,9 +683,9 @@ class ConversationScreen(ctk.CTkFrame):
     # ------------------------------------------------------------------
     def _effective_settings(self) -> Dict[str, any]:
         return {
-            "llm_backend": self.settings.get("conversation", "llm_backend", default="local_llamacpp").strip(),
-            "llm_model": self.settings.get("conversation", "llm_model", default="models/gguf/gemma3-4b.gguf").strip()
-            or "models/gguf/gemma3-4b.gguf",
+            "llm_backend": self.settings.get("conversation", "llm_backend", default=DEFAULT_LLM_BACKEND).strip(),
+            "llm_model": self.settings.get("conversation", "llm_model", default=DEFAULT_LLM_MODEL).strip()
+            or DEFAULT_LLM_MODEL,
             "llm_host": self.settings.get("conversation", "llm_host", default="").strip(),
             "top_k": int(self.settings.get("conversation", "top_k", default=DEFAULT_TOP_K) or DEFAULT_TOP_K),
             "min_similarity": float(self.settings.get("conversation", "min_similarity", default=DEFAULT_SIMILARITY_THRESHOLD) or DEFAULT_SIMILARITY_THRESHOLD),
@@ -823,7 +824,7 @@ class ConversationSettingsDialog(ctk.CTkToplevel):
 
     def _save(self) -> None:
         backend = self.backend.get().strip()
-        model = self.model_combo.get().strip() or "models/gguf/gemma3-4b.gguf"
+        model = self.model_combo.get().strip() or DEFAULT_LLM_MODEL
         host = self.host_entry.get().strip()
         top_k = int(self.topk_slider.get())
         min_sim = round(float(self.sim_slider.get()), 3)

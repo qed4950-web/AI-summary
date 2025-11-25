@@ -12,6 +12,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from core.agents.document import DocumentAgent, DocumentAgentConfig
+from core.config.llm_defaults import DEFAULT_LLM_BACKEND, DEFAULT_LLM_MODEL
 from core.config.paths import CACHE_DIR, CORPUS_PATH, TOPIC_MODEL_PATH
 from pyside_app.chat_worker import ChatWorker
 
@@ -66,8 +67,8 @@ class ChatWindow(QtWidgets.QMainWindow):
         self._load_engine()
 
     def _build_agent(self) -> DocumentAgent:
-        llm_backend = (os.getenv("UI_LLM_BACKEND") or "local_llamacpp").strip()
-        llm_model = (os.getenv("UI_LLM_MODEL") or "models/gguf/gemma3-4b.gguf").strip()
+        llm_backend = (os.getenv("UI_LLM_BACKEND") or DEFAULT_LLM_BACKEND).strip()
+        llm_model = (os.getenv("UI_LLM_MODEL") or DEFAULT_LLM_MODEL).strip()
         return DocumentAgent(
             DocumentAgentConfig(
                 model_path=TOPIC_MODEL_PATH,

@@ -11,6 +11,7 @@ from core.agents import AgentRequest, AgentResult, ConversationalAgent
 from core.agents.supervisor import SummarySupervisor, SupervisorDecision
 from core.conversation.lnp_chat import LNPChat
 from core.data_pipeline.policies.engine import PolicyEngine
+from core.config.llm_defaults import DEFAULT_LLM_MODEL, resolve_backend
 
 
 @dataclass
@@ -59,13 +60,12 @@ class DocumentAgent(ConversationalAgent):
         llm_options.setdefault("thinking", False)
 
         env_backend = os.getenv("DOCUMENT_LLM_BACKEND", "")
-        effective_model = config.llm_model or os.getenv("DOCUMENT_LLM_MODEL", "models/gguf/gemma3-4b.gguf")
-        effective_backend = (config.llm_backend or env_backend or "").strip()
-        if not effective_backend:
-            if effective_model.endswith(".gguf") or "/" in effective_model:
-                effective_backend = "local_llamacpp"
-            else:
-                effective_backend = "local_llamacpp"
+        effective_model = config.llm_model or os.getenv("DOCUMENT_LLM_MODEL", DEFAULT_LLM_MODEL)
+        effective_backend = resolve_backend(
+            config_backend=config.llm_backend,
+            env_backend=env_backend,
+            model=effective_model,
+        )
 
         self._chat = LNPChat(
             model_path=config.model_path,
