@@ -1,0 +1,54 @@
+# AI-summary 자주 쓰는 명령 (터미널에 그대로 붙여넣기)
+
+## 1) 스캔 → 학습 → 인덱스 한 번에 (오프라인, 스마트 폴더 전체)
+HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
+python infopilot.py pipeline all \
+  --out data/found_files.csv \
+  --corpus data/corpus.parquet \
+  --model data/topic_model.joblib \
+  --cache data/cache \
+  --state-file data/scan_state.json \
+  --chunk-cache data/cache/chunk_cache.json \
+  --policy core/config/smart_folders.json \
+  --embedding-concurrency 2
+
+## 2) 검색/챗 모드 (기본: 검색 결과만, LLM 백엔드 없을 때)
+python infopilot.py run chat \
+  --model data/topic_model.joblib \
+  --corpus data/corpus.parquet \
+  --cache data/cache \
+  --lexical-weight 0.35 \
+  --rerank-model BAAI/bge-reranker-large
+
+## 3) 로컬 GGUF(예: gemma3-4b.gguf) + llama.cpp 백엔드 사용 시
+# (필수: pip install llama-cpp-python, GGUF 경로 준비)
+HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
+LNPCHAT_LLM_BACKEND=local_llamacpp \
+LNPCHAT_LLM_MODEL=models/gguf/gemma3-4b.gguf \
+LNPCHAT_LLM_OPTIONS='{"n_ctx":4096,"max_new_tokens":512,"n_threads":4}' \
+python infopilot.py run chat \
+  --model data/topic_model.joblib \
+  --corpus data/corpus.parquet \
+  --cache data/cache \
+  --lexical-weight 0.35 \
+  --rerank-model BAAI/bge-reranker-large
+
+## 4) 골든 리콜 테스트 (모델/코퍼스/캐시 준비되어 있을 때)
+GOLDEN_REQUIRED=1 pytest tests/regression/test_retriever_golden.py::test_golden_queries_recall
+
+## 5) 전체 테스트 빠르게
+pytest
+
+## 6) 특정 루트만 스캔 후 학습 (예: Documents만)
+HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
+python infopilot.py pipeline all \
+  --root /Users/david/Documents \
+  --out data/found_files.csv \
+  --corpus data/corpus.parquet \
+  --model data/topic_model.joblib \
+  --cache data/cache \
+  --state-file data/scan_state.json \
+  --chunk-cache data/cache/chunk_cache.json \
+  --policy core/config/smart_folders.json \
+  --embedding-concurrency 2
+
