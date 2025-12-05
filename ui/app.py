@@ -198,7 +198,7 @@ class AISummaryApp(ctk.CTk):
         try:
             config = self._effective_settings()
             llm_options = self._build_llm_options(config)
-            os.environ.setdefault("LNPCHAT_LLM_TIMEOUT", "6")
+            os.environ.setdefault("LNPCHAT_LLM_TIMEOUT", "30")
             os.environ.setdefault("LNPCHAT_LLM_HEALTH_TIMEOUT", "5")
             document_agent = DocumentAgent(
                 DocumentAgentConfig(

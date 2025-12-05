@@ -152,7 +152,7 @@ class ToolRouter:
             return "dialogue" if llm_available else "search"
 
         lowered = trimmed.lower()
-        has_command = lowered.startswith(("/search", "/doc"))
+        has_command = lowered.startswith(("/search", "/doc", "/audio"))
         keywords_summary = {
             "요약", "정리", "정리해줘", "설명", "설명해줘", "핵심", "한줄", "결론",
             "말해줘", "알려줘", "소개해줘",

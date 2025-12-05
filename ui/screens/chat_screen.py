@@ -221,6 +221,8 @@ class ChatScreen(ctk.CTkFrame):
                     pass
             return
 
+        # 입력창을 즉시 비워서 다음 입력 준비
+        self.search_entry.delete(0, "end")
         self.search_entry.configure(state="disabled")
         self.search_button.configure(state="disabled")
         self._append_conversation("user", query)

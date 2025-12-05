@@ -11,6 +11,11 @@ import textwrap
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Protocol
 
+try:
+    from llama_cpp import Llama  # type: ignore
+except Exception:  # pragma: no cover - optional dependency
+    Llama = None
+
 LOGGER = logging.getLogger(__name__)
 
 SENTENCE_SPLIT = re.compile(r"(?<=[.!?\n])\s+")
@@ -58,6 +63,11 @@ class SummariserConfig:
     bitnet_model: str = os.getenv("MEETING_SUMMARY_BITNET_MODEL", "bitnet/b1.58-instruct")
     bitnet_max_length: int = _int_env("MEETING_SUMMARY_BITNET_MAXLEN", 220)
     bitnet_min_length: int = _int_env("MEETING_SUMMARY_BITNET_MINLEN", 60)
+
+    llama_model: str = os.getenv("MEETING_SUMMARY_LLAMA_MODEL", "")
+    llama_n_ctx: int = _int_env("MEETING_SUMMARY_LLAMA_N_CTX", 4096)
+    llama_n_threads: int = _int_env("MEETING_SUMMARY_LLAMA_THREADS", 0)
+    llama_max_new_tokens: int = _int_env("MEETING_SUMMARY_LLAMA_MAX_NEW_TOKENS", 256)
 
 
 class BaseSummariser(Protocol):
@@ -281,6 +291,98 @@ class OllamaSummariser:
         return (result.stdout or "").strip()
 
 
+class LlamaCppSummariser:
+    """Summariser that runs a local GGUF via llama-cpp-python (no Ollama)."""
+
+    def __init__(self, config: SummariserConfig | None = None) -> None:
+        self.config = config or SummariserConfig()
+        if Llama is None:
+            raise RuntimeError("llama-cpp-python is required for llama backend")
+        model_path = (self.config.llama_model or "").strip()
+        if not model_path:
+            raise RuntimeError("MEETING_SUMMARY_LLAMA_MODEL must point to a GGUF file")
+        n_ctx = max(256, int(self.config.llama_n_ctx))
+        n_threads = int(self.config.llama_n_threads)
+        try:
+            self._llm = Llama(
+                model_path=model_path,
+                n_ctx=n_ctx,
+                n_threads=n_threads if n_threads > 0 else None,
+                logits_all=False,
+            )
+        except Exception as exc:  # pragma: no cover - optional dependency
+            raise RuntimeError(f"llama.cpp model load failed: {exc}") from exc
+
+    @staticmethod
+    def is_available() -> bool:
+        return Llama is not None
+
+    def summarise(self, text: str) -> str:
+        text = (text or "").strip()
+        if not text:
+            return ""
+
+        chunks = self._chunk_text(text, self.config.chunk_char_limit)
+        parts = [self._summarise_chunk(chunk) for chunk in chunks if chunk.strip()]
+        parts = [p for p in parts if p]
+        if not parts:
+            return ""
+        if len(parts) == 1:
+            return parts[0]
+        combined = " ".join(parts)
+        final = self._summarise_chunk(combined)
+        return final or combined
+
+    def _summarise_chunk(self, chunk: str) -> str:
+        prompt_template = self.config.ollama_prompt or DEFAULT_OLLAMA_PROMPT
+        prompt = prompt_template.format(transcript=chunk)
+        try:
+            out = self._llm(
+                prompt=prompt,
+                max_tokens=max(1, int(self.config.llama_max_new_tokens)),
+                temperature=0.0,
+                stop=["</s>"],
+            )
+        except Exception as exc:  # pragma: no cover - inference guard
+            LOGGER.exception("llama.cpp summarisation failed: %s", exc)
+            return ""
+        text = ""
+        if isinstance(out, dict):
+            choices = out.get("choices") or []
+            if choices and isinstance(choices[0], dict):
+                text = choices[0].get("text", "") or ""
+        if not text:
+            text = str(out)
+        return text.strip()
+
+    def _chunk_text(self, text: str, limit: int) -> List[str]:
+        if limit <= 0:
+            return [text]
+
+        sentences = [sentence.strip() for sentence in SENTENCE_SPLIT.split(text) if sentence.strip()]
+        if not sentences:
+            return [text]
+
+        chunks: List[str] = []
+        current: List[str] = []
+        current_len = 0
+
+        for sentence in sentences:
+            length = len(sentence)
+            if current and current_len + length > limit:
+                chunks.append(" ".join(current))
+                current = [sentence]
+                current_len = length
+            else:
+                current.append(sentence)
+                current_len += length
+
+        if current:
+            chunks.append(" ".join(current))
+
+        return chunks or [text]
+
+
 class BitNetSummariser:
     """Summariser for BitNet / low-bit quantised models via HuggingFace pipeline."""
 
@@ -336,11 +438,16 @@ _SUMMARY_BACKEND_ALIASES = {
     "kobart_chunk": "kobart",
     "ollama": "ollama",
     "bitnet": "bitnet",
+    "llama": "llama",
+    "llamacpp": "llama",
+    "local_llama": "llama",
+    "local_llamacpp": "llama",
 }
 _SUMMARY_BACKENDS = {
     "kobart": KoBARTSummariser,
     "ollama": OllamaSummariser,
     "bitnet": BitNetSummariser,
+    "llama": LlamaCppSummariser,
 }
 
 

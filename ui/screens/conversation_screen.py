@@ -299,7 +299,7 @@ class ConversationScreen(ctk.CTkFrame):
             return
         try:
             config = self._effective_settings()
-            os.environ.setdefault("LNPCHAT_LLM_TIMEOUT", "6")
+            os.environ.setdefault("LNPCHAT_LLM_TIMEOUT", "30")
             os.environ.setdefault("LNPCHAT_LLM_HEALTH_TIMEOUT", "5")
             document_agent = DocumentAgent(
                 DocumentAgentConfig(

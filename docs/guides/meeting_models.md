@@ -9,6 +9,7 @@
 | 요약기 (KoBART) | `gogamza/kobart-base-v2` | 한국어 요약 | `MEETING_SUMMARY_MODEL` |
 | 요약기 (BART EN) | `facebook/bart-large-cnn` | 영어 요약 | `MEETING_SUMMARY_EN_MODEL` |
 | 요약기 (Ollama) | 예: `llama3` | 로컬 LLM 기반 요약 | `MEETING_SUMMARY_BACKEND=ollama`, `MEETING_SUMMARY_OLLAMA_MODEL`, `MEETING_SUMMARY_OLLAMA_HOST` |
+| 요약기 (llama.cpp) | 예: `models/gguf/gemma-3-4b-it-Q4_K_M.gguf` | 로컬 GGUF(Llama.cpp) 요약 | `MEETING_SUMMARY_BACKEND=llama`, `MEETING_SUMMARY_LLAMA_MODEL`, `MEETING_SUMMARY_LLAMA_N_CTX`, `MEETING_SUMMARY_LLAMA_THREADS`, `MEETING_SUMMARY_LLAMA_MAX_NEW_TOKENS` |
 | 요약기 (BitNet) | `bitnet/b1.58-instruct` | 경량 LLM 요약 | `MEETING_SUMMARY_BACKEND=bitnet`, `MEETING_SUMMARY_BITNET_MODEL` |
 | 휴리스틱 요약 | - | 모델 실패 시 키워드 기반 응답 | `MEETING_SUMMARY_BACKEND=heuristic` |
 | 요약 감독기 (Supervisor) | 예: `ollama` | 결과 품질 판단/재검수 지시 | `MEETING_SUPERVISOR_BACKEND`, `MEETING_SUPERVISOR_MODEL`, `MEETING_SUPERVISOR_MODE`, `SUMMARY_SUPERVISOR_MODEL`, `DOCUMENT_SUPERVISOR_*` |
@@ -16,6 +17,7 @@
 
 ## 참고 사항
 - KoBART/BART/BitNet은 **요약 전용 모델**이며, Ollama는 원하는 LLM을 지정해 활용할 수 있습니다.
+- llama.cpp를 쓰려면 `MEETING_SUMMARY_BACKEND=llama`와 함께 `MEETING_SUMMARY_LLAMA_MODEL`(GGUF 경로), 필요 시 `MEETING_SUMMARY_LLAMA_N_CTX`/`MEETING_SUMMARY_LLAMA_THREADS`/`MEETING_SUMMARY_LLAMA_MAX_NEW_TOKENS`를 지정하세요.
 - `MEETING_SUMMARY_BACKEND` 값을 `kobart`, `ollama`, `bitnet`, `heuristic`으로 바꾸어 요약 엔진을 전환합니다.
 - STT는 기본적으로 Wav2Vec2(`MEETING_STT_BACKEND=wav2vec2`)를 사용하며, whisper 백엔드는 CPU-only 환경이나 경량 워크로드를 위한 대체 옵션입니다.
 - 요약 검수기는 기본적으로 비활성화되어 있으며, `MEETING_SUMMARY_REVIEW_BACKEND`를 지정하면 1차 요약을 LLM으로 보완한 뒤 JSON 결과를 적용합니다.

@@ -16,12 +16,12 @@ _STATIC_MODEL_CHOICES = {
     "openai": ["", "gpt-4o", "gpt-4o-mini", "gpt-4-turbo", "gpt-3.5-turbo"],
     "local_llamacpp": [
         "",
-        "models/gguf/gemma3-4b.gguf",
+        "models/gguf/gemma-3-4b-it-Q4_K_M.gguf",
         "models/gguf/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf",
     ],
     "local": [
         "",
-        "models/gguf/gemma3-4b.gguf",
+        "models/gguf/gemma-3-4b-it-Q4_K_M.gguf",
         "models/gguf/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf",
     ],
 }

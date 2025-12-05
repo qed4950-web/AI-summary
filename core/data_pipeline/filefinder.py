@@ -52,7 +52,7 @@ class FileFinder:
         ".xlsx", ".xls", ".xlsm", ".xlsb", ".xltx",
         ".pdf",
         ".ppt", ".pptx",
-        ".csv", ".txt", ".md", ".rst", ".json", ".py",
+        ".csv", ".txt", ".md", ".rst", ".json",
     }
     WINDOWS_SKIP_DIRS = {
         r"\$Recycle.Bin",
@@ -84,6 +84,13 @@ class FileFinder:
         "logs",
         "applications",
         "system",
+        # Python 환경 및 라이브러리 폴더 제외
+        "conda",
+        "miniconda",
+        "anaconda",
+        "site-packages",
+        ".pyenv",
+        ".conda",
     }
 
     def __init__(

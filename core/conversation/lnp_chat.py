@@ -39,6 +39,32 @@ _GREETINGS = {
     "good evening",
 }
 
+def _env_flag(name: str, *, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    raw = raw.strip().lower()
+    if raw in {"", "none", "null"}:
+        return default
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    if raw in {"1", "true", "yes", "on"}:
+        return True
+    return default
+
+
+def _env_int(name: str, *, default: int, minimum: int = 1, maximum: Optional[int] = None) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return default
+    if maximum is not None:
+        value = min(value, maximum)
+    return max(minimum, value)
+
 
 def _ensure_offline_transformers() -> None:
     base_dir = MODELS_DIR / "sentence_transformers"
@@ -102,17 +128,17 @@ class LNPChat:
     cache_dir: Path = Path("./index_cache")
     topk: int = 5
     translate: bool = False  # 기본은 다국어 Sentence-BERT로 번역 없이 처리
-    rerank: bool = False
-    rerank_model: str = "BAAI/bge-reranker-large"
-    rerank_depth: int = 80
+    rerank: bool = field(default_factory=lambda: _env_flag("LNPCHAT_RERANK", default=True))
+    rerank_model: str = field(default_factory=lambda: os.getenv("LNPCHAT_RERANK_MODEL", "BAAI/bge-reranker-large"))
+    rerank_depth: int = field(default_factory=lambda: _env_int("LNPCHAT_RERANK_DEPTH", default=80, minimum=10, maximum=256))
     rerank_batch_size: int = 16
     rerank_device: Optional[str] = None
     rerank_min_score: Optional[float] = 0.35
     lexical_weight: float = 0.2
     show_translation: bool = False
     translation_lang: str = "en"
-    auto_search: bool = True
-    min_similarity: float = 0.35
+    auto_search: bool = field(default_factory=lambda: _env_flag("LNPCHAT_AUTO_SEARCH", default=False))
+    min_similarity: float = 0.75
     policy_engine: Optional[PolicyEngine] = None
     policy_scope: str = "auto"  # auto|policy|global
     policy_agent: str = "knowledge_search"
@@ -121,7 +147,7 @@ class LNPChat:
     llm_host: str = field(default_factory=lambda: os.getenv("LNPCHAT_LLM_HOST", ""))
     llm_options: Dict[str, str] = field(default_factory=dict)
     llm_health_timeout: Optional[float] = field(default=None)
-    llm_timeout: float = field(default_factory=lambda: float(os.getenv("LNPCHAT_LLM_TIMEOUT", "12") or 12.0))
+    llm_timeout: float = field(default_factory=lambda: float(os.getenv("LNPCHAT_LLM_TIMEOUT", "30") or 30.0))
 
     retr: Optional[Retriever] = field(init=False, default=None)
     translator: Optional[Any] = field(init=False, default=None)
@@ -142,7 +168,8 @@ class LNPChat:
     last_selected_hit_index: Optional[int] = field(init=False, default=None)
 
     def __post_init__(self) -> None:
-        self.memory = MemoryStore(capacity=20)
+        memory_cap = _env_int("LNPCHAT_MEMORY_TURNS", default=40, minimum=5, maximum=200)
+        self.memory = MemoryStore(capacity=memory_cap)
         self.prompt_manager = PromptManager(self.memory, tokenizer=_split_tokens)
         self.tool_router = ToolRouter()
         self.llm_client = self._init_llm_client()
@@ -836,37 +863,9 @@ class LNPChat:
             mode,
             "친근하고 명확하게 한국어로 답하세요. 필요하면 최대 1000자까지 자세히 설명하되, 확인되지 않은 정보를 지어내지 말고 모르면 모른다고 답하세요.",
         )
-        if include_history:
-            turns = []
-            for turn in self.memory.recent(limit=limit):
-                text = (turn.text or "").strip()
-                if not text:
-                    continue
-                if turn.hits:
-                    first_line = text.splitlines()[0][:160]
-                    text = f"[문서 추천 {len(turn.hits)}건] {first_line}"
-                else:
-                    collapsed = " ".join(text.split())
-                    if len(collapsed) > 360:
-                        text = collapsed[:360].rstrip() + " …"
-                    else:
-                        text = collapsed
-                role = "사용자" if turn.role == "user" else "비서"
-                turns.append(f"{role}: {text}")
-            if turns:
-                history = "\n".join(turns)
-                return textwrap.dedent(
-                    f"""
-                    이전 대화 기록:
-                    {history}
-
-                    사용자의 새 메시지: {current if current else '...'}
-
-                    {instruction}
-                    """
-                ).strip()
-        base = current if current else "..."
-        return f"{base}\n\n{instruction}"
+        # 히스토리 주입을 제거하여 모델이 스스로 대화를 생성하는 환각(Hallucination) 방지
+        # Llama 모델은 프롬프트에 'User:' 패턴이 포함되면 스스로 다음 턴을 예측하려는 경향이 있음
+        return f"<|system|>\n{instruction}\n</s>\n<|user|>\n{current}\n</s>\n<|assistant|>\n"
 
     @staticmethod
     def _is_affirmative(tokens: Set[str]) -> bool:

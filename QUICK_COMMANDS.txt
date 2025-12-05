@@ -20,11 +20,11 @@ python infopilot.py run chat \
   --lexical-weight 0.35 \
   --rerank-model BAAI/bge-reranker-large
 
-## 3) 로컬 GGUF(예: gemma3-4b.gguf) + llama.cpp 백엔드 사용 시
+## 3) 로컬 GGUF(예: gemma-3-4b-it-Q4_K_M.gguf) + llama.cpp 백엔드 사용 시
 # (필수: pip install llama-cpp-python, GGUF 경로 준비)
 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
 LNPCHAT_LLM_BACKEND=local_llamacpp \
-LNPCHAT_LLM_MODEL=models/gguf/gemma3-4b.gguf \
+LNPCHAT_LLM_MODEL=models/gguf/gemma-3-4b-it-Q4_K_M.gguf \
 LNPCHAT_LLM_OPTIONS='{"n_ctx":4096,"max_new_tokens":512,"n_threads":4}' \
 python infopilot.py run chat \
   --model data/topic_model.joblib \
@@ -58,3 +58,6 @@ python ui/app.py
 
 # FastAPI 백엔드 + 웹앱(개발 모드) 동시 실행
 bash scripts/run_all.sh
+
+## 8) 인덱스 빌드 (FAISS/OpenMP 충돌 완화)
+bash scripts/run_index.sh

@@ -8,8 +8,8 @@ from typing import Optional
 # Default values used across UI/CLI/document agents
 DEFAULT_LLM_BACKEND = os.getenv("DEFAULT_LLM_BACKEND", "local_llamacpp").strip() or "local_llamacpp"
 DEFAULT_LLM_MODEL = (
-    os.getenv("DEFAULT_LLM_MODEL", "models/gguf/gemma3-4b.gguf").strip()
-    or "models/gguf/gemma3-4b.gguf"
+    os.getenv("DEFAULT_LLM_MODEL", "models/gguf/gemma-3-4b-it-Q4_K_M.gguf").strip()
+    or "models/gguf/gemma-3-4b-it-Q4_K_M.gguf"
 )
 
 

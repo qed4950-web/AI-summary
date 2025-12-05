@@ -18,7 +18,7 @@ Metal 확인법(유일한 기준)
 즉시 실행 예시
 - CPU + tiny(안정): ./build_cpu/bin/llama-cli -m models/gguf/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf -ngl 0 -c 512 -p "Hello"
 - Metal + tiny(가속): cd models/llama.cpp && ./build_metal/bin/llama-cli -m ../gguf/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf -ngl 1 -c 256 -p "Hello"
-- 4B CPU: ./build_cpu/bin/llama-cli -m models/gguf/gemma3-4b.gguf -ngl 0 -c 512 -p "hi"
+- 4B CPU: ./build_cpu/bin/llama-cli -m models/gguf/gemma-3-4b-it-Q4_K_M.gguf -ngl 0 -c 512 -p "hi"
 
 레포 참고
 - QUICK_COMMANDS.txt: 스캔→학습→인덱스 일괄, 로컬 llama.cpp GGUF, 골든 리콜, UI 실행 등 한 줄 명령 모음.
@@ -30,6 +30,6 @@ Metal 확인법(유일한 기준)
 - 남은 리스크: (1) 4B Metal 초기화 불안정(하드웨어 한계) (2) 로컬 모델 용량/캐시 준비 (3) 오프라인용 모델·인덱스 사전 확보.
 
 다음 액션
-1) 4B CPU 속도 확인: ./build_cpu/bin/llama-cli -m models/gguf/gemma3-4b.gguf -ngl 0 -c 512 -p "hi"
+1) 4B CPU 속도 확인: ./build_cpu/bin/llama-cli -m models/gguf/gemma-3-4b-it-Q4_K_M.gguf -ngl 0 -c 512 -p "hi"
 2) 자주 쓰는 루트/정책을 core/config/smart_folders.json에 저장 후 QUICK_COMMANDS.txt 첫 명령으로 증분 실행.
 3) .env 또는 셸에서 LNPCHAT_LLM_MODEL을 로컬 GGUF 경로로 고정해 UI/CLI/테스트 백엔드를 통일.

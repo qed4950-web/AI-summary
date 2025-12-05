@@ -5,6 +5,7 @@ import json
 import logging
 import math
 import os
+import platform
 import re
 import sys
 import threading
@@ -99,6 +100,9 @@ else:
                 faiss.omp_set_num_threads(max(1, int(threads)))
             except Exception:
                 pass
+# Allow forcing faiss off (e.g., macOS stability, project-local faiss.py stub).
+if os.getenv("FORCE_HNSWLIB", "1") == "1":
+    faiss = None
 
 try:
     import hnswlib  # type: ignore
@@ -114,7 +118,17 @@ from .index_manager import IndexManager
 
 MODEL_TEXT_COLUMN = "text_model"
 MODEL_TYPE_SENTENCE_TRANSFORMER = "sentence-transformer"
-DEFAULT_EMBED_MODEL = "BAAI/bge-m3"
+def _default_embed_model() -> str:
+    env_model = os.getenv("DEFAULT_EMBED_MODEL")
+    if env_model:
+        return env_model
+    if platform.system() == "Darwin":
+        # Prefer multilingual-e5-small on macOS to reduce memory/compute load
+        return "intfloat/multilingual-e5-small"
+    return "BAAI/bge-m3"
+
+
+DEFAULT_EMBED_MODEL = _default_embed_model()
 MAX_BM25_TOKENS = 8000
 MAX_PREVIEW_CHARS = 180
 DEFAULT_MMR_LAMBDA = 0.7
@@ -1848,9 +1862,10 @@ class QueryEncoder:
     def encode_docs(self, texts: List[str]) -> np.ndarray:
         texts = self._sanitize_texts(texts)
         if self.model_type == MODEL_TYPE_SENTENCE_TRANSFORMER and self.embedder is not None:
+            batch_size = int(os.getenv("INDEX_EMBED_BATCH", "16") or 16)
             Z = self.embedder.encode(
                 texts,
-                batch_size=32,
+                batch_size=max(1, batch_size),
                 show_progress_bar=False,
                 convert_to_numpy=True,
                 normalize_embeddings=True,
@@ -1866,9 +1881,10 @@ class QueryEncoder:
     def encode_query(self, query: str) -> np.ndarray:
         clean_query = self._sanitize_texts([query])
         if self.model_type == MODEL_TYPE_SENTENCE_TRANSFORMER and self.embedder is not None:
+            batch_size = int(os.getenv("INDEX_QUERY_BATCH", "4") or 4)
             Zq = self.embedder.encode(
                 clean_query,
-                batch_size=8,
+                batch_size=max(1, batch_size),
                 show_progress_bar=False,
                 convert_to_numpy=True,
                 normalize_embeddings=True,
@@ -1950,10 +1966,15 @@ class VectorIndex:
 
     @staticmethod
     def _ann_backend() -> Optional[str]:
-        if hnswlib is not None:
+        if os.getenv("DISABLE_ANN") == "1":
+            return None
+        prefer_faiss = os.getenv("FORCE_FAISS") == "1" or os.getenv("DISABLE_HNSWLIB") == "1"
+        if not prefer_faiss and hnswlib is not None:
             return "hnswlib"
         if faiss is not None:
             return "faiss"
+        if hnswlib is not None:
+            return "hnswlib"
         return None
 
     @staticmethod

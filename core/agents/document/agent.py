@@ -22,7 +22,7 @@ class DocumentAgentConfig:
     corpus_path: Path
     cache_dir: Path
     topk: int = 5
-    min_similarity: float = 0.35
+    min_similarity: float = 0.75
     translate: bool = False
     rerank: bool = True
     rerank_model: str = "BAAI/bge-reranker-large"
@@ -33,7 +33,7 @@ class DocumentAgentConfig:
     lexical_weight: float = 0.2
     show_translation: bool = False
     translation_lang: str = "en"
-    auto_search: bool = True
+    auto_search: bool = False
     llm_backend: Optional[str] = None
     llm_model: Optional[str] = None
     llm_host: Optional[str] = None

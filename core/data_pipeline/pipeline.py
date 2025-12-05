@@ -1,5 +1,8 @@
 # pipeline.py  (Step2: 추출 + 학습)
 import importlib
+import subprocess
+import json
+import tempfile
 import io
 import math
 import os
@@ -200,7 +203,17 @@ TOKEN_PATTERN = r'(?u)(?:[가-힣]{1,}|[A-Za-z0-9]{2,})'
 DEFAULT_N_COMPONENTS = 128
 MODEL_TEXT_COLUMN = "text_model"
 _META_SPLIT_RE = re.compile(r"[^0-9A-Za-z가-힣]+")
-DEFAULT_EMBED_MODEL = "BAAI/bge-m3"
+def _default_embed_model() -> str:
+    env_model = os.getenv("DEFAULT_EMBED_MODEL")
+    if env_model:
+        return env_model
+    if platform.system() == "Darwin":
+        # Prefer multilingual-e5-small on macOS to reduce memory/compute load
+        return "intfloat/multilingual-e5-small"
+    return "BAAI/bge-m3"
+
+
+DEFAULT_EMBED_MODEL = _default_embed_model()
 MODEL_TYPE_SENTENCE_TRANSFORMER = "sentence-transformer"
 
 DEFAULT_CHUNK_MIN_TOKENS = 200
@@ -1519,6 +1532,11 @@ class TrainConfig:
     async_embeddings: bool = True
     embedding_concurrency: int = 1
     embedding_dtype: str = "auto"
+    # 대규모 코퍼스 처리용 청크/서브프로세스 임베딩 옵션
+    embedding_chunk_size: int = 0  # 0이면 전체 한 번에
+    embedding_chunk_start: int = 0  # chunk_size>0일 때 시작 청크 인덱스(포함)
+    embedding_chunk_end: int = -1  # chunk_size>0일 때 끝 청크 인덱스(미포함, -1이면 끝까지)
+    embedding_subprocess_fallback: bool = True
 
 
 def _resolve_embed_dtype(cfg: TrainConfig) -> str:
@@ -1725,6 +1743,146 @@ class SentenceBertModel:
 
 
 # =========================
+# 청크 임베딩 (서브프로세스 GPU→CPU fallback)
+# =========================
+def _run_embed_chunk_subprocess(
+    texts: List[str],
+    cfg: TrainConfig,
+    chunk_id: int,
+    total_chunks: int,
+) -> np.ndarray:
+    """Embed a chunk of texts in a subprocess to isolate MPS OOM; CPU로 재시도."""
+    root = Path(__file__).resolve().parents[2]
+    cli_path = root / "scripts" / "pipeline" / "infopilot.py"
+    if not cli_path.exists():
+        raise RuntimeError(f"embed-chunk 명령을 찾을 수 없습니다: {cli_path}")
+
+    with tempfile.TemporaryDirectory() as td:
+        td_path = Path(td)
+        input_path = td_path / "chunk.json"
+        output_path = td_path / "embeddings.npy"
+        input_path.write_text(json.dumps(texts, ensure_ascii=False), encoding="utf-8")
+
+        base_cmd = [
+            sys.executable,
+            str(cli_path),
+            "embed-chunk",
+            "--input",
+            str(input_path),
+            "--output",
+            str(output_path),
+            "--model",
+            cfg.embedding_model,
+            "--batch-size",
+            str(max(1, int(cfg.embedding_batch_size))),
+            "--concurrency",
+            str(max(1, int(cfg.embedding_concurrency))),
+            "--dtype",
+            cfg.embedding_dtype or "auto",
+        ]
+        # 청크 임베딩은 안정성을 위해 기본적으로 동기 모드로 강제한다.
+        base_cmd.append("--no-async")
+
+        def _run(cmd, env=None) -> int:
+            proc = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=env,
+            )
+            if proc.returncode != 0:
+                stdout = (proc.stdout or b"").decode(errors="ignore")
+                stderr = (proc.stderr or b"").decode(errors="ignore")
+                print(
+                    f"⚠️ 청크 임베딩 실패(chunk {chunk_id}/{total_chunks-1}, rc={proc.returncode})"
+                    f"\nstdout: {stdout[:2000]}\nstderr: {stderr[:2000]}",
+                    flush=True,
+                )
+            return proc.returncode
+
+        rc = _run(base_cmd)
+        if rc != 0 and cfg.embedding_subprocess_fallback:
+            env = os.environ.copy()
+            env["INFOPILOT_FORCE_CPU"] = "1"
+            print(f"⚠️ chunk {chunk_id} → CPU로 재시도합니다.", flush=True)
+            rc = _run(base_cmd, env=env)
+
+        if rc != 0:
+            raise RuntimeError(f"청크 임베딩 실패(chunk {chunk_id})")
+
+        emb = np.load(output_path)
+        if emb.dtype != np.float32:
+            emb = emb.astype(np.float32, copy=False)
+        return emb
+
+
+def _chunked_sentence_embeddings(texts: List[str], cfg: TrainConfig) -> np.ndarray:
+    chunk_size = max(1, int(cfg.embedding_chunk_size))
+    start_chunk = max(0, int(getattr(cfg, "embedding_chunk_start", 0) or 0))
+    end_chunk = int(getattr(cfg, "embedding_chunk_end", -1) or -1)
+    total_chunks = math.ceil(len(texts) / chunk_size) if texts else 0
+    embeddings_list: List[np.ndarray] = []
+    progress = ProgressLine(total=max(1, total_chunks), label="Chunk 임베딩", update_every=1)
+
+    for chunk_id, start_idx in enumerate(range(0, len(texts), chunk_size)):
+        if chunk_id < start_chunk:
+            continue
+        if end_chunk >= 0 and chunk_id >= end_chunk:
+            break
+        chunk_texts = texts[start_idx : start_idx + chunk_size]
+        emb = _run_embed_chunk_subprocess(chunk_texts, cfg, chunk_id, total_chunks)
+        embeddings_list.append(emb)
+        progress.update()
+
+    progress.close()
+    if not embeddings_list:
+        return np.zeros((0, 0), dtype=np.float32)
+    return np.concatenate(embeddings_list, axis=0)
+
+
+def _fit_sentence_transformer_chunked(train_df, text_col: str, cfg: TrainConfig):
+    """Chunk + subprocess 기반 임베딩 후 클러스터/메트릭 계산."""
+    semantic_model = SentenceBertModel(cfg)
+    texts = (train_df[text_col].fillna("").astype(str)).tolist()
+    embeddings = _chunked_sentence_embeddings(texts, cfg)
+
+    metrics: Dict[str, float] = {}
+    labels: Optional[np.ndarray] = None
+
+    can_cluster = (
+        MiniBatchKMeans is not None
+        and cfg.n_clusters > 0
+        and embeddings.shape[0] >= max(10, max(1, cfg.n_clusters))
+    )
+    if can_cluster:
+        print("🔖 클러스터링: MiniBatchKMeans", flush=True)
+        cluster_model = MiniBatchKMeans(
+            n_clusters=cfg.n_clusters,
+            random_state=42,
+            batch_size=2048,
+            n_init=_resolve_kmeans_n_init(),
+        )
+        cluster_model.fit(embeddings)
+        try:
+            labels = cluster_model.labels_
+        except AttributeError:
+            labels = cluster_model.predict(embeddings)
+        labels = np.asarray(labels, dtype=np.int32)
+        semantic_model.cluster_model = cluster_model
+        semantic_model.cluster_labels_ = labels
+        metrics = evaluate_embeddings(embeddings, labels, topk=min(5, max(1, embeddings.shape[0] - 1)))
+    else:
+        semantic_model.cluster_model = None
+        semantic_model.cluster_labels_ = None
+        if MiniBatchKMeans is None:
+            print("⚠️ scikit-learn MiniBatchKMeans 미설치로 토픽 라벨링을 건너뜁니다.", flush=True)
+        elif embeddings.shape[0] < max(10, max(1, cfg.n_clusters)):
+            print("ℹ️ 문서 수가 적어 토픽 클러스터링을 건너뜁니다.", flush=True)
+
+    return embeddings, semantic_model, metrics
+
+
+# =========================
 # 파이프라인 실행 (메인 함수)
 # =========================
 
@@ -1738,6 +1896,7 @@ def run_step2(
     *,
     scan_state_path: Optional[Path] = None,
     chunk_cache_path: Optional[Path] = None,
+    skip_extract: bool = False,
 ):
     global tqdm
     original_tqdm = tqdm
@@ -1764,67 +1923,83 @@ def run_step2(
         total_count = len(file_rows)
         cached_by_state = 0
         force_paths: Optional[Set[str]] = None
-        if scan_state_path and scan_state is not None:
-            forced_rows, cached_rows = filter_incremental_rows(file_rows, scan_state)
-            force_paths = {str(row.get("path") or "") for row in forced_rows if row.get("path")}
-            cached_by_state = len(cached_rows)
-            if force_paths:
-                print(
-                    f"⚙️ 증분 상태: {len(force_paths):,}건 재처리, 캐시 일치 {cached_by_state:,}건",
-                    flush=True,
-                )
-            else:
-                print("⚙️ 증분 상태: 신규 변경 없음", flush=True)
 
         existing_df = _load_existing_corpus(out_corpus)
-        to_process, reused_df = _split_cache(file_rows, existing_df, force_paths=force_paths)
-        process_paths = {str(row.get("path") or "") for row in to_process if row.get("path")}
-        process_count = len(process_paths)
-        print(
-            f"🗃️ 신규/변경 추출 대상: {process_count:,} | 총 스캔: {total_count:,}",
-            flush=True,
-        )
 
-        if process_count == 0:
-            if reused_df is not None:
-                df = reused_df.copy()
-            elif existing_df is not None:
-                df = existing_df.copy()
-            else:
-                df = pd.DataFrame(columns=list(ExtractRecord.__annotations__.keys()))
+        if skip_extract:
+            if existing_df is None or existing_df.empty:
+                raise RuntimeError(
+                    "skip_extract가 설정되었지만 기존 corpus가 없습니다. 먼저 추출을 포함한 pipeline/train을 실행해 corpus.parquet을 생성하세요."
+                )
+            print("⏭️ 추출 스킵: 기존 corpus를 그대로 사용합니다.", flush=True)
+            df = existing_df.copy()
             _prepare_text_frame(df)
-            order_map = {row["path"]: idx for idx, row in enumerate(file_rows)} if file_rows else {}
-            if "path" in df.columns and order_map:
-                df["_order"] = df["path"].map(order_map)
-                df = df.sort_values("_order").drop(columns=["_order"]).reset_index(drop=True)
-            df = _deduplicate_corpus(df)
-            CorpusBuilder.save(df, out_corpus)
-            if chunk_cache:
-                chunk_cache.update_from_frame(df)
-                chunk_cache.save()
-            if scan_state_path:
-                updated_state = update_scan_state(scan_state or {}, file_rows)
-                save_scan_state(scan_state_path, updated_state)
-            df.attrs["metrics"] = {}
-            df.attrs["incremental"] = {
-                "requested": process_count,
-                "effective": 0,
-                "skipped_by_state": cached_by_state,
-                "total": total_count,
-            }
-            df.attrs["target_embed_dtype"] = target_embed_dtype
-            print("✨ 변경된 문서가 없어 기존 모델을 유지합니다.", flush=True)
-            return df, None
+            to_process = []
+            reused_df = None
+            df_new = df.copy()
+            df_new_chunks = df.copy()
+            process_count = 0
+        else:
+            if scan_state_path and scan_state is not None:
+                forced_rows, cached_rows = filter_incremental_rows(file_rows, scan_state)
+                force_paths = {str(row.get("path") or "") for row in forced_rows if row.get("path")}
+                cached_by_state = len(cached_rows)
+                if force_paths:
+                    print(
+                        f"⚙️ 증분 상태: {len(force_paths):,}건 재처리, 캐시 일치 {cached_by_state:,}건",
+                        flush=True,
+                    )
+                else:
+                    print("⚙️ 증분 상태: 신규 변경 없음", flush=True)
 
-        cb = CorpusBuilder(
-            max_text_chars=200_000,
-            progress=use_tqdm,
-            translate=translate,
-            target_embed_dtype=target_embed_dtype,
-            # PyMuPDF가 다중 스레드에서 불안정하므로 macOS 기본은 워커 1개로 제한
-            max_workers=int(os.getenv("INFOPILOT_MAX_EXTRACT_WORKERS", "1")),
-        )
-        df_new = cb.build(to_process) if process_count else pd.DataFrame(columns=list(ExtractRecord.__annotations__.keys()))
+            to_process, reused_df = _split_cache(file_rows, existing_df, force_paths=force_paths)
+            process_paths = {str(row.get("path") or "") for row in to_process if row.get("path")}
+            process_count = len(process_paths)
+            print(
+                f"🗃️ 신규/변경 추출 대상: {process_count:,} | 총 스캔: {total_count:,}",
+                flush=True,
+            )
+
+            if process_count == 0:
+                if reused_df is not None:
+                    df = reused_df.copy()
+                elif existing_df is not None:
+                    df = existing_df.copy()
+                else:
+                    df = pd.DataFrame(columns=list(ExtractRecord.__annotations__.keys()))
+                _prepare_text_frame(df)
+                order_map = {row["path"]: idx for idx, row in enumerate(file_rows)} if file_rows else {}
+                if "path" in df.columns and order_map:
+                    df["_order"] = df["path"].map(order_map)
+                    df = df.sort_values("_order").drop(columns=["_order"]).reset_index(drop=True)
+                df = _deduplicate_corpus(df)
+                CorpusBuilder.save(df, out_corpus)
+                if chunk_cache:
+                    chunk_cache.update_from_frame(df)
+                    chunk_cache.save()
+                if scan_state_path:
+                    updated_state = update_scan_state(scan_state or {}, file_rows)
+                    save_scan_state(scan_state_path, updated_state)
+                df.attrs["metrics"] = {}
+                df.attrs["incremental"] = {
+                    "requested": process_count,
+                    "effective": 0,
+                    "skipped_by_state": cached_by_state,
+                    "total": total_count,
+                }
+                df.attrs["target_embed_dtype"] = target_embed_dtype
+                print("✨ 변경된 문서가 없어 기존 모델을 유지합니다.", flush=True)
+                return df, None
+
+            cb = CorpusBuilder(
+                max_text_chars=200_000,
+                progress=use_tqdm,
+                translate=translate,
+                target_embed_dtype=target_embed_dtype,
+                # PyMuPDF가 다중 스레드에서 불안정하므로 macOS 기본은 워커 1개로 제한
+                max_workers=int(os.getenv("INFOPILOT_MAX_EXTRACT_WORKERS", "1")),
+            )
+            df_new = cb.build(to_process) if process_count else pd.DataFrame(columns=list(ExtractRecord.__annotations__.keys()))
 
         restored_df = None
         unchanged_paths: Set[str] = set()
@@ -1836,42 +2011,42 @@ def run_step2(
                     restored_df = _collect_existing_rows(existing_df, unchanged_paths)
                 df_new = df_new[~df_new["path"].isin(list(unchanged_paths))]
 
-        df_new_chunks = (
-            _apply_uniform_chunks(
-                df_new,
-                min_tokens=DEFAULT_CHUNK_MIN_TOKENS,
-                max_tokens=DEFAULT_CHUNK_MAX_TOKENS,
+            df_new_chunks = (
+                _apply_uniform_chunks(
+                    df_new,
+                    min_tokens=DEFAULT_CHUNK_MIN_TOKENS,
+                    max_tokens=DEFAULT_CHUNK_MAX_TOKENS,
+                )
+                if df_new is not None and not df_new.empty
+                else pd.DataFrame(columns=list(df_new.columns) if df_new is not None else list(ExtractRecord.__annotations__.keys()))
             )
-            if df_new is not None and not df_new.empty
-            else pd.DataFrame(columns=list(df_new.columns) if df_new is not None else list(ExtractRecord.__annotations__.keys()))
-        )
-        if hasattr(df_new_chunks, "attrs"):
-            df_new_chunks.attrs["target_embed_dtype"] = target_embed_dtype
+            if hasattr(df_new_chunks, "attrs"):
+                df_new_chunks.attrs["target_embed_dtype"] = target_embed_dtype
 
-        frames: List["pd.DataFrame"] = []
-        if reused_df is not None and not reused_df.empty:
-            frames.append(reused_df)
-        if restored_df is not None and not restored_df.empty:
-            frames.append(restored_df)
-        if df_new_chunks is not None and not df_new_chunks.empty:
-            frames.append(df_new_chunks)
+            frames: List["pd.DataFrame"] = []
+            if reused_df is not None and not reused_df.empty:
+                frames.append(reused_df)
+            if restored_df is not None and not restored_df.empty:
+                frames.append(restored_df)
+            if df_new_chunks is not None and not df_new_chunks.empty:
+                frames.append(df_new_chunks)
 
-        if frames:
-            df = pd.concat(frames, ignore_index=True)
-        else:
-            df = pd.DataFrame(columns=list(ExtractRecord.__annotations__.keys()))
+            if frames:
+                df = pd.concat(frames, ignore_index=True)
+            else:
+                df = pd.DataFrame(columns=list(ExtractRecord.__annotations__.keys()))
 
-        _prepare_text_frame(df)
+            _prepare_text_frame(df)
 
-        order_map = {row["path"]: idx for idx, row in enumerate(file_rows)} if file_rows else {}
-        if "path" in df.columns and order_map:
-            df["_order"] = df["path"].map(order_map)
-            df = df.sort_values("_order").drop(columns=["_order"]).reset_index(drop=True)
+            order_map = {row["path"]: idx for idx, row in enumerate(file_rows)} if file_rows else {}
+            if "path" in df.columns and order_map:
+                df["_order"] = df["path"].map(order_map)
+                df = df.sort_values("_order").drop(columns=["_order"]).reset_index(drop=True)
 
-        if "ok" in df.columns:
-            df["ok"] = df["ok"].apply(lambda v: bool(v) if isinstance(v, bool) else str(v).strip().lower() in {"true", "1", "yes"})
-        if "topic" in df.columns:
-            df = df.drop(columns=["topic"])
+            if "ok" in df.columns:
+                df["ok"] = df["ok"].apply(lambda v: bool(v) if isinstance(v, bool) else str(v).strip().lower() in {"true", "1", "yes"})
+            if "topic" in df.columns:
+                df = df.drop(columns=["topic"])
 
         text_col = MODEL_TEXT_COLUMN if MODEL_TEXT_COLUMN in df.columns else "text"
         text_mask = df[text_col].fillna("").str.len() > 0
@@ -1905,8 +2080,19 @@ def run_step2(
 
         if cfg.use_sentence_transformer and SentenceTransformer is not None:
             try:
-                semantic_model = SentenceBertModel(cfg)
-                embeddings = semantic_model.fit(train_df, text_col=text_col)
+                if cfg.embedding_chunk_size and cfg.embedding_chunk_size > 0:
+                    embeddings, semantic_model, metrics = _fit_sentence_transformer_chunked(
+                        train_df, text_col, cfg
+                    )
+                else:
+                    semantic_model = SentenceBertModel(cfg)
+                    embeddings = semantic_model.fit(train_df, text_col=text_col)
+                    if semantic_model.cluster_labels_ is not None:
+                        metrics = evaluate_embeddings(
+                            embeddings,
+                            semantic_model.cluster_labels_,
+                            topk=min(5, max(1, embeddings.shape[0] - 1)),
+                        )
                 print(
                     f"✅ Sentence-BERT 임베딩 완료 (docs={embeddings.shape[0]:,}, dim={semantic_model.embedding_dim})",
                     flush=True,
@@ -1914,12 +2100,13 @@ def run_step2(
                 if semantic_model.cluster_labels_ is not None:
                     train_df["topic"] = semantic_model.cluster_labels_
                     topics_df = train_df[["path", "topic"]].copy()
-                    metrics = evaluate_embeddings(embeddings, semantic_model.cluster_labels_, topk=min(5, max(1, embeddings.shape[0] - 1)))
                 model_obj = semantic_model
             except Exception as exc:
-                print(f"⚠️ Sentence-BERT 학습 실패로 TF-IDF 백업 경로를 사용합니다: {exc}", flush=True)
+                raise RuntimeError(
+                    f"Sentence-BERT 임베딩에 실패했습니다. TF-IDF 백업을 사용하지 않습니다: {exc}"
+                ) from exc
         elif cfg.use_sentence_transformer and SentenceTransformer is None:
-            print("⚠️ sentence-transformers 미설치로 TF-IDF 백업 경로를 사용합니다.", flush=True)
+            raise RuntimeError("sentence-transformers가 설치되어 있지 않아 임베딩을 진행할 수 없습니다.")
 
         if model_obj is None:
             tm = TopicModel(cfg)
