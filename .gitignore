@@ -21,6 +21,11 @@ data/topic_model.joblib
 *.ckpt
 *.onnx
 
+# Logs & experiment outputs
+logs/
+runs/
+results/
+
 # Virtual environments
 .venv/
 venv/
@@ -37,6 +42,10 @@ joblib-*/
 .idea/
 .DS_Store
 core/.DS_Store
+
+# Frontend build artifacts
+webapp/node_modules/
+webapp/src-tauri/target/
 
 # Misc
 .cache/

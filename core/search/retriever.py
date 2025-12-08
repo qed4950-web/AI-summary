@@ -123,8 +123,8 @@ def _default_embed_model() -> str:
     if env_model:
         return env_model
     if platform.system() == "Darwin":
-        # Prefer multilingual-e5-small on macOS to reduce memory/compute load
-        return "intfloat/multilingual-e5-small"
+        # Prefer the bundled multilingual-e5-small copy on macOS to reduce load
+        return "models--intfloat--multilingual-e5-small"
     return "BAAI/bge-m3"
 
 

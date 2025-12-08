@@ -1,4 +1,0 @@
-path,ext,ok,text,text_original,meta,size,mtime,ctime,owner,doc_hash,text_model,chunk_id,chunk_count,chunk_tokens,preview,content_hash,topic
-results/dtype_check_fp32/sample.csv,.csv,True,title text foo Hello world AI bar Second row more details,title | text • foo | Hello world about AI • bar | Second row with more details,"{'engine': 'pandas', 'columns': ['title', 'text'], 'rows_preview': 2}",69,1761485913.890977,1761485913.890977,dtype-test,25172401708e32a2ebddfd4ca3578eff224181a4,"title text foo Hello world AI bar Second row more details
-
-sample.csv sample dtype_check_fp32 dtype check fp32 .csv csv 2025 2025-10 2025-10-26 october 10 size:tiny dtype-test test",1,1,13,title | text • foo | Hello world about AI • bar | Second row with more details,c0e9187fe617a568161caae7b9d3f346d3c16e21,0

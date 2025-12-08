@@ -1,6 +1,6 @@
 # AI-summary
 
-AI-summary는 로컬 문서 컬렉션을 스캔·학습하고, 의미 기반 검색·대화·요약을 제공하는 데스크톱/CLI 툴킷입니다.
+AI-summary는 로컬 문서 컬렉션을 스캔·학습하고, 의미 기반 검색·대화·요약을 제공하는 CLI 중심 툴킷입니다.
 
 ## 1. 개요
 
@@ -8,8 +8,7 @@ AI-summary는 로컬 문서 컬렉션을 스캔·학습하고, 의미 기반 검
 로 스캔 → 학습 → 대화 모드를 일괄 실행  
 - **검색/대화**: `core/search/retriever.py`, `core/conversation/lnp_chat.py`가 BGE-m3 SentenceTransformer 임베딩과 정책 필터링을 결합  
 - **도메인 에이전트**: 회의(STT→요약), 사진(중복/태깅) 비서를 `core/agents/`에서 제공  
-- **UI**: `ui/`의 CustomTkinter 앱으로 주요 기능을 한 화면에서 제어  
-- **문서화**: 아키텍처, 가이드, 실험 기록은 `docs/` 하위 폴더에 정리
+- **문서화**: 핵심 개요/정렬 문서만 `docs/`에 최소화 유지
 
 ## 2. 리포지토리 구조
 
@@ -19,11 +18,10 @@ core/                  데이터 파이프라인·검색·에이전트 구현
   ├─ conversation/     LNP Chat 엔진
   ├─ data_pipeline/    스캔·정제·학습 파이프라인
   └─ search/           의미 검색기 & 인덱스
-ui/                    CustomTkinter 데스크톱 앱
-data/                  실행 중 생성되는 산출물 (Git 관리 제외)
-models/                로컬 모델 캐시 (Git 관리 제외)
+data/                  실행 중 생성되는 산출물 (현재 비워둠)
+models/                로컬 모델 캐시 (bge-m3, llama.cpp 필수)
 scripts/               CLI/빌드/유틸 스크립트
-docs/                  agents / architecture / guides / plan / process / research / roadmap / ux
+docs/                  architecture/overview.md, plan/product_alignment.md
 tests/                 pytest 기반 단위·통합 테스트
 ```
 
@@ -122,9 +120,8 @@ python infopilot.py pipeline all --out data/found_files.csv --corpus data/corpus
 python infopilot.py run chat   --model data/topic_model.joblib --corpus data/corpus.parquet --cache data/cache --lexical-weight 0.35
 python infopilot.py run watch  --cache data/cache --corpus data/corpus.parquet --model data/topic_model.joblib  # 신규 파일 자동 스캔·증분 임베딩
 
-# 4) 회의 요약/파이프라인 UI 실행
-python ui/app.py           # 데스크톱 UI (PySide6)
-python scripts/run_all.sh  # FastAPI 백엔드 + webapp(Vite) 동시 실행
+# 4) FastAPI 파이프라인 서버
+python scripts/api_server.py
 ```
 
 ### 3.5 Prefect DAG 실행
@@ -155,31 +152,17 @@ python scripts/api_server.py
 # POST http://127.0.0.1:8080/pipeline/cancel
 ```
 
-서버는 내부적으로 `scripts/prefect_dag.py`에서 제공하는 Runner를 재사용하며, 단계별 진행 상황/결과를 JSON으로 제공합니다. UI의 학습 화면에서도 동일한 API를 호출할 수 있도록 새로운 "FastAPI 제어" 패널을 추가했습니다.
+서버는 내부적으로 `scripts/prefect_dag.py`에서 제공하는 Runner를 재사용하며, 단계별 진행 상황/결과를 JSON으로 제공합니다.
 
-## 4. 데스크톱 앱
+> 데스크톱/웹 UI 폴더(`ui/`, `pyside_app/`, `webapp/`)는 정리되어 현재는 CLI+API만 제공합니다.
 
-```bash
-python scripts/launch_desktop.py          # 개발 중에는 python ui/app.py
-```
-
-앱에서는 다음 화면을 제공합니다.
-
-- 홈 대시보드: 모델/코퍼스 상태와 바로가기
-- 대화 비서: 문서 기반 Q&A + LLM 요약(예: Ollama)
-- 지식·검색 비서: 의미 검색 + 필터링
-- 전체 학습 & 증분 업데이트: CLI 파이프라인을 GUI로 래핑
-- FastAPI 제어 패널: UI에서 바로 파이프라인 API 실행/상태 확인/취소
-- 회의/사진 비서: STT·요약·중복 정리 워크플로 미리보기
-- 대화 비서에서 회의/사진 관련 요청을 하면 자동으로 오디오·폴더 선택 대화상자가 뜨고, 최근에 사용한 파일/폴더를 재사용할 수 있는 입력 폼이 함께 표시됩니다. 입력을 완료하면 진행 상태와 취소 버튼이 표시되어 장시간 작업을 모니터링할 수 있습니다.
-
-## 5. 데이터 & 모델 관리
+## 4. 데이터 & 모델 관리
 
 - `data/정답지/metadata.json`에 문서별 `"document_title"`, `"description"`, `"file_name"`을 기록하면 파이프라인이 메타데이터를 자동으로 병합합니다.
-- 기본 문서 임베딩 모델은 `BAAI/bge-m3`이며, `DEFAULT_EMBED_MODEL`(infopilot CLI `--embedding-model`)로 다른 SentenceTransformer를 쉽게 대체할 수 있습니다.
+- 기본 문서 임베딩 모델은 `BAAI/bge-m3`(macOS에서는 `models--intfloat--multilingual-e5-small`)이며, `DEFAULT_EMBED_MODEL`(infopilot CLI `--embedding-model`)로 다른 SentenceTransformer를 쉽게 대체할 수 있습니다.
 - SentenceTransformer 모델을 `models/sentence_transformers/` 아래에 복사하면 CLI가 `HF_HOME`, `SENTENCE_TRANSFORMERS_HOME`, `HF_HUB_OFFLINE`, `TRANSFORMERS_OFFLINE`을 자동 설정하여 오프라인에서 임베딩을 로드합니다.
 
-## 6. 유지 보수
+## 5. 유지 보수
 
 1. **테스트**  
    ```bash
@@ -199,16 +182,3 @@ python scripts/launch_desktop.py          # 개발 중에는 python ui/app.py
    git commit -m "설명"
    git push origin <branch>
    ```
-
-## 7. 추가 문서
-
-- `docs/agents/`: 회의 비서 등 에이전트 설계·운영 가이드
-- `docs/architecture/`: 시스템 구성, 데이터/모듈 상호작용
-- `docs/guides/`: 로컬 LLM, 회의 모델 등 실사용 가이드
-- `docs/plan/`: 로드맵 v3 정렬, 캐시/정책 전략, 테스트 체크리스트
-- `docs/process/`: 운영/프로세스 정리, 체크리스트
-- `docs/research/`: 실험 기록 및 벤치마크
-- `docs/roadmap/`: 기능 계획 및 우선순위
-- `docs/ux/`: UX 개선안, 피드백 로그
-
-필요한 세부 가이드는 각 하위 디렉터리의 README 또는 문서를 참고하세요.

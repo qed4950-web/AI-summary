@@ -320,27 +320,53 @@ def _parse_roots(raw_roots: List[str] | None) -> List[Path] | None:
             continue
         roots.append(p)
     if not roots:
-        print("⚠️ 경고: 사용할 수 있는 루트가 없어 기본 전체 스캔을 수행합니다.")
+        print("⚠️ 경고: 사용할 수 있는 루트가 없습니다.")
         return None
     return roots
 
 
-def _load_policy_engine(policy_arg: Optional[str]) -> PolicyEngine:
+def _load_policy_engine(
+    policy_arg: Optional[str],
+    *,
+    fail_if_missing: bool = False,
+    stage: str = "pipeline",
+) -> PolicyEngine:
+    """Load a policy engine with optional fail-closed semantics."""
+
     raw = (policy_arg or str(DEFAULT_POLICY_PATH)).strip()
-    if raw.lower() == "none" or raw == "":
+    normalized = raw.lower()
+    if normalized in {"none", ""}:
+        if fail_if_missing:
+            raise click.ClickException(
+                f"[{stage}] 스마트 폴더 정책이 없어 파이프라인을 중단합니다. "
+                "정책 파일을 지정하거나 --policy none 과 함께 --root 옵션을 명시하세요."
+            )
         return PolicyEngine.empty()
+
     path = Path(raw).expanduser()
     try:
-        cache_key = path.resolve()
+        resolved = path.resolve()
     except OSError:
-        cache_key = path
+        resolved = path
+
+    if not resolved.exists():
+        message = f"[{stage}] 스마트 폴더 정책 파일을 찾을 수 없습니다: {resolved}"
+        if fail_if_missing:
+            raise click.ClickException(message)
+        print(f"⚠️ {message} (정책 미적용 상태로 진행)", flush=True)
+        return PolicyEngine.empty()
+
+    cache_key = resolved
     engine = _POLICY_CACHE.get(cache_key)
     if engine is None:
         try:
-            engine = PolicyEngine.from_file(path)
+            engine = PolicyEngine.from_file(resolved)
         except Exception as exc:
-            print(f"⚠️ 정책 파일을 불러오지 못했습니다: {exc}")
-            engine = PolicyEngine.empty()
+            message = f"[{stage}] 정책 파일을 불러오지 못했습니다 ({resolved}): {exc}"
+            if fail_if_missing:
+                raise click.ClickException(message) from exc
+            print(f"⚠️ {message}", flush=True)
+            return PolicyEngine.empty()
         _POLICY_CACHE[cache_key] = engine
     return engine
 
@@ -394,8 +420,18 @@ def _run_scan(
 
 
 def cmd_scan(args) -> int:
-    policy_engine = _load_policy_engine(getattr(args, "policy", None))
+    policy_arg = getattr(args, "policy", None)
+    policy_normalized = (policy_arg or "").strip().lower()
+    policy_required = policy_normalized != "none"
+    policy_engine = _load_policy_engine(policy_arg, fail_if_missing=policy_required, stage="scan")
     roots = _parse_roots(args.roots)
+    if not roots and policy_engine and policy_engine.has_policies:
+        roots = policy_engine.roots_for_agent(KNOWLEDGE_AGENT, include_manual=True)
+    if not roots:
+        raise click.ClickException(
+            "스마트 폴더 정책이나 스캔 루트가 없어 scan을 중단합니다. "
+            "Park David Foundation 스펙에 따라 정책 기반 경계가 필수입니다."
+        )
     rows = _run_scan(
         Path(args.out),
         roots,
@@ -1028,7 +1064,10 @@ def _ensure_chat_artifacts(
 
 def cmd_train(args):
     scan_csv = _resolve_scan_csv(Path(args.scan_csv))
-    policy_engine = _load_policy_engine(getattr(args, "policy", None))
+    policy_arg = getattr(args, "policy", None)
+    policy_normalized = (policy_arg or "").strip().lower()
+    policy_required = policy_normalized != "none"
+    policy_engine = _load_policy_engine(policy_arg, fail_if_missing=policy_required, stage="train")
     row_iter = _load_scan_rows(scan_csv, policy_engine=policy_engine, include_manual=True)
     rows = _maybe_limit_rows(row_iter, args.limit_files)
 
@@ -1068,8 +1107,18 @@ def cmd_train(args):
 
 def cmd_pipeline(args):
     out = Path(args.out)
+    policy_arg = getattr(args, "policy", None)
+    policy_normalized = (policy_arg or "").strip().lower()
+    policy_required = policy_normalized != "none"
+    policy_engine = _load_policy_engine(policy_arg, fail_if_missing=policy_required, stage="pipeline")
     roots = _parse_roots(args.roots)
-    policy_engine = _load_policy_engine(getattr(args, "policy", None))
+    if not roots and policy_engine and policy_engine.has_policies:
+        roots = policy_engine.roots_for_agent(KNOWLEDGE_AGENT, include_manual=True)
+    if not roots:
+        raise click.ClickException(
+            "스마트 폴더 정책이나 스캔 루트가 없어 파이프라인을 중단합니다. "
+            "정책 파일을 지정하거나 --policy none 과 함께 --root를 명시하세요."
+        )
     scan_rows = _run_scan(
         out,
         roots,
@@ -1153,7 +1202,10 @@ def cmd_pipeline(args):
 
 
 def cmd_index(args):
-    policy_engine = _load_policy_engine(getattr(args, "policy", None))
+    policy_arg = getattr(args, "policy", None)
+    policy_normalized = (policy_arg or "").strip().lower()
+    policy_required = policy_normalized != "none"
+    policy_engine = _load_policy_engine(policy_arg, fail_if_missing=policy_required, stage="index")
     scope = getattr(args, "scope", "auto")
 
     limit = max(0, int(getattr(args, "limit_files", 0) or 0))
@@ -1206,7 +1258,10 @@ def cmd_index(args):
 
 def cmd_chat(args):
     """대화형 검색 모드 (LNPChat 사용)"""
-    policy_engine = _load_policy_engine(getattr(args, "policy", None))
+    policy_arg = getattr(args, "policy", None)
+    policy_normalized = (policy_arg or "").strip().lower()
+    policy_required = policy_normalized != "none"
+    policy_engine = _load_policy_engine(policy_arg, fail_if_missing=policy_required, stage="chat")
     def _env_or_arg(name: str, default: Optional[str] = None) -> Optional[str]:
         value = getattr(args, name, None)
         if value:
@@ -1431,15 +1486,18 @@ def cmd_watch(args):
     if encoder is None:
         raise RuntimeError("sentence-transformers 모델을 로드할 수 없어 watcher를 실행할 수 없습니다.")
 
-    policy_engine = _load_policy_engine(getattr(args, "policy", None))
+    policy_arg = getattr(args, "policy", None)
+    policy_normalized = (policy_arg or "").strip().lower()
+    policy_required = policy_normalized != "none"
+    policy_engine = _load_policy_engine(policy_arg, fail_if_missing=policy_required, stage="watch")
     roots = _parse_roots(args.roots)
+    if not roots and policy_engine and policy_engine.has_policies:
+        roots = policy_engine.roots_for_agent(KNOWLEDGE_AGENT, include_manual=False)
     if not roots:
-        policy_roots = (
-            policy_engine.roots_for_agent(KNOWLEDGE_AGENT, include_manual=False)
-            if policy_engine and policy_engine.has_policies
-            else []
+        raise click.ClickException(
+            "스마트 폴더 정책이나 감시 루트가 지정되지 않아 watcher를 시작할 수 없습니다. "
+            "정책 파일을 지정하거나 --policy none 과 함께 --root를 명시하세요."
         )
-        roots = policy_roots or [Path.cwd()]
 
     deduped_roots: List[Path] = []
     seen_roots: Set[str] = set()
@@ -1463,7 +1521,7 @@ def cmd_watch(args):
         else:
             print(f"⚠️ 감시 루트가 존재하지 않아 제외합니다: {root}")
     if not existing_roots:
-        existing_roots = [Path.cwd()]
+        raise click.ClickException("유효한 감시 루트가 없습니다. 경로를 다시 확인하세요.")
     roots = existing_roots
 
     event_queue: "queue.Queue[Tuple[str, str]]" = queue.Queue()
@@ -1510,7 +1568,7 @@ def cmd_watch(args):
 
 
 def cmd_schedule(args):
-    policy_engine = _load_policy_engine(getattr(args, "policy", None))
+    policy_engine = _load_policy_engine(getattr(args, "policy", None), fail_if_missing=True, stage="schedule")
     if not policy_engine or not policy_engine.has_policies:
         print("⚠️ 스케줄러: 정책이 없어 종료합니다.")
         return
@@ -2009,7 +2067,9 @@ def _run_reembed_pipeline(
     encoder, batch_size, model_name = _load_sentence_encoder(Path(model))
     if encoder is None:
         raise click.ClickException("SentenceTransformer 모델 로드 실패로 재임베딩을 진행할 수 없습니다.")
-    policy_engine = _load_policy_engine(policy)
+    policy_normalized = (policy or "").strip().lower()
+    policy_required = policy_normalized != "none"
+    policy_engine = _load_policy_engine(policy, fail_if_missing=policy_required, stage="reembed")
     pipeline_ctx = IncrementalPipeline(
         encoder=encoder,
         batch_size=batch_size,
