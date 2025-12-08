@@ -62,7 +62,7 @@ cp .env.example .env   # scripts/setup_env.sh 실행 시 자동 생성되기도 
 ### 3.4 파이프라인 실행
 
 ```bash
-# 0) 전체 파이프라인 한 번에 (스캔→학습→필요 시 chat)
+# 0) 전체 파이프라인 한 번에 (스캔→추출/임베딩→필요 시 chat)
 python infopilot.py pipeline all \
   --out data/found_files.csv \
   --corpus data/corpus.parquet \
@@ -74,6 +74,19 @@ python infopilot.py pipeline all \
 
 # 또는 개별 단계
 python infopilot.py run scan --out data/found_files.csv
+# 추출만 (코퍼스 생성, 임베딩 없음)
+python infopilot.py run extract \
+  --scan_csv data/found_files.csv \
+  --corpus data/corpus.parquet \
+  --state-file data/scan_state.json \
+  --chunk-cache data/cache/chunk_cache.json
+# 임베딩/모델만 (기존 corpus 사용)
+python infopilot.py run embed \
+  --scan_csv data/found_files.csv \
+  --corpus data/corpus.parquet \
+  --model data/topic_model.joblib \
+  --state-file data/scan_state.json \
+  --chunk-cache data/cache/chunk_cache.json
 python infopilot.py run train \
   --scan_csv data/found_files.csv \
   --corpus data/corpus.parquet \
@@ -111,6 +124,8 @@ python infopilot.py drift reembed --path /docs/2023/report.docx --scan-csv ... -
 ```bash
 # 1) 임베딩 스캔 + 코퍼스/모델 학습
 python infopilot.py run scan   --out data/found_files.csv
+python infopilot.py run extract --scan_csv data/found_files.csv --corpus data/corpus.parquet --state-file data/scan_state.json --chunk-cache data/cache/chunk_cache.json
+python infopilot.py run embed   --scan_csv data/found_files.csv --corpus data/corpus.parquet --model data/topic_model.joblib --state-file data/scan_state.json --chunk-cache data/cache/chunk_cache.json --async-embed --embedding-concurrency 2
 python infopilot.py run train  --scan_csv data/found_files.csv --corpus data/corpus.parquet --model data/topic_model.joblib --state-file data/scan_state.json --chunk-cache data/cache/chunk_cache.json --async-embed --embedding-concurrency 2
 
 # 2) 통합 파이프라인 한 번에 + 완료 후 CLI 켜기
@@ -159,7 +174,7 @@ python scripts/api_server.py
 ## 4. 데이터 & 모델 관리
 
 - `data/정답지/metadata.json`에 문서별 `"document_title"`, `"description"`, `"file_name"`을 기록하면 파이프라인이 메타데이터를 자동으로 병합합니다.
-- 기본 문서 임베딩 모델은 `BAAI/bge-m3`(macOS에서는 `models--intfloat--multilingual-e5-small`)이며, `DEFAULT_EMBED_MODEL`(infopilot CLI `--embedding-model`)로 다른 SentenceTransformer를 쉽게 대체할 수 있습니다.
+- 기본 문서 임베딩 모델: macOS에서는 `intfloat/multilingual-e5-small`(또는 로컬 캐시 `models--intfloat--multilingual-e5-small`), Windows/Linux에서는 `BAAI/bge-m3`. 플래그 `--embedding-model` 또는 환경변수 `DEFAULT_EMBED_MODEL`로 언제든 덮어쓸 수 있습니다.
 - SentenceTransformer 모델을 `models/sentence_transformers/` 아래에 복사하면 CLI가 `HF_HOME`, `SENTENCE_TRANSFORMERS_HOME`, `HF_HUB_OFFLINE`, `TRANSFORMERS_OFFLINE`을 자동 설정하여 오프라인에서 임베딩을 로드합니다.
 
 ## 5. 유지 보수

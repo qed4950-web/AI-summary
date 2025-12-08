@@ -1105,6 +1105,93 @@ def cmd_train(args):
     }
 
 
+def cmd_extract(args):
+    scan_csv = _resolve_scan_csv(Path(args.scan_csv))
+    policy_arg = getattr(args, "policy", None)
+    policy_normalized = (policy_arg or "").strip().lower()
+    policy_required = policy_normalized != "none"
+    policy_engine = _load_policy_engine(policy_arg, fail_if_missing=policy_required, stage="extract")
+    row_iter = _load_scan_rows(scan_csv, policy_engine=policy_engine, include_manual=True)
+    rows = _maybe_limit_rows(row_iter, args.limit_files)
+
+    if not rows:
+        raise ValueError("유효한 추출 대상 행이 없습니다. 스캔 CSV를 확인해주세요.")
+
+    cfg = _build_train_config(args)
+    out_corpus = Path(args.corpus)
+    out_model = Path(args.model)
+    chunk_cache_path = Path(getattr(args, "chunk_cache", DEFAULT_CHUNK_CACHE))
+    state_path = Path(getattr(args, "state_file", DEFAULT_SCAN_STATE))
+    df, _ = run_step2(
+        rows,
+        out_corpus=out_corpus,
+        out_model=out_model,
+        cfg=cfg,
+        use_tqdm=True,
+        translate=args.translate,
+        scan_state_path=state_path,
+        chunk_cache_path=chunk_cache_path,
+        skip_extract=False,
+        train_embeddings=False,
+    )
+    incremental = df.attrs.get("incremental", {}) if hasattr(df, "attrs") else {}
+    print("✅ 추출 완료 (임베딩/모델 생성 없음)")
+    return {
+        "rows": len(rows),
+        "corpus": str(out_corpus),
+        "incremental": incremental,
+    }
+
+
+def cmd_embed(args):
+    scan_csv = _resolve_scan_csv(Path(args.scan_csv))
+    corpus_path = Path(args.corpus)
+    if not corpus_path.exists():
+        raise FileNotFoundError(
+            f"기존 corpus가 없어 임베딩을 진행할 수 없습니다: {corpus_path}. 먼저 extract/train을 실행하세요."
+        )
+
+    policy_arg = getattr(args, "policy", None)
+    policy_normalized = (policy_arg or "").strip().lower()
+    policy_required = policy_normalized != "none"
+    policy_engine = _load_policy_engine(policy_arg, fail_if_missing=policy_required, stage="embed")
+    row_iter = _load_scan_rows(scan_csv, policy_engine=policy_engine, include_manual=True)
+    rows = _maybe_limit_rows(row_iter, args.limit_files)
+
+    if not rows:
+        raise ValueError("유효한 임베딩 대상 행이 없습니다. 스캔 CSV를 확인해주세요.")
+
+    cfg = _build_train_config(args)
+    out_model = Path(args.model)
+    chunk_cache_path = Path(getattr(args, "chunk_cache", DEFAULT_CHUNK_CACHE))
+    state_path = Path(getattr(args, "state_file", DEFAULT_SCAN_STATE))
+    df, tm = run_step2(
+        rows,
+        out_corpus=corpus_path,
+        out_model=out_model,
+        cfg=cfg,
+        use_tqdm=True,
+        translate=args.translate,
+        scan_state_path=state_path,
+        chunk_cache_path=chunk_cache_path,
+        skip_extract=True,
+        train_embeddings=True,
+    )
+    metrics = df.attrs.get("metrics", {}) if hasattr(df, "attrs") else {}
+    incremental = df.attrs.get("incremental", {}) if hasattr(df, "attrs") else {}
+    if metrics:
+        metric_str = ", ".join(f"{k}={v}" for k, v in metrics.items())
+        print(f"📊 임베딩 품질 지표: {metric_str}")
+    print("✅ 임베딩/모델 생성 완료 (기존 corpus 사용)")
+    return {
+        "rows": len(rows),
+        "corpus": str(corpus_path),
+        "model": str(out_model),
+        "metrics": metrics,
+        "incremental": incremental,
+    }
+
+
 def cmd_pipeline(args):
     out = Path(args.out)
     policy_arg = getattr(args, "policy", None)
@@ -2158,6 +2245,71 @@ def scan_command(ctx: click.Context, out: str, roots: Tuple[str, ...], exts: Tup
     click.echo(f"📦 스캔 완료: {count}건 기록 ({out})")
 
 
+@click.command("extract")
+@_train_options
+@click.pass_context
+def extract_command(
+    ctx: click.Context,
+    scan_csv: str,
+    corpus: str,
+    model: str,
+    max_features: int,
+    n_components: int,
+    n_clusters: int,
+    min_df: int,
+    max_df: float,
+    embedding_model: str,
+    embedding_batch_size: int,
+    limit_files: int,
+    translate: bool,
+    use_embedding: bool,
+    policy: str,
+    state_file: str,
+    chunk_cache: str,
+    embedding_concurrency: int,
+    async_embed: bool,
+    embedding_dtype: str,
+    embedding_chunk_size: int,
+    embedding_chunk_start: int,
+    embedding_chunk_end: int,
+    embedding_subprocess_fallback: bool,
+    skip_extract: bool,
+) -> None:
+    _require_pandas()
+    args = SimpleNamespace(
+        scan_csv=scan_csv,
+        corpus=corpus,
+        model=model,
+        max_features=max_features,
+        n_components=n_components,
+        n_clusters=n_clusters,
+        min_df=min_df,
+        max_df=max_df,
+        embedding_model=embedding_model,
+        embedding_batch_size=embedding_batch_size,
+        limit_files=limit_files,
+        translate=translate,
+        use_embedding=use_embedding,
+        policy=policy,
+        state_file=state_file,
+        chunk_cache=chunk_cache,
+        embedding_concurrency=embedding_concurrency,
+        async_embed=async_embed,
+        embedding_dtype=embedding_dtype,
+        embedding_chunk_size=embedding_chunk_size,
+        embedding_chunk_start=embedding_chunk_start,
+        embedding_chunk_end=embedding_chunk_end,
+        embedding_subprocess_fallback=embedding_subprocess_fallback,
+        skip_extract=False,
+    )
+    with _command_session(ctx, "extract") as session:
+        stats = cmd_extract(args) or {}
+        if session and stats:
+            session.log_params({"corpus": stats.get("corpus"), "policy": policy})
+            session.log_metrics({"rows": float(stats.get("rows", 0))})
+    click.echo(f"📦 추출 완료 → corpus={corpus}")
+
+
 @click.command("train")
 @_train_options
 @click.pass_context
@@ -2231,6 +2383,81 @@ def train_command(
             if extra_metrics:
                 session.log_metrics(extra_metrics)
     click.echo(f"🧠 학습 완료 → corpus={corpus}")
+
+
+@click.command("embed")
+@_train_options
+@click.pass_context
+def embed_command(
+    ctx: click.Context,
+    scan_csv: str,
+    corpus: str,
+    model: str,
+    max_features: int,
+    n_components: int,
+    n_clusters: int,
+    min_df: int,
+    max_df: float,
+    embedding_model: str,
+    embedding_batch_size: int,
+    limit_files: int,
+    translate: bool,
+    use_embedding: bool,
+    policy: str,
+    state_file: str,
+    chunk_cache: str,
+    embedding_concurrency: int,
+    async_embed: bool,
+    embedding_dtype: str,
+    embedding_chunk_size: int,
+    embedding_chunk_start: int,
+    embedding_chunk_end: int,
+    embedding_subprocess_fallback: bool,
+    skip_extract: bool,
+) -> None:
+    _require_pandas()
+    args = SimpleNamespace(
+        scan_csv=scan_csv,
+        corpus=corpus,
+        model=model,
+        max_features=max_features,
+        n_components=n_components,
+        n_clusters=n_clusters,
+        min_df=min_df,
+        max_df=max_df,
+        embedding_model=embedding_model,
+        embedding_batch_size=embedding_batch_size,
+        limit_files=limit_files,
+        translate=translate,
+        use_embedding=use_embedding,
+        policy=policy,
+        state_file=state_file,
+        chunk_cache=chunk_cache,
+        embedding_concurrency=embedding_concurrency,
+        async_embed=async_embed,
+        embedding_dtype=embedding_dtype,
+        embedding_chunk_size=embedding_chunk_size,
+        embedding_chunk_start=embedding_chunk_start,
+        embedding_chunk_end=embedding_chunk_end,
+        embedding_subprocess_fallback=embedding_subprocess_fallback,
+        skip_extract=True,
+    )
+    with _command_session(ctx, "embed") as session:
+        stats = cmd_embed(args) or {}
+        if session and stats:
+            session.log_params(
+                {
+                    "corpus": stats.get("corpus"),
+                    "model": stats.get("model"),
+                    "embedding_model": embedding_model,
+                    "policy": policy,
+                }
+            )
+            session.log_metrics({"rows": float(stats.get("rows", 0))})
+            extra_metrics = stats.get("metrics") or {}
+            if extra_metrics:
+                session.log_metrics(extra_metrics)
+    click.echo(f"🧠 임베딩/모델 완료 → corpus={corpus}")
 
 
 @click.command("pipeline")
@@ -2463,8 +2690,12 @@ cli.add_command(index_command)
 cli.add_command(chat_command)
 cli.add_command(watch_command)
 cli.add_command(schedule_command)
+cli.add_command(extract_command)
+cli.add_command(embed_command)
 run.add_command(scan_command)
+run.add_command(extract_command)
 run.add_command(train_command)
+run.add_command(embed_command)
 run.add_command(index_command)
 run.add_command(chat_command)
 run.add_command(watch_command)

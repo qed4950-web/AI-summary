@@ -1897,6 +1897,7 @@ def run_step2(
     scan_state_path: Optional[Path] = None,
     chunk_cache_path: Optional[Path] = None,
     skip_extract: bool = False,
+    train_embeddings: bool = True,
 ):
     global tqdm
     original_tqdm = tqdm
@@ -2064,6 +2065,26 @@ def run_step2(
                 chunk_cache.update_from_frame(df)
                 chunk_cache.save()
             print(f"⚠️ 유효 텍스트 없음. 코퍼스만 저장: {out_corpus}", flush=True)
+            df.attrs["metrics"] = {}
+            df.attrs["incremental"] = {
+                "requested": process_count,
+                "effective": 0,
+                "skipped_by_state": cached_by_state,
+                "total": total_count,
+            }
+            df.attrs["target_embed_dtype"] = target_embed_dtype
+            return df, None
+
+        if not train_embeddings:
+            df = _deduplicate_corpus(df)
+            CorpusBuilder.save(df, out_corpus)
+            if scan_state_path:
+                updated_state = update_scan_state(scan_state or {}, file_rows)
+                save_scan_state(scan_state_path, updated_state)
+            if chunk_cache:
+                chunk_cache.update_from_frame(df)
+                chunk_cache.save()
+            print(f"📦 추출만 완료 (임베딩/모델 건너뜀): {out_corpus}", flush=True)
             df.attrs["metrics"] = {}
             df.attrs["incremental"] = {
                 "requested": process_count,
