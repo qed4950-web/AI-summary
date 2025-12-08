@@ -1,0 +1,349 @@
+좋아. 지금부터 **AI-summary 전체 문서 Part 5 — Conversation Engine (LNP Chat) Full Specification**을 생성한다.
+이 파트는 **AI-summary의 사용자 경험을 직접 결정하는 핵심 대화 엔진**에 대한 완전 사양이다.
+
+---
+
+# 💬 **PART 5 — Conversation Engine (LNP Chat) Full Specification**
+
+Conversation Engine(LNP Chat)은 AI-summary에서 사용자가 직접 상호작용하는 “인터페이스 레벨 AI”이며,
+Knowledge Agent / Meeting Agent / Photo Agent를 **통합된 대화형 UI**로 묶는 핵심 계층이다.
+
+이 엔진은 다음 5가지 원칙을 따른다:
+
+1. **Smart Folder 기반 접근 제어**
+2. **RAG + Local LLM 조합**
+3. **대화 메모리 컨텍스트 유지**
+4. **정책 기반 마스킹**
+5. **Agent Orchestration** (자동 에이전트 호출)
+
+---
+
+# 1. Conversation Engine의 목표
+
+### 🎯 사용자 가치
+
+* 자연어로 질문하면 문서 기반 답변을 제공
+* 요약, 정리, 변환, 결론 요청 등 다양한 작업 지원
+* 필요한 경우 자동으로 Meeting Agent나 Photo Agent로 전환
+* 오프라인에서 빠르게 작동
+
+### 🎯 기술 목표
+
+* RAG 검색 ↔ LLM 생성 결합
+* 대화 메모리 안정성
+* Smart Folder 기반 정책 준수
+* 프롬프트 일관성과 환각 방지
+
+---
+
+# 2. Conversation Engine 전체 아키텍처
+
+```
+core/
+  conversation/
+    lnp_chat.py
+    memory.py
+    prompt_builder.py
+    llm_backend.py
+    rag_bridge.py
+    policy_filter.py
+    safety.py
+    history_cache.py
+```
+
+Conversation Engine은 다음 7개 서브모듈로 구성된다:
+
+1. Memory System
+2. Prompt Builder
+3. LLM Backend
+4. RAG Bridge
+5. Policy Filter
+6. Safety Filter
+7. History Cache
+
+---
+
+# 3. End-to-End Flow
+
+```
+User Message
+    ↓
+Memory + History Merge
+    ↓
+Smart Folder Policy Injection
+    ↓
+Intent Detection
+    ↓
+  ┌─────────── Agent Needed? ───────────┐
+  │ yes → Meeting/Photo Agent 호출       │
+  │ no  → Knowledge RAG or Pure LLM 응답 │
+  └──────────────────────────────────────┘
+    ↓
+LLM 답변 생성
+    ↓
+Citation / Safety 정리
+    ↓
+Output to User
+```
+
+---
+
+# 4. Message Memory System (memory.py)
+
+대화 품질의 70% 이상은 Memory System이 결정한다.
+
+### Memory 구조
+
+```
+memory = {
+  "recent_messages": [...],
+  "system_context": "...",
+  "smartfolder_context": { ... },
+  "agent_context": null
+}
+```
+
+### Memory 기능
+
+* 최근 메시지 5~10개 유지
+* Smart Folder 메타데이터 자동 주입
+* Agent 실행 후 결과물을 Memory에 통합
+
+### 규칙
+
+✔ Memory overflow 방지 (최대 token 제한)
+✔ Meeting Agent 요약은 Memory에 자동 추가
+✔ 민감 정보는 저장 전에 Masking
+
+---
+
+# 5. Prompt Builder (prompt_builder.py)
+
+Prompt Builder는 LLM에게 전달되는 모든 입력을 규격화한다.
+
+### 기본 프롬프트 구조
+
+```
+[System Rules]
+[SmartFolder Context]
+[Conversation History]
+[User Message]
+[Retrieval Context (optional)]
+---
+Produce a grounded answer with citations.
+```
+
+### Prompt Builder 책임
+
+* hallucination 방지 지침 포함
+* citation 강제 규칙 포함
+* 정책 위반 정보 제거
+* Agent 전환 표시
+
+---
+
+# 6. LLM Backend Manager (llm_backend.py)
+
+AI-summary는 오프라인 LLM 환경이므로
+LLM Backend는 모든 로컬 모델을 통합 관리한다.
+
+### 지원 모델
+
+* LLaMA.cpp
+* GPT4All
+* Qwen (GGUF)
+* TinyLLaMA
+* Vicuna (옵션)
+
+### Backend 책임
+
+* 모델 로딩/언로딩
+* inference 파라미터 설정
+* 온디맨드 메모리 관리
+* fallback 모델 사용
+
+### 백엔드 구조
+
+```python
+class LLMBackend:
+    def load()
+    def generate(prompt)
+    def unload()
+```
+
+### fallback 규칙
+
+* 모델 실패 시 → 더 작은 모델로 교체
+* prompt 길이 초과 → truncated prompt
+
+---
+
+# 7. RAG Bridge (rag_bridge.py)
+
+Conversation Engine은 Knowledge Agent(RAG)를 자동 호출할 수 있다.
+
+### 조건
+
+* 검색이 필요한 질문 → retriever 호출
+* Smart Folder 정책 만족 여부 검사
+
+### RAG Bridge 작업
+
+1. Query embedding
+2. Retriever 호출
+3. Chunk selection
+4. Citation-ready context 생성
+5. Prompt Builder로 컨텍스트 전달
+
+### RAG 출력
+
+```
+{
+  "context": "... retrieved text ...",
+  "citations": [...],
+  "chunks": [...]
+}
+```
+
+---
+
+# 8. Policy Filter (policy_filter.py)
+
+대화 전체에 Smart Folder 정책을 주입하는 역할.
+
+### Policy Filter 기능
+
+* 파일 접근 제어
+* 민감 정보 출력 여부 관리
+* agent-specific filtering
+* 마스킹 옵션 적용
+
+### 예: 이메일 출력 금지
+
+```
+→ [EMAIL]로 자동 변환
+```
+
+---
+
+# 9. Safety Filter (safety.py)
+
+Safety는 “환각 방지 + Grounding 보장”이 주요 목표
+
+### Safety 검증 로직
+
+* 답변이 문서 기반인지 확인
+* citation 없는 문장 제거
+* policy 위반 내용 제거
+* 근거 없는 주장 → 재생성 요청
+
+### 실패 시 처리
+
+* 1차 재생성
+* 여전히 실패 → "근거 부족" 메시지 출력
+
+---
+
+# 10. History Cache (history_cache.py)
+
+대화 기록을 특정 Smart Folder와 연결하여 유지한다.
+
+### 저장 경로
+
+```
+artifacts/conversation/<smartfolder_id>/history.json
+```
+
+### 캐시 규칙
+
+* 최근 100 메세지까지만 저장
+* 민감 정보 masking 후 저장
+* Agent 생성 결과 자동 기록
+
+---
+
+# 11. LNPChat.run() 전체 흐름
+
+Complete flow:
+
+```
+def run(user_msg, smartfolder):
+    memory = Memory.load(smartfolder)
+    intent = IntentDetector.detect(user_msg)
+
+    if agent_needed(intent):
+        result = AgentManager.run(intent, smartfolder)
+        memory.update(result)
+        return result
+
+    retrieval = RAGBridge.retrieve_if_needed(user_msg, smartfolder)
+    prompt = PromptBuilder.build(user_msg, memory, retrieval, smartfolder)
+
+    raw_output = LLMBackend.generate(prompt)
+    filtered = PolicyFilter.apply(raw_output)
+    safe_output = SafetyFilter.check(filtered, retrieval)
+
+    memory.append(user_msg, safe_output)
+    Memory.save(memory)
+
+    return safe_output
+```
+
+---
+
+# 12. 에러 처리 규칙
+
+| 에러                  | 원인              | 처리               |
+| ------------------- | --------------- | ---------------- |
+| AccessDeniedError   | Smart Folder 위반 | 즉시 실패            |
+| NoModelLoadedError  | LLM 미로딩         | 자동 로딩            |
+| PromptTooLargeError | Prompt > limit  | truncation       |
+| NoCitationError     | grounding 실패    | 재생성              |
+| AgentSwitchError    | Agent 호출 실패     | generic fallback |
+
+---
+
+# 13. 테스트 전략
+
+tests/test_lnp_chat.py에 포함:
+
+* test_memory_persistence
+* test_policy_filter_masking
+* test_agent_auto_switch
+* test_rag_injection
+* test_citation_enforcement
+* test_safety_grounding
+* test_llm_fallback
+
+---
+
+# 14. 개발자 규칙
+
+✔ Prompt Builder를 우회해 LLM 직접 호출 금지
+✔ citation 없는 답변 merge 금지
+✔ memory에 raw STT 저장 금지
+✔ Smart Folder context 없이 LNP Chat 사용 금지
+✔ agent 호출 규칙 어기면 PR reject
+
+---
+
+# 🎉 PART 5 — Conversation Engine Full Specification 완료
+
+다음 파트는:
+
+---
+
+# ▶ **PART 6 — Smart Folder Integration with Pipeline (scan → extract → embed → train → watch) Full Specification**
+
+포함 내용:
+
+* Smart Folder가 pipeline 전체에 어떻게 주입되는지
+* 증분 업데이트 구조
+* drift + 인덱스 업데이트
+* 캐시 구조
+* pipeline 전체 품질 보장
+* developer constraints
+
+---
+
+계속하려면 **“다음”**이라고 말해줘.

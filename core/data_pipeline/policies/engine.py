@@ -28,9 +28,11 @@ def _normalize_path(path: Path) -> Path:
 class SmartFolderPolicy:
     path: Path
     agents: frozenset[str]
+    sensitive_paths: frozenset[Path]
     security: Dict[str, object]
     indexing: Dict[str, object]
     retention: Dict[str, object]
+    cache: Dict[str, object]
 
     @classmethod
     def from_dict(cls, data: Dict[str, object], *, base: Path) -> "SmartFolderPolicy":
@@ -51,15 +53,30 @@ class SmartFolderPolicy:
                 raw_path = base / raw_path
         normalized_path = _normalize_path(raw_path)
         agents = frozenset(str(item) for item in data.get("agents", []) or [])
+        sensitive_paths_raw = data.get("sensitive_paths") or []
+        sensitive_paths: List[Path] = []
+        for entry in sensitive_paths_raw:
+            if entry is None:
+                continue
+            entry_str = str(entry).strip()
+            if not entry_str:
+                continue
+            entry_path = Path(entry_str).expanduser()
+            if not entry_path.is_absolute():
+                entry_path = base / entry_path
+            sensitive_paths.append(_normalize_path(entry_path))
         security = dict(data.get("security", {}) or {})
         indexing = dict(data.get("indexing", {}) or {})
         retention = dict(data.get("retention", {}) or {})
+        cache = dict(data.get("cache", {}) or {})
         return cls(
             path=normalized_path,
             agents=agents,
+            sensitive_paths=frozenset(sensitive_paths),
             security=security,
             indexing=indexing,
             retention=retention,
+            cache=cache,
         )
 
     @property
@@ -73,6 +90,18 @@ class SmartFolderPolicy:
         if not self.agents:
             return True
         return agent in self.agents
+
+    def is_sensitive(self, path: Path) -> bool:
+        if not self.sensitive_paths:
+            return False
+        normalized = _normalize_path(path)
+        for sensitive_root in self.sensitive_paths:
+            try:
+                normalized.relative_to(sensitive_root)
+                return True
+            except ValueError:
+                continue
+        return False
 
 
 class PolicyEngine:
@@ -145,6 +174,8 @@ class PolicyEngine:
             return True
         policy = self.policy_for_path(path)
         if policy is None:
+            return False
+        if policy.is_sensitive(path):
             return False
         if not policy.allows_agent(agent):
             return False

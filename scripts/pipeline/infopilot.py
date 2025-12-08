@@ -112,6 +112,19 @@ _POLICY_CACHE: Dict[Path, PolicyEngine] = {}
 _SENTENCE_ENCODER_MANAGER: Optional[ModelManager] = None
 
 
+def _dir_size_bytes(path: Path) -> int:
+    total = 0
+    if not path.exists():
+        return total
+    for entry in path.rglob("*"):
+        try:
+            if entry.is_file():
+                total += entry.stat().st_size
+        except OSError:
+            continue
+    return total
+
+
 def _require_pandas() -> None:
     if pd is None:
         raise click.ClickException(
@@ -1336,10 +1349,12 @@ def cmd_index(args):
     )
     agent = DocumentAgent(cfg)
     agent.prepare()
-    print("✅ 인덱스/캐시 갱신 완료")
+    cache_usage = _dir_size_bytes(cfg.cache_dir)
+    print(f"✅ 인덱스/캐시 갱신 완료 (cache ~{cache_usage:,} bytes)")
     return {
         "cache": str(cfg.cache_dir),
         "corpus": str(cfg.corpus_path),
+        "cache_usage_bytes": cache_usage,
     }
 
 

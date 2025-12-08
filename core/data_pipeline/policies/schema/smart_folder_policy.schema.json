@@ -22,6 +22,29 @@
       },
       "description": "Agents enabled for this folder"
     },
+    "sensitive_paths": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "Paths to exclude even when folder is accessible"
+    },
+    "cache": {
+      "type": "object",
+      "properties": {
+        "max_bytes": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Optional cache size limit in bytes"
+        },
+        "purge_days": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Optional cache purge interval in days"
+        }
+      },
+      "additionalProperties": false
+    },
     "security": {
       "type": "object",
       "properties": {
