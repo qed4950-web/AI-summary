@@ -7,7 +7,7 @@ from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Dict
 
-from audit_log import DEFAULT_AUDIT_PATH
+from scripts.audit_log import DEFAULT_AUDIT_PATH
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -15,7 +15,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--log",
         default=str(DEFAULT_AUDIT_PATH),
-        help="JSONL audit log path (default: data/audit/desktop_agents.jsonl)",
+        help="JSONL audit log path (default: artifacts/logs/audit/desktop_agents.jsonl)",
     )
     parser.add_argument("--json", action="store_true", help="Print raw JSON summary")
     return parser

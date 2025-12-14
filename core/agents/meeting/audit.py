@@ -4,11 +4,13 @@ from __future__ import annotations
 import json
 import os
 from dataclasses import dataclass
+from datetime import date
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
 
 from core.utils import get_logger
+from core.config.paths import AUDIT_LOG_DIR
 
 LOGGER = get_logger("meeting.audit")
 
@@ -20,10 +22,13 @@ class AuditConfig:
 
     @classmethod
     def from_env(cls) -> "AuditConfig":
-        path = os.getenv("MEETING_AUDIT_LOG")
-        if not path:
+        raw = (os.getenv("MEETING_AUDIT_LOG") or "").strip()
+        if not raw:
             return cls(enabled=False)
-        log_path = Path(path).expanduser()
+        if raw.lower() in {"1", "true", "yes", "on"}:
+            log_path = AUDIT_LOG_DIR / f"{date.today().isoformat()}.jsonl"
+        else:
+            log_path = Path(raw).expanduser()
         log_path.parent.mkdir(parents=True, exist_ok=True)
         return cls(enabled=True, log_path=log_path)
 

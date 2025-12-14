@@ -29,7 +29,7 @@ AI-summary의 **엔진/에이전트 작동 방식에 대한 “공식 운영 설
 * **Smart Folder**:
 
   * 사용자 또는 운영자가 “이 안에 있는 자료만 AI가 사용해도 된다”고 명시적으로 허용한 폴더 집합.
-  * `smart_folders.json`에 각 폴더의 `scope`, `base_path`, `policyPath`, `allowed_types` 등이 기록된다.
+* `smart_folders.json`(현재 레포: `core/config/smart_folders.json`)에 각 폴더의 `scope`, `base_path`, `policyPath`, `allowed_types` 등이 기록된다.
 * **Policy 파일** (`policyPath`):
 
   * 허용 확장자, 허용/차단 경로 패턴, 권한 요구 사항 등을 정의.
@@ -44,8 +44,8 @@ AI-summary의 **엔진/에이전트 작동 방식에 대한 “공식 운영 설
 * 데이터/캐시/로그는 모두 **로컬 파일 시스템**에 저장:
 
   * `data/` – corpus, parquet, joblib 등의 아티팩트
-  * `index_cache/` – 검색 인덱스/임베딩 캐시
-  * `logs/` – 감사 로그, 피드백 로그 등
+  * `data/cache/` – 검색 인덱스/임베딩 캐시 (예: `doc_meta.json`, `doc_embeddings.npy`, `doc_index.faiss`, `translations.sqlite3`)
+  * `artifacts/logs/` – 런타임/감사/audit, drift/resource 로그 등
 
 ### 1.3 Lifecycle 공통 구조
 
@@ -396,7 +396,7 @@ Cycle 2는 크게 두 개의 에이전트 작업으로 나뉜다.
   4. 벡터 인덱스(FAISS/SQLite+JSON) 파일 생성.
 * 출력:
 
-  * `index_cache/<scope_id>.{faiss/json/sqlite}` 등
+  * 기본 캐시 디렉터리(예: `data/cache/`)에 인덱스/메타 저장 (`doc_index.faiss`, `doc_meta.json`, `doc_embeddings.npy`)
 
 **검색(Retrieval & RAG)**
 
@@ -534,7 +534,7 @@ Cycle 2는 크게 두 개의 에이전트 작업으로 나뉜다.
 
 **로그 체계**
 
-* `logs/audit.log`:
+* `artifacts/logs/audit/YYYY-MM-DD.jsonl`:
 
   * 주요 이벤트 (Scan, Train, Query, Error, Policy violation 등)
   * 타임스탬프, scope, 파일 수, 에러 코드 등 기록.
@@ -603,7 +603,7 @@ Cycle 2는 크게 두 개의 에이전트 작업으로 나뉜다.
 1. **재스캔 & 재색인**
 
    * Scan → Train 단계 재실행.
-   * corpus, index_cache 업데이트.
+   * corpus, data/cache 업데이트.
 
 2. **모델 교체/튜닝**
 

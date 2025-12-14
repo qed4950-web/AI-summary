@@ -19,6 +19,54 @@ from types import SimpleNamespace
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Set, Tuple
 
 import click
+from core.errors import (
+    AccessDeniedError,
+    PolicyViolationError,
+    ModelLoadError,
+    DriftError,
+    ScanError,
+)
+from core.logging.runtime import configure_runtime_logging
+from scripts.pipeline.infopilot_cli.history import (
+    HISTORY_PATH,
+    MAX_AGENT_HISTORY,
+    load_agent_history as _load_agent_history,
+    remember_agent_history as _remember_agent_history,
+)
+from scripts.pipeline.infopilot_cli.drift import (
+    auto_reembed_targets as _auto_reembed_targets,
+    perform_drift_check as _perform_drift_check,
+    print_drift_report as _print_drift_report,
+)
+from scripts.pipeline.infopilot_cli.policy import (
+    dir_size_bytes as _dir_size_bytes,
+    enforce_cache_limit as _enforce_cache_limit,
+    load_policy_engine as _load_policy_engine_impl,
+    normalize_exts as _normalize_exts,
+    parse_roots as _parse_roots,
+    warn_if_cache_limit_exceeded as _warn_if_cache_limit_exceeded,
+)
+from scripts.pipeline.infopilot_cli.scan import cmd_scan as _cmd_scan_impl, run_scan as _run_scan_impl
+from scripts.pipeline.infopilot_cli.scan_rows import load_scan_rows as _load_scan_rows_impl, resolve_scan_csv as _resolve_scan_csv_impl
+from scripts.pipeline.infopilot_cli.steps import (
+    cmd_embed as _cmd_embed_impl,
+    cmd_extract as _cmd_extract_impl,
+    cmd_train as _cmd_train_impl,
+)
+from scripts.pipeline.infopilot_cli.index import cmd_index as _cmd_index_impl
+from scripts.pipeline.infopilot_cli.chat import cmd_chat as _cmd_chat_impl
+from scripts.pipeline.infopilot_cli.train_config import (
+    build_train_config as _build_train_config_impl,
+    default_train_config as _default_train_config_impl,
+    maybe_limit_rows as _maybe_limit_rows_impl,
+)
+from scripts.pipeline.infopilot_cli.watch import (
+    IncrementalPipeline,
+    PolicyEventHandler,
+    WatchEventHandler,
+    watch_loop as _watch_loop,
+)
+from scripts.pipeline.infopilot_cli.session import command_session as _command_session
 
 ROOT_DIR = Path(__file__).resolve().parents[2]
 if str(ROOT_DIR) not in sys.path:
@@ -53,15 +101,14 @@ except Exception:
     Observer = None
 
 
-HISTORY_PATH = Path.home() / ".infopilot" / "agent_history.json"
-MAX_AGENT_HISTORY = 5
-
-
 # 모듈 임포트
 from core.config.paths import (
     CACHE_DIR,
     CORPUS_PATH,
     DATA_DIR,
+    DRIFT_LOG_PATH,
+    RESOURCE_LOG_PATH,
+    SEMANTIC_BASELINE_PATH,
     TOPIC_MODEL_PATH,
     MODELS_DIR,
 )
@@ -80,20 +127,16 @@ from core.data_pipeline.pipeline import (
 )
 from core.infra.scheduler import JobScheduler, ScheduleSpec, ScheduledJob
 from core.infra.models import ModelManager
-from core.agents.document import DocumentAgent, DocumentAgentConfig
-from core.agents.meeting import MeetingAgent
-from core.agents.photo import PhotoAgent
-from core.conversation.orchestrator import AssistantOrchestrator
+from core.agents.document import DocumentAgentConfig
 from core.search.retriever import (
     VectorIndex,
     MODEL_TEXT_COLUMN,
     _split_tokens,
 )
-from core.monitor import check_drift, ResourceLogger
+from core.monitor import check_drift
 from scripts.utils.mlflow_logger import (
     DEFAULT_EXPERIMENT,
     DEFAULT_TRACKING_URI,
-    mlflow_session,
 )
 from scripts.utils.quantizer import export_to_onnx
 
@@ -104,106 +147,16 @@ DEFAULT_FOUND_FILES = DATA_DIR / "found_files.csv"
 DEFAULT_SCHEDULED_ROOT = DATA_DIR / "scheduled"
 DEFAULT_SCAN_STATE = DATA_DIR / "scan_state.json"
 DEFAULT_CHUNK_CACHE = CACHE_DIR / "chunk_cache.json"
-DEFAULT_RESOURCE_LOG = Path("logs/resource_log.jsonl")
-DEFAULT_DRIFT_LOG = Path("logs/drift_log.jsonl")
-DEFAULT_SEMANTIC_BASELINE = Path("logs/semantic_baseline.json")
+DEFAULT_RESOURCE_LOG = RESOURCE_LOG_PATH
+DEFAULT_DRIFT_LOG = DRIFT_LOG_PATH
+DEFAULT_SEMANTIC_BASELINE = SEMANTIC_BASELINE_PATH
 
-_POLICY_CACHE: Dict[Path, PolicyEngine] = {}
 _SENTENCE_ENCODER_MANAGER: Optional[ModelManager] = None
-
-
-def _dir_size_bytes(path: Path) -> int:
-    total = 0
-    if not path.exists():
-        return total
-    for entry in path.rglob("*"):
-        try:
-            if entry.is_file():
-                total += entry.stat().st_size
-        except OSError:
-            continue
-    return total
 
 
 def _require_pandas() -> None:
     if pd is None:
-        raise click.ClickException(
-            "pandas 라이브러리가 필요합니다. `pip install pandas` 또는 `bash scripts/setup_env.sh` 후 다시 시도하세요."
-        )
-
-
-def _load_agent_history() -> Dict[str, List[str]]:
-    try:
-        payload = json.loads(HISTORY_PATH.read_text(encoding="utf-8"))
-        if not isinstance(payload, dict):
-            return {"meeting_audio": [], "photo_roots": []}
-        meeting = [str(item) for item in payload.get("meeting_audio", []) if isinstance(item, str)]
-        photo = [str(item) for item in payload.get("photo_roots", []) if isinstance(item, str)]
-        return {
-            "meeting_audio": meeting[:MAX_AGENT_HISTORY],
-            "photo_roots": photo[:MAX_AGENT_HISTORY],
-        }
-    except Exception:
-        return {"meeting_audio": [], "photo_roots": []}
-
-
-def _save_agent_history(history: Dict[str, List[str]]) -> None:
-    try:
-        HISTORY_PATH.parent.mkdir(parents=True, exist_ok=True)
-        HISTORY_PATH.write_text(json.dumps(history, ensure_ascii=False, indent=2), encoding="utf-8")
-    except Exception:
-        pass
-
-
-def _remember_agent_history(kind: str, values: Iterable[str]) -> None:
-    if kind not in {"meeting_audio", "photo_roots"}:
-        return
-    history = _load_agent_history()
-    original = history.get(kind, [])
-    merged: List[str] = []
-    for value in values:
-        normalised = str(Path(value).expanduser())
-        if normalised and normalised not in merged:
-            merged.append(normalised)
-    for existing in original:
-        if existing not in merged:
-            merged.append(existing)
-    history[kind] = merged[:MAX_AGENT_HISTORY]
-    _save_agent_history(history)
-
-
-@contextlib.contextmanager
-def _command_session(ctx: click.Context, run_name: str):
-    """Attach MLflow + resource logger lifecycle to each CLI command."""
-
-    settings = ctx.ensure_object(dict)
-    use_mlflow: bool = settings.get("use_mlflow", True)
-    tracking_uri: str = settings.get("mlflow_uri", DEFAULT_TRACKING_URI)
-    experiment: str = settings.get("mlflow_experiment", DEFAULT_EXPERIMENT)
-    resource_path: Optional[Path] = settings.get("resource_log_path")
-    resource_interval: float = settings.get("resource_interval", 30.0)
-
-    if use_mlflow:
-        mlflow_cm = mlflow_session(
-            run_name,
-            experiment=experiment,
-            tracking_uri=tracking_uri,
-            tags={"command": run_name},
-        )
-    else:
-        mlflow_cm = contextlib.nullcontext(None)
-
-    resource_logger = None
-    if resource_path:
-        resource_logger = ResourceLogger(Path(resource_path), interval=resource_interval)
-        resource_logger.start(context=run_name)
-
-    try:
-        with mlflow_cm as session:
-            yield session
-    finally:
-        if resource_logger:
-            resource_logger.stop()
+        raise ScanError("pandas 라이브러리가 필요합니다.", hint="pip install pandas 또는 scripts/setup_env.sh 실행")
 
 
 def _configure_offline_transformers() -> None:
@@ -235,17 +188,6 @@ def _disable_mps_for_inference(reason: str = "") -> None:
 _configure_offline_transformers()
 
 
-NORMALIZED_ALIASES = {
-    "path": ("path", "filepath", "file_path", "fullpath", "full_path", "absolute_path"),
-    "size": ("size", "filesize", "file_size", "bytes"),
-    "mtime": ("mtime", "modified", "modified_time", "lastmodified", "timestamp"),
-    "ctime": ("ctime", "created", "created_time", "creation", "creation_time"),
-    "ext": ("ext", "extension", "suffix"),
-    "drive": ("drive", "volume", "root"),
-    "owner": ("owner", "user", "username", "author", "created_by"),
-}
-
-
 def _get_sentence_encoder_manager() -> ModelManager:
     global _SENTENCE_ENCODER_MANAGER
     if _SENTENCE_ENCODER_MANAGER is None:
@@ -261,127 +203,18 @@ def _get_sentence_encoder_manager() -> ModelManager:
     return _SENTENCE_ENCODER_MANAGER
 
 
-def _normalize_key(name: str) -> str:
-    """Normalize header names by stripping non-alphanumerics and lowering case."""
-    return "".join(ch for ch in (name or "").lower() if ch.isalnum())
-
-
-def _pick_value(row: Dict[str, str], aliases) -> str:
-    normalized = {_normalize_key(k): (k, v) for k, v in row.items() if k}
-    for alias in aliases:
-        alias_norm = _normalize_key(alias)
-        data = normalized.get(alias_norm)
-        if data:
-            value = (data[1] or "").strip()
-            if value:
-                return value
-    return ""
-
-
-def _normalize_scan_row(raw: Dict[str, str], *, context: str = "") -> Dict[str, Any] | None:
-    path = _pick_value(raw, NORMALIZED_ALIASES["path"])
-    if not path:
-        columns = ", ".join(k for k in raw.keys() if k)
-        location = f" ({context})" if context else ""
-        print(f"⚠️ 경고: 'path' 값을 찾지 못해 행을 건너뜁니다{location}. (감지한 열: {columns or '없음'})")
-        return None
-
-    size_raw = _pick_value(raw, NORMALIZED_ALIASES["size"])
-    mtime_raw = _pick_value(raw, NORMALIZED_ALIASES["mtime"])
-    ext = _pick_value(raw, NORMALIZED_ALIASES["ext"])
-    drive = _pick_value(raw, NORMALIZED_ALIASES["drive"])
-    ctime_raw = _pick_value(raw, NORMALIZED_ALIASES["ctime"])
-    owner = _pick_value(raw, NORMALIZED_ALIASES["owner"])
-
-    def to_int(value: str) -> int:
-        try:
-            return int(float(value))
-        except (TypeError, ValueError):
-            return 0
-
-    def to_float(value: str) -> float:
-        try:
-            out = float(value)
-            if math.isnan(out) or math.isinf(out):
-                return 0.0
-            return out
-        except (TypeError, ValueError):
-            return 0.0
-
-    normalized = dict(raw)
-    normalized["path"] = path
-    normalized["size"] = to_int(size_raw)
-    normalized["mtime"] = to_float(mtime_raw)
-    normalized["ctime"] = to_float(ctime_raw)
-    if ext:
-        normalized["ext"] = ext
-    if drive:
-        normalized["drive"] = drive
-    if owner:
-        normalized["owner"] = owner
-    return normalized
-
-
-def _parse_roots(raw_roots: List[str] | None) -> List[Path] | None:
-    if not raw_roots:
-        return None
-    roots: List[Path] = []
-    for raw in raw_roots:
-        p = Path(raw).expanduser().resolve()
-        if not p.exists():
-            print(f"⚠️ 경고: 지정한 루트 '{p}'이(가) 존재하지 않아 건너뜁니다.")
-            continue
-        roots.append(p)
-    if not roots:
-        print("⚠️ 경고: 사용할 수 있는 루트가 없습니다.")
-        return None
-    return roots
-
-
 def _load_policy_engine(
     policy_arg: Optional[str],
     *,
     fail_if_missing: bool = False,
     stage: str = "pipeline",
 ) -> PolicyEngine:
-    """Load a policy engine with optional fail-closed semantics."""
-
-    raw = (policy_arg or str(DEFAULT_POLICY_PATH)).strip()
-    normalized = raw.lower()
-    if normalized in {"none", ""}:
-        if fail_if_missing:
-            raise click.ClickException(
-                f"[{stage}] 스마트 폴더 정책이 없어 파이프라인을 중단합니다. "
-                "정책 파일을 지정하거나 --policy none 과 함께 --root 옵션을 명시하세요."
-            )
-        return PolicyEngine.empty()
-
-    path = Path(raw).expanduser()
-    try:
-        resolved = path.resolve()
-    except OSError:
-        resolved = path
-
-    if not resolved.exists():
-        message = f"[{stage}] 스마트 폴더 정책 파일을 찾을 수 없습니다: {resolved}"
-        if fail_if_missing:
-            raise click.ClickException(message)
-        print(f"⚠️ {message} (정책 미적용 상태로 진행)", flush=True)
-        return PolicyEngine.empty()
-
-    cache_key = resolved
-    engine = _POLICY_CACHE.get(cache_key)
-    if engine is None:
-        try:
-            engine = PolicyEngine.from_file(resolved)
-        except Exception as exc:
-            message = f"[{stage}] 정책 파일을 불러오지 못했습니다 ({resolved}): {exc}"
-            if fail_if_missing:
-                raise click.ClickException(message) from exc
-            print(f"⚠️ {message}", flush=True)
-            return PolicyEngine.empty()
-        _POLICY_CACHE[cache_key] = engine
-    return engine
+    return _load_policy_engine_impl(
+        policy_arg,
+        default_policy_path=DEFAULT_POLICY_PATH,
+        fail_if_missing=fail_if_missing,
+        stage=stage,
+    )
 
 
 def _run_scan(
@@ -391,101 +224,15 @@ def _run_scan(
     policy_engine: Optional[PolicyEngine] = None,
     exts: Optional[Iterable[str]] = None,
 ) -> List[Dict[str, Any]]:
-    scan_roots = roots
-    if policy_engine and policy_engine.has_policies and not roots:
-        candidate_roots = policy_engine.roots_for_agent(KNOWLEDGE_AGENT, include_manual=True)
-        if candidate_roots:
-            scan_roots = candidate_roots
-            print("📁 정책 기반 스캔 루트:")
-            for root in candidate_roots:
-                print(f"   - {root}")
-
-    normalized_exts: Optional[Set[str]] = None
-    if exts:
-        normalized_exts = set()
-        for ext in exts:
-            value = (ext or "").strip().lower()
-            if not value:
-                continue
-            if not value.startswith("."):
-                value = f".{value}"
-            normalized_exts.add(value)
-        if not normalized_exts:
-            normalized_exts = None
-
-    finder = FileFinder(
-        exts=normalized_exts or FileFinder.DEFAULT_EXTS,
-        scan_all_drives=True,
-        start_from_current_drive_only=False,
-        follow_symlinks=False,
-        max_depth=None,
-        show_progress=True,
-        progress_update_secs=0.5,
-        estimate_total_dirs=False,
-        startup_banner=True,
-    )
-    files = finder.find(roots=scan_roots, run_async=False)
-    if policy_engine and policy_engine.has_policies:
-        files = policy_engine.filter_records(files, agent=KNOWLEDGE_AGENT, include_manual=True)
-    FileFinder.to_csv(files, out)
-    print(f"📦 스캔 결과 저장: {out}")
-    return files
+    return _run_scan_impl(out, roots, policy_engine=policy_engine, exts=exts, agent=KNOWLEDGE_AGENT)
 
 
 def cmd_scan(args) -> int:
-    policy_arg = getattr(args, "policy", None)
-    policy_normalized = (policy_arg or "").strip().lower()
-    policy_required = policy_normalized != "none"
-    policy_engine = _load_policy_engine(policy_arg, fail_if_missing=policy_required, stage="scan")
-    roots = _parse_roots(args.roots)
-    if not roots and policy_engine and policy_engine.has_policies:
-        roots = policy_engine.roots_for_agent(KNOWLEDGE_AGENT, include_manual=True)
-    if not roots:
-        raise click.ClickException(
-            "스마트 폴더 정책이나 스캔 루트가 없어 scan을 중단합니다. "
-            "Park David Foundation 스펙에 따라 정책 기반 경계가 필수입니다."
-        )
-    rows = _run_scan(
-        Path(args.out),
-        roots,
-        policy_engine=policy_engine,
-        exts=getattr(args, "exts", None),
-    )
-    return len(rows)
+    return _cmd_scan_impl(args, default_policy_path=DEFAULT_POLICY_PATH, agent=KNOWLEDGE_AGENT)
 
 
 def _resolve_scan_csv(path: Path) -> Path:
-    if path.exists():
-        return path
-
-    search_root = path.parent if path.parent else Path(".")
-    candidates = []
-    for candidate in sorted(search_root.glob("*.csv"), key=lambda p: p.stat().st_mtime, reverse=True):
-        try:
-            with candidate.open("r", encoding="utf-8", newline="") as f:
-                reader = csv.DictReader(f)
-                headers = reader.fieldnames or []
-        except OSError:
-            continue
-        header_norm = {_normalize_key(h) for h in headers}
-        if any(_normalize_key(alias) in header_norm for alias in NORMALIZED_ALIASES["path"]):
-            candidates.append(candidate)
-
-    if candidates:
-        picked = candidates[0]
-        print(f"⚠️ '{path}' 파일이 없어 '{picked}'을(를) 사용합니다.")
-        return picked
-
-    raise FileNotFoundError(f"스캔 CSV를 찾을 수 없습니다: {path}")
-
-
-def _iter_scan_rows(scan_csv: Path) -> Iterator[Dict[str, Any]]:
-    with scan_csv.open("r", encoding="utf-8", newline="") as f:
-        reader = csv.DictReader(f)
-        for idx, raw in enumerate(reader, start=2):
-            normalized = _normalize_scan_row(raw, context=f"{scan_csv}:{idx}")
-            if normalized:
-                yield normalized
+    return _resolve_scan_csv_impl(path)
 
 
 def _load_scan_rows(
@@ -494,19 +241,24 @@ def _load_scan_rows(
     policy_engine: Optional[PolicyEngine] = None,
     include_manual: bool = True,
 ) -> Iterator[Dict[str, Any]]:
-    for row in _iter_scan_rows(scan_csv):
-        if policy_engine and policy_engine.has_policies:
-            raw_path = row.get("path")
-            if not raw_path:
-                continue
-            if not policy_engine.allows(
-                Path(str(raw_path)),
-                agent=KNOWLEDGE_AGENT,
-                include_manual=include_manual,
-            ):
-                continue
-        yield row
+    return _load_scan_rows_impl(
+        scan_csv,
+        policy_engine=policy_engine,
+        include_manual=include_manual,
+        agent=KNOWLEDGE_AGENT,
+    )
 
+
+def _build_train_config(args) -> TrainConfig:
+    return _build_train_config_impl(args)
+
+
+def _maybe_limit_rows(rows: Iterable[Dict[str, Any]], limit: int) -> List[Dict[str, Any]]:
+    return _maybe_limit_rows_impl(rows, limit)
+
+
+def _default_train_config() -> TrainConfig:
+    return _default_train_config_impl()
 
 @dataclass
 class _PolicyArtifacts:
@@ -651,244 +403,23 @@ def _load_vector_index(cache_dir: Path) -> VectorIndex:
     return index
 
 
-class WatchEventHandler(FileSystemEventHandler):
-    def __init__(
-        self,
-        event_queue: "queue.Queue[Tuple[str, str]]",
-        allowed_exts: Set[str],
-        *,
-        policy_engine: Optional[PolicyEngine] = None,
-        agent: str = KNOWLEDGE_AGENT,
-    ) -> None:
-        super().__init__()
-        self._queue = event_queue
-        self._allowed_exts = {ext.lower() for ext in allowed_exts}
-        self._policy_engine = policy_engine
-        self._policy_agent = agent
-
-    def _should_process(self, path: str) -> bool:
-        if not path:
-            return False
-        ext = Path(path).suffix.lower()
-        if ext not in self._allowed_exts:
-            return False
-        if self._policy_engine and self._policy_engine.has_policies and not self._policy_engine.allows(
-            Path(path), agent=self._policy_agent, include_manual=False
-        ):
-            return False
-        return True
-
-    def on_created(self, event):  # type: ignore[override]
-        if getattr(event, "is_directory", False):
-            return
-        if self._should_process(event.src_path):
-            self._queue.put(("created", event.src_path))
-
-    def on_modified(self, event):  # type: ignore[override]
-        if getattr(event, "is_directory", False):
-            return
-        if self._should_process(event.src_path):
-            self._queue.put(("modified", event.src_path))
-
-    def on_moved(self, event):  # type: ignore[override]
-        if getattr(event, "is_directory", False):
-            return
-        if self._should_process(event.src_path):
-            self._queue.put(("deleted", event.src_path))
-        if self._should_process(event.dest_path):
-            self._queue.put(("created", event.dest_path))
-
-    def on_deleted(self, event):  # type: ignore[override]
-        if getattr(event, "is_directory", False):
-            return
-        if self._should_process(event.src_path):
-            self._queue.put(("deleted", event.src_path))
-
-
-class IncrementalPipeline:
-    def __init__(
-        self,
-        *,
-        encoder: SentenceTransformer,
-        batch_size: int,
-        scan_csv: Path,
-        corpus_path: Path,
-        cache_dir: Path,
-        translate: bool,
-        policy_engine: Optional[PolicyEngine] = None,
-    ) -> None:
-        self.encoder = encoder
-        self.batch_size = max(1, int(batch_size))
-        self.scan_csv = scan_csv
-        self.corpus_path = corpus_path
-        self.cache_dir = cache_dir
-        self.translate = translate
-        self.allowed_exts = {ext.lower() for ext in FileFinder.DEFAULT_EXTS}
-        self.cache_dir.mkdir(parents=True, exist_ok=True)
-        self.policy_engine = policy_engine
-        self.policy_agent = KNOWLEDGE_AGENT
-
-    def process(self, add_paths: Set[str], remove_paths: Set[str]) -> None:
-        if pd is None:
-            raise RuntimeError("pandas 필요. pip install pandas")
-        add_paths = {p for p in add_paths if Path(p).suffix.lower() in self.allowed_exts}
-        remove_paths = {p for p in remove_paths if Path(p).suffix.lower() in self.allowed_exts}
-        if self.policy_engine and self.policy_engine.has_policies and add_paths:
-            add_paths = {
-                p
-                for p in add_paths
-                if self.policy_engine.allows(Path(p), agent=self.policy_agent, include_manual=False)
-            }
-
-        rows_to_add: List[Dict[str, Any]] = []
-        for raw_path in sorted(add_paths):
-            if self.policy_engine and self.policy_engine.has_policies and not self.policy_engine.allows(
-                Path(raw_path), agent=self.policy_agent, include_manual=False
-            ):
-                continue
-            meta = FileFinder.collect_file_metadata(Path(raw_path), allowed_exts=self.allowed_exts)
-            if meta:
-                rows_to_add.append(meta)
-
-        _sync_scan_csv(self.scan_csv, rows_to_add, {str(p) for p in remove_paths})
-
-        if remove_paths:
-            remove_from_corpus(list(remove_paths), self.corpus_path)
-
-        new_records = None
-        if rows_to_add:
-            cb = CorpusBuilder(progress=False, translate=self.translate)
-            new_records = cb.build(rows_to_add)
-        else:
-            new_records = None
-
-        if new_records is not None and not new_records.empty:
-            update_corpus_file(new_records, self.corpus_path)
-
-        index = _load_vector_index(self.cache_dir)
-
-        paths_to_remove = set(remove_paths)
-        paths_to_remove.update(row["path"] for row in rows_to_add if "path" in row)
-        if paths_to_remove:
-            index.remove_paths(paths_to_remove)
-
-        if new_records is None or new_records.empty:
-            index.save(self.cache_dir)
-            if rows_to_add or remove_paths:
-                print(
-                    f"⚡ watcher: removed {len(paths_to_remove)} 문서, 새 문서 없음.",
-                    flush=True,
-                )
-            return
-
-        valid_mask = new_records.get("ok", True)
-        if pd is not None and isinstance(valid_mask, pd.Series):
-            valid_df = new_records[valid_mask & (new_records[MODEL_TEXT_COLUMN].astype(str).str.len() > 0)].copy()
-        else:
-            valid_df = new_records.copy()
-
-        if valid_df.empty:
-            index.save(self.cache_dir)
-            print(
-                f"⚡ watcher: 갱신 {len(rows_to_add)}건 중 유효 텍스트가 없습니다.",
-                flush=True,
-            )
-            return
-
-        texts = valid_df[MODEL_TEXT_COLUMN].astype(str).tolist()
-        embeddings = self.encoder.encode(
-            texts,
-            batch_size=self.batch_size,
-            show_progress_bar=False,
-            convert_to_numpy=True,
-            normalize_embeddings=False,
-        )
-        embeddings = np.asarray(embeddings, dtype=np.float32)
-
-        token_lists = [[tok for tok in _split_tokens(text.lower()) if tok] for text in texts]
-        previews_series = valid_df["text_original"] if "text_original" in valid_df.columns else valid_df["text"]
-        previews = previews_series.fillna("").astype(str).tolist()
-
-        for idx, (_, row) in enumerate(valid_df.iterrows()):
-            index.upsert(
-                path=str(row.get("path", "")),
-                ext=str(row.get("ext", "")),
-                embedding=embeddings[idx],
-                preview=previews[idx],
-                size=int(row.get("size", 0) or 0),
-                mtime=float(row.get("mtime", 0.0) or 0.0),
-                ctime=float(row.get("ctime", 0.0) or 0.0),
-                owner=str(row.get("owner", "") or ""),
-                tokens=token_lists[idx],
-            )
-
-        index.save(self.cache_dir)
-        print(
-            f"⚡ watcher: 문서 {len(valid_df)}건 업데이트 (제거 {len(paths_to_remove)})",
-            flush=True,
-        )
-
-
-def _watch_loop(
+def _make_watch_handler(
     event_queue: "queue.Queue[Tuple[str, str]]",
-    pipeline_ctx: IncrementalPipeline,
-    stop_event: threading.Event,
-    debounce_sec: float,
-) -> None:
-    pending_add: Set[str] = set()
-    pending_remove: Set[str] = set()
-    last_event = 0.0
-
-    def _log_throughput(add_count: int, remove_count: int, elapsed: float) -> None:
-        total = add_count + remove_count
-        if total <= 0:
-            return
-        rate = total / elapsed if elapsed > 0 else 0.0
-        print(
-            (
-                "⚙️ watcher: processed add={add} remove={rem} in {secs:.2f}s "
-                "(~{rate:.1f}/s)"
-            ).format(add=add_count, rem=remove_count, secs=elapsed, rate=rate),
-            flush=True,
-        )
-
-    while not stop_event.is_set():
-        try:
-            event_type, path = event_queue.get(timeout=0.5)
-            path = str(path)
-            if event_type == "deleted":
-                pending_remove.add(path)
-                pending_add.discard(path)
-            else:
-                pending_add.add(path)
-                pending_remove.discard(path)
-            last_event = time.time()
-        except queue.Empty:
-            pass
-
-        now = time.time()
-        if (pending_add or pending_remove) and (now - last_event) >= debounce_sec:
-            to_add = set(pending_add)
-            to_remove = set(pending_remove)
-            pending_add.clear()
-            pending_remove.clear()
-            try:
-                t0 = time.time()
-                pipeline_ctx.process(to_add, to_remove)
-                _log_throughput(len(to_add), len(to_remove), time.time() - t0)
-            except Exception as exc:
-                print(f"⚠️ 증분 파이프라인 처리 중 오류: {exc}")
-
-    # Flush remaining events
-    if pending_add or pending_remove:
-        try:
-            to_add = set(pending_add)
-            to_remove = set(pending_remove)
-            t0 = time.time()
-            pipeline_ctx.process(to_add, to_remove)
-            _log_throughput(len(to_add), len(to_remove), time.time() - t0)
-        except Exception as exc:
-            print(f"⚠️ 증분 파이프라인 종료 처리 중 오류: {exc}")
+    allowed_exts: Set[str],
+    *,
+    policy_engine: Optional[PolicyEngine],
+    policy_engine_provider=None,
+    ignore_paths: Optional[Set[str]] = None,
+) -> FileSystemEventHandler:
+    return WatchEventHandler(
+        event_queue,
+        allowed_exts,
+        policy_engine=policy_engine,
+        policy_engine_provider=policy_engine_provider,
+        ignore_paths=ignore_paths,
+        agent=KNOWLEDGE_AGENT,
+        base_handler_cls=FileSystemEventHandler,
+    )
 
 
 def _register_policy_jobs(
@@ -952,257 +483,34 @@ def _register_policy_jobs(
     return registered
 
 
-def _build_train_config(args) -> TrainConfig:
-    return TrainConfig(
-        max_features=args.max_features,
-        n_components=args.n_components,
-        n_clusters=args.n_clusters,
-        ngram_range=(1, 2),
-        min_df=args.min_df,
-        max_df=args.max_df,
-        use_sentence_transformer=getattr(args, "use_embedding", True),
-        embedding_model=getattr(args, "embedding_model", DEFAULT_EMBED_MODEL),
-        embedding_batch_size=getattr(args, "embedding_batch_size", 32),
-        async_embeddings=getattr(args, "async_embed", True),
-        embedding_concurrency=max(1, int(getattr(args, "embedding_concurrency", 1))),
-        embedding_dtype=getattr(args, "embedding_dtype", "auto"),
-        embedding_chunk_size=max(0, int(getattr(args, "embedding_chunk_size", 0) or 0)),
-        embedding_chunk_start=max(0, int(getattr(args, "embedding_chunk_start", 0) or 0)),
-        embedding_chunk_end=int(getattr(args, "embedding_chunk_end", -1) or -1),
-        embedding_subprocess_fallback=bool(getattr(args, "embedding_subprocess_fallback", True)),
-    )
-
-
-def _maybe_limit_rows(rows: Iterable[Dict[str, Any]], limit: int) -> List[Dict[str, Any]]:
-    iterator = iter(rows)
-    if limit and limit > 0:
-        limited = list(itertools.islice(iterator, limit))
-        if next(iterator, None) is not None:
-            print(f"⚡ 테스트 모드: 상위 {limit}개 파일만 사용합니다.")
-        return limited
-    return list(iterator)
-
-
-def _default_train_config() -> TrainConfig:
-    return TrainConfig(
-        max_features=50000,
-        n_components=DEFAULT_N_COMPONENTS,
-        n_clusters=25,
-        ngram_range=(1, 2),
-        min_df=2,
-        max_df=0.85,
-        use_sentence_transformer=True,
-        embedding_model=DEFAULT_EMBED_MODEL,
-        embedding_batch_size=32,
-        embedding_chunk_size=0,
-        embedding_chunk_start=0,
-        embedding_chunk_end=-1,
-        embedding_subprocess_fallback=True,
-    )
-
-
-def _ensure_chat_artifacts(
-    scan_csv: Path,
-    corpus: Path,
-    model: Path,
-    *,
-    translate: bool,
-    auto_train: bool,
-    policy_engine: Optional[PolicyEngine],
-) -> bool:
-    """Ensure chat artifacts exist and are up to date. Returns True if training ran."""
-
-    def mtime(path: Path) -> float:
-        try:
-            return path.stat().st_mtime
-        except OSError:
-            return 0.0
-
-    resolved_scan: Optional[Path] = None
-    if scan_csv:
-        try:
-            resolved_scan = _resolve_scan_csv(scan_csv)
-        except FileNotFoundError:
-            resolved_scan = None
-
-    artifacts_exist = corpus.exists() and model.exists()
-    needs_train = not artifacts_exist
-
-    if not needs_train and resolved_scan:
-        scan_mtime = mtime(resolved_scan)
-        artifacts_mtime = min(mtime(corpus), mtime(model))
-        if scan_mtime > artifacts_mtime:
-            needs_train = True
-
-    if not needs_train:
-        print("🔄 인덱스 최신성 확인 완료.")
-        return False
-
-    if resolved_scan is None:
-        msg = (
-            "⚠️ 학습 산출물이 없거나 오래되었지만 사용할 스캔 CSV를 찾지 못했습니다."
-            " `--scan_csv` 경로를 확인하거나 'scan' 명령을 다시 실행해주세요."
-        )
-        raise FileNotFoundError(msg)
-
-    if not auto_train:
-        raise RuntimeError(
-            "학습 산출물이 최신이 아닙니다. 'python infopilot.py train --scan_csv "
-            f"{resolved_scan}'를 실행한 뒤 다시 시도해주세요."
-        )
-
-    print("⚠️ 스캔 결과가 모델보다 최신입니다. 자동으로 train 단계를 실행합니다.")
-    rows = list(
-        _load_scan_rows(
-            resolved_scan,
-            policy_engine=policy_engine,
-            include_manual=False,
-        )
-    )
-    if not rows:
-        raise ValueError("자동 학습을 위한 유효한 행이 없습니다. 스캔 결과를 확인해주세요.")
-
-    cfg = _default_train_config()
-    run_step2(
-        rows,
-        out_corpus=corpus,
-        out_model=model,
-        cfg=cfg,
-        use_tqdm=True,
-        translate=translate,
-    )
-    print("✅ 자동 학습 완료")
-    return True
-
-
 def cmd_train(args):
-    scan_csv = _resolve_scan_csv(Path(args.scan_csv))
-    policy_arg = getattr(args, "policy", None)
-    policy_normalized = (policy_arg or "").strip().lower()
-    policy_required = policy_normalized != "none"
-    policy_engine = _load_policy_engine(policy_arg, fail_if_missing=policy_required, stage="train")
-    row_iter = _load_scan_rows(scan_csv, policy_engine=policy_engine, include_manual=True)
-    rows = _maybe_limit_rows(row_iter, args.limit_files)
-
-    if not rows:
-        raise ValueError("유효한 학습 대상 행이 없습니다. 스캔 CSV를 확인해주세요.")
-
-    cfg = _build_train_config(args)
-    out_corpus = Path(args.corpus)
-    out_model = Path(args.model)
-    chunk_cache_path = Path(getattr(args, "chunk_cache", DEFAULT_CHUNK_CACHE))
-    state_path = Path(getattr(args, "state_file", DEFAULT_SCAN_STATE))
-    df, tm = run_step2(
-        rows,
-        out_corpus=out_corpus,
-        out_model=out_model,
-        cfg=cfg,
-        use_tqdm=True,
-        translate=args.translate,
-        scan_state_path=state_path,
-        chunk_cache_path=chunk_cache_path,
-        skip_extract=bool(getattr(args, "skip_extract", False)),
+    return _cmd_train_impl(
+        args,
+        default_policy_path=DEFAULT_POLICY_PATH,
+        default_chunk_cache=DEFAULT_CHUNK_CACHE,
+        default_scan_state=DEFAULT_SCAN_STATE,
+        agent=KNOWLEDGE_AGENT,
     )
-    metrics = df.attrs.get("metrics", {}) if hasattr(df, "attrs") else {}
-    incremental = df.attrs.get("incremental", {}) if hasattr(df, "attrs") else {}
-    if metrics:
-        metric_str = ", ".join(f"{k}={v}" for k, v in metrics.items())
-        print(f"📊 임베딩 품질 지표: {metric_str}")
-    print("✅ 학습 완료")
-    return {
-        "rows": len(rows),
-        "corpus": str(out_corpus),
-        "model": str(out_model),
-        "metrics": metrics,
-        "incremental": incremental,
-    }
 
 
 def cmd_extract(args):
-    scan_csv = _resolve_scan_csv(Path(args.scan_csv))
-    policy_arg = getattr(args, "policy", None)
-    policy_normalized = (policy_arg or "").strip().lower()
-    policy_required = policy_normalized != "none"
-    policy_engine = _load_policy_engine(policy_arg, fail_if_missing=policy_required, stage="extract")
-    row_iter = _load_scan_rows(scan_csv, policy_engine=policy_engine, include_manual=True)
-    rows = _maybe_limit_rows(row_iter, args.limit_files)
-
-    if not rows:
-        raise ValueError("유효한 추출 대상 행이 없습니다. 스캔 CSV를 확인해주세요.")
-
-    cfg = _build_train_config(args)
-    out_corpus = Path(args.corpus)
-    out_model = Path(args.model)
-    chunk_cache_path = Path(getattr(args, "chunk_cache", DEFAULT_CHUNK_CACHE))
-    state_path = Path(getattr(args, "state_file", DEFAULT_SCAN_STATE))
-    df, _ = run_step2(
-        rows,
-        out_corpus=out_corpus,
-        out_model=out_model,
-        cfg=cfg,
-        use_tqdm=True,
-        translate=args.translate,
-        scan_state_path=state_path,
-        chunk_cache_path=chunk_cache_path,
-        skip_extract=False,
-        train_embeddings=False,
+    return _cmd_extract_impl(
+        args,
+        default_policy_path=DEFAULT_POLICY_PATH,
+        default_chunk_cache=DEFAULT_CHUNK_CACHE,
+        default_scan_state=DEFAULT_SCAN_STATE,
+        agent=KNOWLEDGE_AGENT,
     )
-    incremental = df.attrs.get("incremental", {}) if hasattr(df, "attrs") else {}
-    print("✅ 추출 완료 (임베딩/모델 생성 없음)")
-    return {
-        "rows": len(rows),
-        "corpus": str(out_corpus),
-        "incremental": incremental,
-    }
 
 
 def cmd_embed(args):
-    scan_csv = _resolve_scan_csv(Path(args.scan_csv))
-    corpus_path = Path(args.corpus)
-    if not corpus_path.exists():
-        raise FileNotFoundError(
-            f"기존 corpus가 없어 임베딩을 진행할 수 없습니다: {corpus_path}. 먼저 extract/train을 실행하세요."
-        )
-
-    policy_arg = getattr(args, "policy", None)
-    policy_normalized = (policy_arg or "").strip().lower()
-    policy_required = policy_normalized != "none"
-    policy_engine = _load_policy_engine(policy_arg, fail_if_missing=policy_required, stage="embed")
-    row_iter = _load_scan_rows(scan_csv, policy_engine=policy_engine, include_manual=True)
-    rows = _maybe_limit_rows(row_iter, args.limit_files)
-
-    if not rows:
-        raise ValueError("유효한 임베딩 대상 행이 없습니다. 스캔 CSV를 확인해주세요.")
-
-    cfg = _build_train_config(args)
-    out_model = Path(args.model)
-    chunk_cache_path = Path(getattr(args, "chunk_cache", DEFAULT_CHUNK_CACHE))
-    state_path = Path(getattr(args, "state_file", DEFAULT_SCAN_STATE))
-    df, tm = run_step2(
-        rows,
-        out_corpus=corpus_path,
-        out_model=out_model,
-        cfg=cfg,
-        use_tqdm=True,
-        translate=args.translate,
-        scan_state_path=state_path,
-        chunk_cache_path=chunk_cache_path,
-        skip_extract=True,
-        train_embeddings=True,
+    return _cmd_embed_impl(
+        args,
+        default_policy_path=DEFAULT_POLICY_PATH,
+        default_chunk_cache=DEFAULT_CHUNK_CACHE,
+        default_scan_state=DEFAULT_SCAN_STATE,
+        agent=KNOWLEDGE_AGENT,
     )
-    metrics = df.attrs.get("metrics", {}) if hasattr(df, "attrs") else {}
-    incremental = df.attrs.get("incremental", {}) if hasattr(df, "attrs") else {}
-    if metrics:
-        metric_str = ", ".join(f"{k}={v}" for k, v in metrics.items())
-        print(f"📊 임베딩 품질 지표: {metric_str}")
-    print("✅ 임베딩/모델 생성 완료 (기존 corpus 사용)")
-    return {
-        "rows": len(rows),
-        "corpus": str(corpus_path),
-        "model": str(out_model),
-        "metrics": metrics,
-        "incremental": incremental,
-    }
 
 
 def cmd_pipeline(args):
@@ -1215,7 +523,7 @@ def cmd_pipeline(args):
     if not roots and policy_engine and policy_engine.has_policies:
         roots = policy_engine.roots_for_agent(KNOWLEDGE_AGENT, include_manual=True)
     if not roots:
-        raise click.ClickException(
+        raise PolicyViolationError(
             "스마트 폴더 정책이나 스캔 루트가 없어 파이프라인을 중단합니다. "
             "정책 파일을 지정하거나 --policy none 과 함께 --root를 명시하세요."
         )
@@ -1302,301 +610,38 @@ def cmd_pipeline(args):
 
 
 def cmd_index(args):
-    policy_arg = getattr(args, "policy", None)
-    policy_normalized = (policy_arg or "").strip().lower()
-    policy_required = policy_normalized != "none"
-    policy_engine = _load_policy_engine(policy_arg, fail_if_missing=policy_required, stage="index")
-    scope = getattr(args, "scope", "auto")
-
-    limit = max(0, int(getattr(args, "limit_files", 0) or 0))
-    corpus_path = Path(args.corpus)
-    tmp_corpus: Optional[Path] = None
-
-    if limit:
-        _require_pandas()
-        try:
-            df = pd.read_parquet(corpus_path)
-        except Exception as exc:
-            raise click.ClickException(f"코퍼스를 불러오지 못했습니다: {exc}") from exc
-        if len(df) > limit:
-            df = df.iloc[:limit].copy()
-        tmp_dir = Path(args.cache) / "tmp_index"
-        try:
-            tmp_dir.mkdir(parents=True, exist_ok=True)
-        except PermissionError:
-            try:
-                tmp_dir = Path(
-                    tempfile.mkdtemp(prefix="tmp_index_", dir=str(Path(args.cache).parent))
-                )
-            except Exception:
-                tmp_dir = Path(tempfile.mkdtemp(prefix="tmp_index_"))
-        tmp_corpus = tmp_dir / f"corpus_limit_{limit}.parquet"
-        engine = PARQUET_ENGINE or "pyarrow"
-        df.to_parquet(tmp_corpus, engine=engine, index=False)
-        corpus_path = tmp_corpus
-        click.echo(f"⚡ 상위 {limit:,}개 문서로 제한하여 인덱싱합니다. ({corpus_path})")
-
-    cfg = DocumentAgentConfig(
-        model_path=Path(args.model),
-        corpus_path=corpus_path,
-        cache_dir=Path(args.cache),
-        translate=getattr(args, "translate", False),
-        rerank=False,
-        policy_engine=policy_engine,
-        policy_scope=scope,
-        policy_agent=KNOWLEDGE_AGENT,
-        rebuild_index=True,
-    )
-    agent = DocumentAgent(cfg)
-    agent.prepare()
-    cache_usage = _dir_size_bytes(cfg.cache_dir)
-    print(f"✅ 인덱스/캐시 갱신 완료 (cache ~{cache_usage:,} bytes)")
-    return {
-        "cache": str(cfg.cache_dir),
-        "corpus": str(cfg.corpus_path),
-        "cache_usage_bytes": cache_usage,
-    }
+    return _cmd_index_impl(args, default_policy_path=DEFAULT_POLICY_PATH, agent=KNOWLEDGE_AGENT)
 
 
 def cmd_chat(args):
-    """대화형 검색 모드 (LNPChat 사용)"""
-    policy_arg = getattr(args, "policy", None)
-    policy_normalized = (policy_arg or "").strip().lower()
-    policy_required = policy_normalized != "none"
-    policy_engine = _load_policy_engine(policy_arg, fail_if_missing=policy_required, stage="chat")
-    def _env_or_arg(name: str, default: Optional[str] = None) -> Optional[str]:
-        value = getattr(args, name, None)
-        if value:
-            value = str(value).strip()
-            if value:
-                return value
-        env_name = f"LNPCHAT_{name.upper()}"
-        env_value = os.getenv(env_name)
-        if env_value is None:
-            return default
-        env_value = env_value.strip()
-        return env_value or default
-
-    llm_backend = _env_or_arg("llm_backend")
-    llm_model = _env_or_arg("llm_model", default="llama3")
-    llm_host = _env_or_arg("llm_host", default="")
-    auto_trained = _ensure_chat_artifacts(
-        scan_csv=Path(args.scan_csv),
-        corpus=Path(args.corpus),
-        model=Path(args.model),
-        translate=args.translate,
-        auto_train=args.auto_train,
-        policy_engine=policy_engine,
-    )
-
-    document_agent = DocumentAgent(
-        DocumentAgentConfig(
-            model_path=Path(args.model),
-            corpus_path=Path(args.corpus),
-            cache_dir=Path(args.cache),
-            topk=args.topk,
-            translate=args.translate,
-            rerank=args.rerank,
-            rerank_model=args.rerank_model,
-            rerank_depth=args.rerank_depth,
-            rerank_batch_size=args.rerank_batch_size,
-            rerank_device=args.rerank_device or None,
-            rerank_min_score=args.rerank_min_score,
-            lexical_weight=args.lexical_weight,
-            show_translation=args.show_translation,
-            translation_lang=args.translation_lang,
-            min_similarity=args.min_similarity,
-            llm_backend=llm_backend,
-            llm_model=llm_model,
-            llm_host=llm_host,
-            llm_options={},
-            policy_engine=policy_engine if policy_engine and policy_engine.has_policies else policy_engine,
-            policy_scope=(getattr(args, "scope", "auto") or "auto").lower(),
-            policy_agent=KNOWLEDGE_AGENT,
-            rebuild_index=auto_trained,
-        )
-    )
-    meeting_agent = MeetingAgent()
-    photo_agent = PhotoAgent()
-
-    orchestrator = AssistantOrchestrator(
-        [document_agent, meeting_agent, photo_agent],
-        llm_client=document_agent.llm_client,
-    )
-
-    def _print_response(resp: "OrchestratorResponse") -> None:
-        prefix = f"[{resp.agent}] " if resp.agent else ""
-        print(prefix + resp.message)
-        if resp.suggestions:
-            print("\n💡 이런 질문은 어떠세요?")
-            for suggestion in resp.suggestions:
-                print(f"   - {suggestion}")
-
-    def _cli_progress_handler(agent_label: str) -> Callable[[Dict[str, Any]], None]:
-        def _handler(event: Dict[str, Any]) -> None:
-            stage = event.get("stage")
-            status = event.get("status")
-            prefix = f"[{agent_label}]"
-            if status == "running":
-                print(f"{prefix} ▶ {stage} 시작")
-            elif status == "completed":
-                print(f"{prefix} ✅ {stage} 완료")
-            elif status == "failed":
-                error = event.get("error")
-                print(f"{prefix} ❌ {stage} 실패: {error}")
-            elif status == "cancelled":
-                print(f"{prefix} ⛔ {stage} 취소")
-        return _handler
-
-    def _prompt_follow_up(reason: Optional[str], message: str) -> Optional[Dict[str, object]]:
-        print(message)
-        history = _load_agent_history()
-        if reason == "needs_audio":
-            recent = history.get("meeting_audio", [])
-            if recent:
-                print("\n📁 최근 사용한 오디오 파일:")
-                for idx, item in enumerate(recent, start=1):
-                    print(f"  {idx}. {item}")
-            prompt = "회의 요약을 실행하려면 오디오 파일 전체 경로를 입력하거나 번호를 선택하세요> "
-            raw = input(prompt).strip()
-            if not raw:
-                print("⚠️ 경로를 입력하지 않아 요청을 취소했습니다.")
-                return None
-            if raw.isdigit():
-                index = int(raw) - 1
-                if 0 <= index < len(recent):
-                    audio_path = recent[index]
-                else:
-                    print("⚠️ 번호가 유효하지 않아 요청을 취소했습니다.")
-                    return None
-            else:
-                audio_path = raw
-            _remember_agent_history("meeting_audio", [audio_path])
-            return {"audio_path": audio_path, "enable_resume": True}
-        if reason == "needs_roots":
-            recent = history.get("photo_roots", [])
-            if recent:
-                print("\n📸 최근 사용한 사진 폴더:")
-                for idx, item in enumerate(recent, start=1):
-                    print(f"  {idx}. {item}")
-            prompt = "사진 폴더 경로를 입력하거나 번호(여러 개는 콤마)로 선택하세요> "
-            raw = input(prompt).strip()
-            if not raw:
-                print("⚠️ 경로를 입력하지 않아 요청을 취소했습니다.")
-                return None
-            roots: List[str] = []
-            for token in [part.strip() for part in raw.split(",") if part.strip()]:
-                if token.isdigit():
-                    index = int(token) - 1
-                    if 0 <= index < len(recent):
-                        roots.append(recent[index])
-                    else:
-                        print(f"⚠️ 번호 {token}가 유효하지 않아 무시합니다.")
-                else:
-                    roots.append(token)
-            if not roots:
-                print("⚠️ 유효한 경로가 없어 요청을 취소했습니다.")
-                return None
-            _remember_agent_history("photo_roots", roots)
-            return {"roots": roots}
-        extra = input("추가 정보를 입력하세요> ").strip()
-        if not extra:
-            print("⚠️ 추가 정보를 입력하지 않아 요청을 취소했습니다.")
-            return None
-        return {"details": extra}
-
-    def _resolve_follow_up(original_query: str, initial_response: "OrchestratorResponse") -> "OrchestratorResponse":
-        response = initial_response
-        while response.agent == "follow_up":
-            follow_context = _prompt_follow_up(response.reason, response.message)
-            if not follow_context:
-                break
-            if response.reason == "needs_audio":
-                follow_context.setdefault("__progress_callback", _cli_progress_handler("회의 비서"))
-            elif response.reason == "needs_roots":
-                follow_context.setdefault("__progress_callback", _cli_progress_handler("사진 비서"))
-            response = orchestrator.handle(original_query, follow_context)
-        return response
-
-    single_query = getattr(args, "query", None)
-    json_mode = bool(getattr(args, "json", False))
-    if json_mode and not single_query:
-        raise SystemExit("--json 옵션은 --query와 함께 사용해야 합니다.")
-
-    if single_query:
-        response = orchestrator.handle(single_query)
-        if response.agent == "follow_up" and not json_mode:
-            response = _resolve_follow_up(single_query, response)
-        if json_mode:
-            metadata = response.metadata if isinstance(response.metadata, dict) else {}
-            payload = {
-                "query": single_query,
-                "answer": response.message,
-                "agent": response.agent,
-                "reason": response.reason,
-                "metadata": metadata,
-                "suggestions": response.suggestions or [],
-                "results": [],
-            }
-            if response.agent == "follow_up":
-                metadata["follow_up"] = response.reason
-            hits = response.metadata.get("hits", []) if isinstance(response.metadata, dict) else []
-            for hit in hits[: args.topk]:
-                payload["results"].append(
-                    {
-                        "title": Path(str(hit.get("path") or "")).name,
-                        "path": hit.get("path"),
-                        "ext": hit.get("ext"),
-                        "score": hit.get("similarity", hit.get("vector_similarity")),
-                        "vector_score": hit.get("vector_similarity"),
-                        "lexical_score": hit.get("lexical_score"),
-                        "match_reasons": hit.get("match_reasons") or [],
-                        "preview": hit.get("preview"),
-                        "translation": hit.get("translation"),
-                    }
-                )
-            print(json.dumps(payload, ensure_ascii=False))
-        else:
-            _print_response(response)
-        return
-
-    print("\n💬 InfoPilot Chat 모드입니다. 자유롭게 대화하고, 문서 검색이 필요하면 '/search 질문'처럼 입력해 보세요. (종료하려면 'exit' 또는 '종료' 입력)")
-    print("   명령어: /search <질문>, /meeting, /photo")
-    while True:
-        try:
-            query = input("질문> ").strip()
-        except (EOFError, KeyboardInterrupt):
-            print("\n👋 종료합니다.")
-            break
-        if not query:
-            continue
-        if query.lower() in {"exit", "quit", "종료"}:
-            print("👋 종료합니다.")
-            break
-
-        response = orchestrator.handle(query)
-        response = _resolve_follow_up(query, response)
-        _print_response(response)
-        print("-" * 80)
+    return _cmd_chat_impl(args, default_policy_path=DEFAULT_POLICY_PATH, policy_agent=KNOWLEDGE_AGENT)
 
 
 def cmd_watch(args):
     if Observer is None:
-        raise click.ClickException("watchdog 라이브러리가 필요합니다. pip install watchdog")
+        raise PolicyViolationError("watchdog 라이브러리가 필요합니다. pip install watchdog")
 
     encoder, batch_size, model_name = _load_sentence_encoder(Path(args.model))
     if encoder is None:
-        raise RuntimeError("sentence-transformers 모델을 로드할 수 없어 watcher를 실행할 수 없습니다.")
+        raise ModelLoadError("sentence-transformers 모델을 로드할 수 없어 watcher를 실행할 수 없습니다.")
 
     policy_arg = getattr(args, "policy", None)
     policy_normalized = (policy_arg or "").strip().lower()
     policy_required = policy_normalized != "none"
     policy_engine = _load_policy_engine(policy_arg, fail_if_missing=policy_required, stage="watch")
+    policy_path = getattr(policy_engine, "source", None) if policy_engine and policy_engine.has_policies else None
+    policy_box = {"engine": policy_engine}
+
+    def _get_policy_engine() -> Optional[PolicyEngine]:
+        return policy_box.get("engine")
+
+    def _set_policy_engine(updated: Optional[PolicyEngine]) -> None:
+        policy_box["engine"] = updated
     roots = _parse_roots(args.roots)
     if not roots and policy_engine and policy_engine.has_policies:
         roots = policy_engine.roots_for_agent(KNOWLEDGE_AGENT, include_manual=False)
     if not roots:
-        raise click.ClickException(
+        raise PolicyViolationError(
             "스마트 폴더 정책이나 감시 루트가 지정되지 않아 watcher를 시작할 수 없습니다. "
             "정책 파일을 지정하거나 --policy none 과 함께 --root를 명시하세요."
         )
@@ -1623,15 +668,27 @@ def cmd_watch(args):
         else:
             print(f"⚠️ 감시 루트가 존재하지 않아 제외합니다: {root}")
     if not existing_roots:
-        raise click.ClickException("유효한 감시 루트가 없습니다. 경로를 다시 확인하세요.")
+        raise PolicyViolationError("유효한 감시 루트가 없습니다. 경로를 다시 확인하세요.")
     roots = existing_roots
 
     event_queue: "queue.Queue[Tuple[str, str]]" = queue.Queue()
     allowed_exts = {ext.lower() for ext in FileFinder.DEFAULT_EXTS}
-    handler = WatchEventHandler(event_queue, allowed_exts, policy_engine=policy_engine, agent=KNOWLEDGE_AGENT)
+    ignore_paths: Set[str] = set()
+    if policy_path is not None:
+        ignore_paths.add(str(policy_path))
+    handler = _make_watch_handler(
+        event_queue,
+        allowed_exts,
+        policy_engine=policy_engine,
+        policy_engine_provider=_get_policy_engine,
+        ignore_paths=ignore_paths,
+    )
     observer = Observer()
     for root in roots:
         observer.schedule(handler, str(root), recursive=True)
+    if policy_path is not None and policy_path.exists():
+        policy_handler = PolicyEventHandler(event_queue, policy_path, base_handler_cls=FileSystemEventHandler)
+        observer.schedule(policy_handler, str(policy_path.parent), recursive=False)
 
     pipeline_ctx = IncrementalPipeline(
         encoder=encoder,
@@ -1641,6 +698,17 @@ def cmd_watch(args):
         cache_dir=Path(args.cache),
         translate=args.translate,
         policy_engine=policy_engine,
+        policy_engine_provider=_get_policy_engine,
+        policy_reload_callback=_set_policy_engine,
+        policy_path=policy_path,
+        roots=roots,
+        agent=KNOWLEDGE_AGENT,
+    )
+    _enforce_cache_limit(
+        Path(args.cache),
+        policy_engine,
+        hard_limit=getattr(args, "cache_hard_limit", False),
+        clean_on_limit=getattr(args, "cache_clean_on_limit", False),
     )
 
     debounce_sec = max(0.5, args.debounce_ms / 1000.0)
@@ -1741,6 +809,19 @@ def _scan_options(func):
         show_default=True,
         type=click.Path(dir_okay=False, path_type=str),
         help="스캔 결과 CSV 경로.",
+    )(func)
+    func = click.option(
+        "--include-denied/--allowed-only",
+        default=False,
+        show_default=True,
+        help="정책에 의해 차단된 파일도 CSV에 기록할지 여부 (allowed, deny_reason 컬럼 추가).",
+    )(func)
+    func = click.option(
+        "--hash/--no-hash",
+        "include_hash",
+        default=False,
+        show_default=True,
+        help="allowed 파일에 대해 SHA256 해시를 계산해 기록합니다(느릴 수 있음).",
     )(func)
     return func
 
@@ -1913,6 +994,8 @@ def _index_options(func):
         show_default=True,
         help="스마트 폴더 정책 경로 (비활성화하려면 'none').",
     )(func)
+    func = click.option("--cache-hard-limit", is_flag=True, help="캐시 한도 초과 시 중단")(func)
+    func = click.option("--cache-clean-on-limit", is_flag=True, help="캐시 한도 초과 시 캐시 초기화 후 진행")(func)
     func = click.option(
         "--limit-files",
         type=int,
@@ -1941,6 +1024,8 @@ def _chat_options(func):
         show_default=True,
         help="스마트 폴더 정책 경로 (비활성화하려면 'none').",
     )(func)
+    func = click.option("--cache-hard-limit", is_flag=True, help="캐시 한도 초과 시 중단")(func)
+    func = click.option("--cache-clean-on-limit", is_flag=True, help="캐시 한도 초과 시 캐시 초기화 후 진행")(func)
     func = click.option(
         "--scope",
         type=click.Choice(["auto", "policy", "global"]),
@@ -1976,6 +1061,8 @@ def _watch_options(func):
         show_default=True,
         help="스마트 폴더 정책 경로 (비활성화하려면 'none').",
     )(func)
+    func = click.option("--cache-hard-limit", is_flag=True, help="캐시 한도 초과 시 중단")(func)
+    func = click.option("--cache-clean-on-limit", is_flag=True, help="캐시 한도 초과 시 캐시 초기화 후 진행")(func)
     func = click.option("--translate/--no-translate", default=False, show_default=True)(func)
     func = click.option("--debounce-ms", type=int, default=2000, show_default=True)(func)
     func = click.option("--cache", default=str(CACHE_DIR), show_default=True, type=click.Path(path_type=str))(func)
@@ -2040,6 +1127,7 @@ def cli(
     resource_interval: float,
     no_resource_log: bool,
 ) -> None:
+    configure_runtime_logging()
     ctx.ensure_object(dict)
     ctx.obj.update(
         {
@@ -2084,74 +1172,26 @@ def _perform_drift_check(
     semantic_threshold: float,
     log_path: str,
     alert_threshold: float,
+    policy: str,
+    cache_hard_limit: bool,
+    cache_clean_on_limit: bool,
 ):
-    _require_pandas()
-    cache_path = Path(cache_dir)
-    baseline_path = Path(semantic_baseline) if semantic_baseline else None
-    with _command_session(ctx, run_name) as session:
-        report = check_drift(
-            Path(scan_csv),
-            Path(corpus),
-            cache_dir=cache_path,
-            log_path=Path(log_path),
-            alert_threshold=alert_threshold,
-            semantic_baseline=baseline_path,
-            semantic_threshold=semantic_threshold,
-        )
-        if session:
-            session.log_metrics(
-                {
-                    "hash_drift_ratio": report.hash_drift_ratio,
-                    "semantic_shift": report.semantic_shift,
-                    "new_files": float(len(report.new_files)),
-                    "changed_files": float(len(report.changed_files)),
-                    "missing_files": float(len(report.missing_files)),
-                }
-            )
-    return report
-
-
-def _print_drift_report(report, semantic_threshold: float) -> None:
-    click.echo(f"📈 hash drift ratio={report.hash_drift_ratio:.3f} (scan={report.scan_rows}, corpus={report.corpus_rows})")
-    if report.new_files:
-        click.echo(f"➕ 신규 문서 {len(report.new_files)}건 (상위 5개):")
-        for path in report.new_files[:5]:
-            click.echo(f"   + {path}")
-    if report.changed_files:
-        click.echo(f"🌀 변경 감지 {len(report.changed_files)}건 (상위 5개):")
-        for path in report.changed_files[:5]:
-            click.echo(f"   * {path}")
-    if report.missing_files:
-        click.echo(f"➖ 누락 문서 {len(report.missing_files)}건 (상위 5개):")
-        for path in report.missing_files[:5]:
-            click.echo(f"   - {path}")
-    click.echo(
-        f"🎯 semantic shift={report.semantic_shift:.3f} (threshold={semantic_threshold:.2f}, sample={report.semantic_sample_size})"
+    return _perform_drift_check(
+        ctx,
+        run_name=run_name,
+        scan_csv=scan_csv,
+        corpus=corpus,
+        cache_dir=cache_dir,
+        semantic_baseline=semantic_baseline,
+        semantic_threshold=semantic_threshold,
+        log_path=log_path,
+        alert_threshold=alert_threshold,
+        policy=policy,
+        policy_agent=KNOWLEDGE_AGENT,
+        default_policy_path=DEFAULT_POLICY_PATH,
+        cache_hard_limit=cache_hard_limit,
+        cache_clean_on_limit=cache_clean_on_limit,
     )
-    if report.reembed_candidates:
-        click.echo(f"🔁 재임베딩 후보 {len(report.reembed_candidates)}건 (로그에 기록)")
-    if report.recommendations:
-        click.echo(f"✅ 권장 조치: {', '.join(report.recommendations)}")
-
-
-def _auto_reembed_targets(report, *, max_candidates: int, include_changed: bool, include_new: bool) -> Set[str]:
-    ordered: List[str] = []
-    ordered.extend(report.reembed_candidates or [])
-    if include_changed:
-        ordered.extend(report.changed_files or [])
-    if include_new:
-        ordered.extend(report.new_files or [])
-    deduped: List[str] = []
-    seen: Set[str] = set()
-    for path in ordered:
-        path = str(path or "")
-        if not path or path in seen:
-            continue
-        deduped.append(path)
-        seen.add(path)
-        if max_candidates and len(deduped) >= max_candidates:
-            break
-    return set(deduped)
 
 
 def _run_reembed_pipeline(
@@ -2165,10 +1205,12 @@ def _run_reembed_pipeline(
     translate: bool,
     policy: str,
     run_name: str,
+    cache_hard_limit: bool = False,
+    cache_clean_on_limit: bool = False,
 ) -> None:
     encoder, batch_size, model_name = _load_sentence_encoder(Path(model))
     if encoder is None:
-        raise click.ClickException("SentenceTransformer 모델 로드 실패로 재임베딩을 진행할 수 없습니다.")
+        raise ModelLoadError("SentenceTransformer 모델 로드 실패로 재임베딩을 진행할 수 없습니다.")
     policy_normalized = (policy or "").strip().lower()
     policy_required = policy_normalized != "none"
     policy_engine = _load_policy_engine(policy, fail_if_missing=policy_required, stage="reembed")
@@ -2181,10 +1223,25 @@ def _run_reembed_pipeline(
         translate=translate,
         policy_engine=policy_engine,
     )
+    cache_action = _enforce_cache_limit(
+        Path(cache),
+        policy_engine,
+        hard_limit=cache_hard_limit,
+        clean_on_limit=cache_clean_on_limit,
+    )
     with _command_session(ctx, run_name) as session:
         pipeline_ctx.process(set(paths), set())
         if session:
             session.log_metrics({"reembedded": float(len(paths))})
+            session.set_tags(
+                {
+                    "policy": str(policy),
+                    "cache_hard_limit": str(cache_hard_limit),
+                    "cache_clean_on_limit": str(cache_clean_on_limit),
+                    "cache_action": cache_action or "",
+                    "policy_source": str(getattr(policy_engine, "source", "")) if policy_engine else "",
+                }
+            )
     click.echo(f"🔁 재임베딩 완료 ({len(paths)}건)")
     try:
         _get_sentence_encoder_manager().release(model_name)
@@ -2215,18 +1272,18 @@ def embed_chunk_command(
     async_embed: bool,
 ) -> None:
     if SentenceTransformer is None:
-        raise click.ClickException("sentence-transformers 패키지가 필요합니다. pip install sentence-transformers")
+        raise PolicyViolationError("sentence-transformers 패키지가 필요합니다. pip install sentence-transformers")
     try:
         import numpy as np
     except Exception:
-        raise click.ClickException("numpy 패키지가 필요합니다. pip install numpy")
+        raise PolicyViolationError("numpy 패키지가 필요합니다. pip install numpy")
 
     try:
         payload = json.loads(Path(input_path).read_text(encoding="utf-8"))
     except Exception as exc:
-        raise click.ClickException(f"입력 JSON 로드 실패: {exc}")
+        raise PolicyViolationError(f"입력 JSON 로드 실패: {exc}")
     if not isinstance(payload, list):
-        raise click.ClickException("입력 파일은 텍스트 리스트(JSON 배열)여야 합니다.")
+        raise PolicyViolationError("입력 파일은 텍스트 리스트(JSON 배열)여야 합니다.")
     texts = [str(item or "") for item in payload]
 
     cfg = TrainConfig(
@@ -2249,9 +1306,24 @@ def embed_chunk_command(
 @click.command("scan")
 @_scan_options
 @click.pass_context
-def scan_command(ctx: click.Context, out: str, roots: Tuple[str, ...], exts: Tuple[str, ...], policy: str) -> None:
+def scan_command(
+    ctx: click.Context,
+    out: str,
+    roots: Tuple[str, ...],
+    exts: Tuple[str, ...],
+    policy: str,
+    include_denied: bool,
+    include_hash: bool,
+) -> None:
     _require_pandas()
-    args = SimpleNamespace(out=out, roots=list(roots) if roots else None, policy=policy, exts=list(exts) if exts else None)
+    args = SimpleNamespace(
+        out=out,
+        roots=list(roots) if roots else None,
+        policy=policy,
+        exts=list(exts) if exts else None,
+        include_denied=include_denied,
+        include_hash=include_hash,
+    )
     with _command_session(ctx, "scan") as session:
         count = cmd_scan(args) or 0
         if session:
@@ -2564,6 +1636,8 @@ def pipeline_command(
 
 @click.command("index")
 @_index_options
+@click.option("--cache-hard-limit", is_flag=True, help="캐시 한도 초과 시 중단")
+@click.option("--cache-clean-on-limit", is_flag=True, help="캐시 한도 초과 시 캐시 초기화 후 진행")
 @click.pass_context
 def index_command(
     ctx: click.Context,
@@ -2574,6 +1648,8 @@ def index_command(
     scope: str,
     policy: str,
     limit_files: int,
+    cache_hard_limit: bool,
+    cache_clean_on_limit: bool,
 ) -> None:
     _require_pandas()
     args = SimpleNamespace(
@@ -2659,6 +1735,8 @@ def watch_command(
     debounce_ms: int,
     translate: bool,
     policy: str,
+    cache_hard_limit: bool,
+    cache_clean_on_limit: bool,
 ) -> None:
     args = SimpleNamespace(
         roots=list(roots) if roots else None,
@@ -2669,6 +1747,8 @@ def watch_command(
         debounce_ms=debounce_ms,
         translate=translate,
         policy=policy,
+        cache_hard_limit=cache_hard_limit,
+        cache_clean_on_limit=cache_clean_on_limit,
     )
     with _command_session(ctx, "watch"):
         cmd_watch(args)
@@ -2816,17 +1896,19 @@ def model_quantize(model_name: str, output: str, seq_length: int, opset: int, in
     click.echo(f"✅ ONNX {mode} 저장 완료 ({size_mb:.1f} MB) → {result.output}")
 
 
-def _drift_log_candidates(log_path: Path, limit: int = 64) -> List[str]:
+def _drift_log_candidates(log_path: Path, limit: int = 64) -> Tuple[List[str], Set[str], Set[str]]:
     if limit <= 0 or not log_path.exists():
-        return []
+        return [], set(), set()
     try:
         with log_path.open("r", encoding="utf-8") as f:
             lines = f.readlines()
     except OSError:
-        return []
+        return [], set(), set()
 
     seen: Set[str] = set()
     picked: List[str] = []
+    policy_ids: Set[str] = set()
+    cache_actions: Set[str] = set()
     for raw in reversed(lines):
         entry = raw.strip()
         if not entry:
@@ -2835,6 +1917,12 @@ def _drift_log_candidates(log_path: Path, limit: int = 64) -> List[str]:
             payload = json.loads(entry)
         except json.JSONDecodeError:
             continue
+        policy_id = payload.get("policy_id")
+        if isinstance(policy_id, str) and policy_id:
+            policy_ids.add(policy_id)
+        cache_action = payload.get("cache_action")
+        if isinstance(cache_action, str) and cache_action:
+            cache_actions.add(cache_action)
         for key in ("reembed_candidates", "changed_files", "new_files"):
             for path in payload.get(key, []) or []:
                 normalized = str(path).strip()
@@ -2843,11 +1931,11 @@ def _drift_log_candidates(log_path: Path, limit: int = 64) -> List[str]:
                 seen.add(normalized)
                 picked.append(normalized)
                 if len(picked) >= limit:
-                    return picked
+                    return picked, policy_ids, cache_actions
         if picked:
             # Stop after the most recent entry that yielded candidates.
-            return picked
-    return picked
+            return picked, policy_ids, cache_actions
+    return picked, policy_ids, cache_actions
 
 
 @drift_group.command("check")
@@ -2858,6 +1946,9 @@ def _drift_log_candidates(log_path: Path, limit: int = 64) -> List[str]:
 @click.option("--semantic-threshold", type=float, default=0.15, show_default=True, help="semantic drift 임계값 (cosine)")
 @click.option("--log-path", default=str(DEFAULT_DRIFT_LOG), show_default=True, type=click.Path(path_type=str))
 @click.option("--alert-threshold", type=float, default=0.1, show_default=True, help="hash drift 비율 알림 임계값")
+@click.option("--policy", default=str(DEFAULT_POLICY_PATH), show_default=True, help="스마트 폴더 정책 파일")
+@click.option("--cache-hard-limit", is_flag=True, help="캐시 한도 초과 시 중단")
+@click.option("--cache-clean-on-limit", is_flag=True, help="캐시 한도 초과 시 캐시 초기화 후 진행")
 @click.pass_context
 def drift_check(
     ctx: click.Context,
@@ -2868,6 +1959,9 @@ def drift_check(
     semantic_threshold: float,
     log_path: str,
     alert_threshold: float,
+    policy: str,
+    cache_hard_limit: bool,
+    cache_clean_on_limit: bool,
 ) -> None:
     report = _perform_drift_check(
         ctx,
@@ -2879,6 +1973,9 @@ def drift_check(
         semantic_threshold=semantic_threshold,
         log_path=log_path,
         alert_threshold=alert_threshold,
+        policy=policy,
+        cache_hard_limit=cache_hard_limit,
+        cache_clean_on_limit=cache_clean_on_limit,
     )
     _print_drift_report(report, semantic_threshold)
 
@@ -2906,6 +2003,8 @@ def drift_check(
 @click.option("--model", default=str(TOPIC_MODEL_PATH), show_default=True, type=click.Path(path_type=str))
 @click.option("--translate/--no-translate", default=False, show_default=True)
 @click.option("--policy", default=str(DEFAULT_POLICY_PATH), show_default=True)
+@click.option("--cache-hard-limit", is_flag=True, help="캐시 한도 초과 시 중단")
+@click.option("--cache-clean-on-limit", is_flag=True, help="캐시 한도 초과 시 캐시 초기화 후 진행")
 @click.pass_context
 def drift_reembed(
     ctx: click.Context,
@@ -2920,6 +2019,8 @@ def drift_reembed(
     model: str,
     translate: bool,
     policy: str,
+    cache_hard_limit: bool,
+    cache_clean_on_limit: bool,
 ) -> None:
     _require_pandas()
     candidate_paths: Set[str] = set(paths or [])
@@ -2927,9 +2028,15 @@ def drift_reembed(
         file_lines = Path(paths_file).read_text(encoding="utf-8").splitlines()
         candidate_paths.update(line.strip() for line in file_lines if line.strip())
     if use_drift_log:
-        auto_paths = _drift_log_candidates(Path(drift_log_path), limit=max_candidates)
+        auto_paths, policies, cache_actions = _drift_log_candidates(Path(drift_log_path), limit=max_candidates)
         if auto_paths:
-            click.echo(f"📥 드리프트 로그에서 {len(auto_paths)}건 자동 수집")
+            meta = []
+            if policies:
+                meta.append(f"policy={','.join(sorted(policies))}")
+            if cache_actions:
+                meta.append(f"cache_action={','.join(sorted(cache_actions))}")
+            meta_str = f" ({'; '.join(meta)})" if meta else ""
+            click.echo(f"📥 드리프트 로그에서 {len(auto_paths)}건 자동 수집{meta_str}")
             candidate_paths.update(auto_paths)
         else:
             click.echo("⚠️ 드리프트 로그에서 자동으로 선택할 문서를 찾지 못했습니다.")
@@ -2945,6 +2052,8 @@ def drift_reembed(
         translate=translate,
         policy=policy,
         run_name="drift-reembed",
+        cache_hard_limit=cache_hard_limit,
+        cache_clean_on_limit=cache_clean_on_limit,
     )
 
 
@@ -2962,6 +2071,10 @@ def drift_reembed(
 @click.option("--max-reembed", type=int, default=32, show_default=True, help="자동 재임베딩 상한")
 @click.option("--include-changed/--skip-changed", default=True, show_default=True)
 @click.option("--include-new/--skip-new", default=False, show_default=True)
+@click.option("--dry-run", is_flag=True, help="재임베딩을 실행하지 않고 대상만 출력")
+@click.option("--yes", is_flag=True, help="확인 프롬프트 없이 재임베딩 실행")
+@click.option("--cache-hard-limit", is_flag=True, help="캐시 한도 초과 시 중단")
+@click.option("--cache-clean-on-limit", is_flag=True, help="캐시 한도 초과 시 캐시 초기화 후 진행")
 @click.pass_context
 def drift_auto(
     ctx: click.Context,
@@ -2978,6 +2091,10 @@ def drift_auto(
     max_reembed: int,
     include_changed: bool,
     include_new: bool,
+    dry_run: bool,
+    yes: bool,
+    cache_hard_limit: bool,
+    cache_clean_on_limit: bool,
 ) -> None:
     report = _perform_drift_check(
         ctx,
@@ -2989,6 +2106,9 @@ def drift_auto(
         semantic_threshold=semantic_threshold,
         log_path=log_path,
         alert_threshold=alert_threshold,
+        policy=policy,
+        cache_hard_limit=cache_hard_limit,
+        cache_clean_on_limit=cache_clean_on_limit,
     )
     _print_drift_report(report, semantic_threshold)
 
@@ -2998,11 +2118,30 @@ def drift_auto(
         include_changed=include_changed,
         include_new=include_new,
     )
+    if report.reembed_candidates and cache_clean_on_limit:
+        click.echo("♻️ cache clean on limit enabled; cache will reset if over limit before reembed.")
     if not targets:
         click.echo("✨ 자동 재임베딩 대상이 없어 종료합니다.")
         return
 
-    click.echo(f"🔁 자동 재임베딩 대상 {len(targets)}건 처리 중…")
+    target_list = sorted(targets)
+    click.echo(f"🔁 자동 재임베딩 대상 {len(target_list)}건 (상위 10개):")
+    for item in target_list[:10]:
+        click.echo(f"   - {item}")
+    if dry_run:
+        click.echo("✅ dry-run 모드: 재임베딩을 실행하지 않습니다.")
+        return
+    if not yes:
+        if not click.confirm(f"위 {len(target_list)}건을 재임베딩할까요?", default=False):
+            click.echo("⛔ 취소했습니다.")
+            return
+
+    policy_engine = _load_policy_engine(policy, fail_if_missing=False, stage="drift")
+    policy_source = str(getattr(policy_engine, "source", "")) if policy_engine else ""
+    click.echo(
+        f"🔁 자동 재임베딩 대상 {len(targets)}건 처리 중… "
+        f"(policy={policy_source or 'n/a'}, cache_clean={cache_clean_on_limit}, cache_hard={cache_hard_limit})"
+    )
     _run_reembed_pipeline(
         ctx,
         targets,
@@ -3013,6 +2152,8 @@ def drift_auto(
         translate=translate,
         policy=policy,
         run_name="drift-auto-reembed",
+        cache_hard_limit=cache_hard_limit,
+        cache_clean_on_limit=cache_clean_on_limit,
     )
 
 

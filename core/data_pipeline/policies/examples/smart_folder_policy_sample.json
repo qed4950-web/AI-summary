@@ -13,6 +13,15 @@
     "mode": "scheduled",
     "cron": "0 3 * * *"
   },
+  "sensitive_paths": [
+    "D:/주연테크/사업기획부/HR",
+    "D:/주연테크/사업기획부/기밀"
+  ],
+  "cache": {
+    "max_bytes": 2147483648,
+    "purge_days": 14,
+    "policy_id": "sample"
+  },
   "retention": {
     "summary_days": 180,
     "preview_cache": false

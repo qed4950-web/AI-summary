@@ -26,9 +26,12 @@ class FileMeta:
     size: int = 0
     mtime: float = 0.0
     doc_hash: str = ""
+    file_hash: str = ""
 
     def signature(self) -> str:
         """Return a lightweight hash that can be compared across runs."""
+        if self.file_hash:
+            return self.file_hash
         if self.size > 0 or self.mtime > 0.0:
             return f"{self.size}:{int(round(self.mtime))}"
         return self.doc_hash or ""
@@ -77,6 +80,9 @@ def _load_scan_meta(scan_csv: Path) -> Dict[str, FileMeta]:
     with scan_csv.open("r", encoding="utf-8", newline="") as f:
         reader = csv.DictReader(f)
         for row in reader:
+            allowed = str(row.get("allowed") or "").strip().lower()
+            if allowed in {"0", "false", "no"}:
+                continue
             path = str(row.get("path") or "").strip()
             if not path:
                 continue
@@ -85,6 +91,7 @@ def _load_scan_meta(scan_csv: Path) -> Dict[str, FileMeta]:
                 size=_safe_int(row.get("size")),
                 mtime=_safe_float(row.get("mtime")),
                 doc_hash="",
+                file_hash=str(row.get("hash") or row.get("file_hash") or "").strip(),
             )
     return meta
 
@@ -94,7 +101,7 @@ def _load_corpus_meta(corpus_path: Path) -> Dict[str, FileMeta]:
         return {}
     try:
         try:
-            df = pd.read_parquet(corpus_path, columns=["path", "size", "mtime", "doc_hash"])
+            df = pd.read_parquet(corpus_path, columns=["path", "size", "mtime", "doc_hash", "file_hash"])
         except Exception:
             df = pd.read_parquet(corpus_path)
     except Exception:
@@ -106,6 +113,7 @@ def _load_corpus_meta(corpus_path: Path) -> Dict[str, FileMeta]:
     has_size = "size" in columns
     has_mtime = "mtime" in columns
     has_hash = "doc_hash" in columns
+    has_file_hash = "file_hash" in columns
 
     meta: Dict[str, FileMeta] = {}
     for idx in range(len(df)):
@@ -117,6 +125,7 @@ def _load_corpus_meta(corpus_path: Path) -> Dict[str, FileMeta]:
             size=_safe_int(df["size"].iloc[idx]) if has_size else 0,
             mtime=_safe_float(df["mtime"].iloc[idx]) if has_mtime else 0.0,
             doc_hash=str(df["doc_hash"].iloc[idx] or "") if has_hash else "",
+            file_hash=str(df["file_hash"].iloc[idx] or "") if has_file_hash else "",
         )
     return meta
 
@@ -208,6 +217,11 @@ def check_drift(
     semantic_baseline: Optional[Path] = None,
     semantic_threshold: float = 0.15,
     semantic_sample: int = 2048,
+    policy_engine=None,
+    policy_agent: str = "",
+    log_policy_metadata: bool = False,
+    cache_action: Optional[str] = None,
+    policy_id: Optional[str] = None,
 ) -> DriftReport:
     """Compare scan CSV vs corpus metadata and compute semantic shift."""
 
@@ -264,7 +278,13 @@ def check_drift(
     if log_path:
         log_path.parent.mkdir(parents=True, exist_ok=True)
         with log_path.open("a", encoding="utf-8") as f:
-            f.write(report.to_json())
+            entry = json.loads(report.to_json())
+            if log_policy_metadata:
+                entry["policy_id"] = policy_id
+                entry["policy_source"] = getattr(policy_engine, "source", None) if policy_engine else None
+                entry["policy_agent"] = policy_agent
+                entry["cache_action"] = cache_action
+            f.write(json.dumps(entry, ensure_ascii=False))
             f.write("\n")
 
     return report

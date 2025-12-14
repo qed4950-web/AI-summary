@@ -23,7 +23,7 @@
 2. **데이터 파이프라인**
    ```bash
    # 전체 파이프라인 한 번에 (증분 상태/해시 캐시 포함)
-   python infopilot.py pipeline all \
+   python3 infopilot.py pipeline all \
      --out data/found_files.csv \
      --corpus data/corpus.parquet \
      --model data/topic_model.joblib \
@@ -32,33 +32,33 @@
      --chunk-cache data/cache/chunk_cache.json
 
    # 필요 시 개별 단계
-   python infopilot.py run scan --out data/found_files.csv
-   python infopilot.py run train --scan_csv data/found_files.csv --state-file data/scan_state.json --chunk-cache data/cache/chunk_cache.json
-   python infopilot.py run chat --model data/topic_model.joblib --corpus data/corpus.parquet --cache data/cache --lexical-weight 0.35
-   python infopilot.py run watch --corpus data/corpus.parquet --model data/topic_model.joblib --cache data/cache
+   python3 infopilot.py run scan --out data/found_files.csv
+   python3 infopilot.py run train --scan_csv data/found_files.csv --state-file data/scan_state.json --chunk-cache data/cache/chunk_cache.json
+   python3 infopilot.py run chat --model data/topic_model.joblib --corpus data/corpus.parquet --cache data/cache --lexical-weight 0.35
+   python3 infopilot.py run watch --corpus data/corpus.parquet --model data/topic_model.joblib --cache data/cache
    ```
 
    로그/품질 점검용 보조 커맨드도 자주 사용합니다.
 
    ```bash
-   python infopilot.py logs show
-   python infopilot.py drift check --scan-csv data/found_files.csv --corpus data/corpus.parquet
-   python infopilot.py model quantize --model sentence-transformers/all-MiniLM-L6-v2 --output models/sbert.onnx
+   python3 infopilot.py logs show
+   python3 infopilot.py drift check --scan-csv data/found_files.csv --corpus data/corpus.parquet
+   python3 infopilot.py model quantize --model sentence-transformers/all-MiniLM-L6-v2 --output models/sbert.onnx
    ```
 3. **데스크톱 UI**
    ```bash
-   python scripts/launch_desktop.py
+   python3 scripts/launch_desktop.py
    # 또는 직접 실행
-   python ui/app.py
+   python3 ui/app.py
    ```
 
 4. **오케스트레이션 (선택 사항)**
    ```bash
    # Prefect Flow로 전체 파이프라인 실행
-   python scripts/prefect_dag.py --root ~/Documents --use-prefect
+   python3 scripts/prefect_dag.py --root ~/Documents --use-prefect
 
    # FastAPI 서버로 REST 제어
-   python scripts/api_server.py
+   python3 scripts/api_server.py
    # POST /pipeline/run  → 파이프라인 시작
    # GET  /pipeline/status → 진행 상황 조회
    # POST /pipeline/cancel → 중단
@@ -78,7 +78,7 @@
 1. 정책 파일을 편집합니다.
 2. 정책을 반영해 파이프라인을 실행합니다.
    ```bash
-   python infopilot.py pipeline all \
+   python3 infopilot.py pipeline all \
      --out data/found_files.csv \
      --policy core/config/smart_folders.json \
      --corpus data/corpus.parquet \
@@ -86,7 +86,7 @@
    ```
 3. 정책 범위를 강제하고 싶다면 대화 시 `--scope policy`를 사용합니다.
    ```bash
-   python infopilot.py run chat \
+   python3 infopilot.py run chat \
      --policy core/config/smart_folders.json \
      --scope policy \
      --model data/topic_model.joblib \
@@ -95,7 +95,7 @@
    ```
 4. 정책 기반 예약 실행
    ```bash
-   python infopilot.py schedule \
+   python3 infopilot.py schedule \
      --policy core/config/smart_folders.json \
      --agent knowledge_search \
      --output-root data/scheduled_runs
@@ -107,7 +107,7 @@
 
 ### 학습된 문서로 자연어 대화
 ```bash
-python infopilot.py run chat \
+python3 infopilot.py run chat \
   --model data/topic_model.joblib \
   --corpus data/corpus.parquet \
   --cache data/cache
@@ -115,7 +115,7 @@ python infopilot.py run chat \
 
 ### 단일 질의 + JSON 응답
 ```bash
-python infopilot.py run chat \
+python3 infopilot.py run chat \
   --query "보안 가이드 요약해 줘" \
   --json \
   --model data/topic_model.joblib \
@@ -125,7 +125,7 @@ python infopilot.py run chat \
 
 ### 로컬 LLM 연결 확인
 ```bash
-python scripts/check_local_llm.py --backend ollama --model llama3
+python3 scripts/check_local_llm.py --backend ollama --model llama3
 ```
 환경 변수 설정 예시는 `docs/guides/local_llm.md` 참고.
 
@@ -141,15 +141,17 @@ python scripts/check_local_llm.py --backend ollama --model llama3
 
 ### 회의 비서 (STT → 요약)
 ```bash
-python scripts/run_meeting_agent.py \
+python3 scripts/run_meeting_agent.py \
+  --folder-path "/Users/me/AI Summary/녹음" \
+  --policy-path core/config/smart_folders.json \
   --audio path/to/meeting.m4a \
-  --output-dir data/ami_outputs/meeting_001 \
-  --language ko
+  --output-dir data/meetings/output_001 \
+  --output-json
 ```
 
 ### 사진 비서 (태깅·중복 정리)
 ```bash
-python scripts/run_knowledge_agent.py \
+python3 scripts/run_knowledge_agent.py \
   --roots "/Users/me/Pictures" \
   --output-dir data/photo_outputs
 ```
@@ -160,10 +162,10 @@ python scripts/run_knowledge_agent.py \
 
 ## 부록: 테스트 및 릴리스 전 점검
 
-- 벤치마크: `python -m scripts.benchmarks.ann_benchmark ...`
-- 정확도 평가: `python -m scripts.benchmarks.accuracy_eval ...`
+- 벤치마크: `python3 -m scripts.benchmarks.ann_benchmark ...`
+- 정확도 평가: `python3 -m scripts.benchmarks.accuracy_eval ...`
 - 릴리스 가이드: `docs/process/release.md`
 - 문서 비서 설계/운영: `docs/agents/document/README.md`
 - 회의 비서 설계/운영: `docs/agents/meeting/README.md`
 - 사진 비서 설계/운영: `docs/agents/photo/README.md`
-- KPI 스냅샷: `python scripts/util/release_prepare.py --print`
+- KPI 스냅샷: `python3 scripts/util/release_prepare.py --print`

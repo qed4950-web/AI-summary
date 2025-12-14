@@ -792,7 +792,8 @@ def test_pii_masking_enabled(monkeypatch, tmp_path: Path) -> None:
     audio.write_bytes(b"audio")
     transcript = tmp_path / "meeting.wav.txt"
     transcript.write_text(
-        "연락처는 contact@example.com 이고 전화번호는 +82 10-1234-5678 입니다.",
+        "연락처는 contact@example.com 이고 전화번호는 +82 10-1234-5678 입니다. "
+        "주민번호는 901010-1234567 이고 주소는 서울특별시 강남구 역삼동 테헤란로 123-4 입니다.",
         encoding="utf-8",
     )
 
@@ -802,9 +803,14 @@ def test_pii_masking_enabled(monkeypatch, tmp_path: Path) -> None:
 
     assert "[REDACTED_EMAIL]" in summary.raw_summary
     assert "[REDACTED_PHONE]" in summary.raw_summary
+    assert "[REDACTED_RRN]" in summary.raw_summary
+    assert "[REDACTED_ADDRESS]" in summary.raw_summary
     masked_transcript = (tmp_path / "transcript.txt").read_text(encoding="utf-8")
     assert "contact@example.com" not in masked_transcript
     assert "[REDACTED_PHONE]" in masked_transcript
+    assert "901010-1234567" not in masked_transcript
+    assert "[REDACTED_RRN]" in masked_transcript
+    assert "[REDACTED_ADDRESS]" in masked_transcript
 
     metadata = json.loads((tmp_path / "metadata.json").read_text(encoding="utf-8"))
     assert metadata.get("pii_masked") is True

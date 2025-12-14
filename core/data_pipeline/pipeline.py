@@ -396,6 +396,93 @@ def _token_chunk_spans(text: str, *, min_tokens: int, max_tokens: int) -> List[T
     return spans
 
 
+def _token_chunk_spans_with_overlap(
+    text: str,
+    *,
+    min_tokens: int,
+    max_tokens: int,
+    overlap_tokens: int,
+) -> List[Tuple[int, int, int]]:
+    min_tokens = max(1, int(min_tokens))
+    max_tokens = max(min_tokens, int(max_tokens))
+    overlap = max(0, int(overlap_tokens))
+
+    matches = list(_TOKEN_REGEX.finditer(text))
+    if not matches:
+        cleaned = (text or "").strip()
+        return [(0, len(text), 0)] if cleaned else []
+
+    total_tokens = len(matches)
+    if total_tokens <= max_tokens:
+        return [(0, len(text), total_tokens)]
+
+    spans: List[Tuple[int, int, int]] = []
+    start_index = 0
+    text_len = len(text)
+    while start_index < total_tokens:
+        end_index = min(start_index + max_tokens, total_tokens)
+        remaining = total_tokens - end_index
+        if remaining and remaining < min_tokens:
+            end_index = total_tokens
+
+        start_char = matches[start_index].start()
+        end_char = matches[end_index - 1].end() if end_index > start_index else min(text_len, start_char)
+        chunk = text[start_char:end_char].strip()
+        if chunk:
+            spans.append((start_char, end_char, end_index - start_index))
+
+        if end_index >= total_tokens:
+            break
+        next_start = end_index - overlap if overlap else end_index
+        if next_start <= start_index:
+            next_start = end_index
+        start_index = next_start
+
+    if spans and spans[-1][1] < text_len:
+        start, _, tokens = spans[-1]
+        spans[-1] = (start, text_len, tokens)
+
+    return spans
+
+
+_MD_HEADING_RE = re.compile(r"(?m)^(#{1,6})\s+(.+?)\s*$")
+_MD_NUMBERED_HEADING_RE = re.compile(r"(?m)^\s*(\d+(?:\.\d+)*[\).])\s+(.+?)\s*$")
+
+
+def _iter_markdown_sections(text: str) -> List[Tuple[int, int, str]]:
+    """Return (start_char, end_char, heading_title) for markdown-ish sections."""
+    if not text:
+        return []
+    headings: List[Tuple[int, str]] = []
+    for match in _MD_HEADING_RE.finditer(text):
+        title = (match.group(2) or "").strip()
+        headings.append((match.start(), title))
+    for match in _MD_NUMBERED_HEADING_RE.finditer(text):
+        title = (match.group(2) or "").strip()
+        headings.append((match.start(), title))
+    if not headings:
+        return [(0, len(text), "")]
+
+    headings.sort(key=lambda item: item[0])
+    sections: List[Tuple[int, int, str]] = []
+    for idx, (start, title) in enumerate(headings):
+        end = headings[idx + 1][0] if idx + 1 < len(headings) else len(text)
+        sections.append((start, end, title))
+    if sections and sections[0][0] > 0:
+        sections.insert(0, (0, sections[0][0], ""))
+    return [(s, e, t) for (s, e, t) in sections if s < e]
+
+
+def _is_markdown_record(record: Dict[str, Any]) -> bool:
+    ext = str(record.get("ext") or "").lower()
+    if ext == ".md":
+        return True
+    meta = record.get("meta")
+    if isinstance(meta, dict) and str(meta.get("format") or "").lower() == "markdown":
+        return True
+    return False
+
+
 def _adaptive_chunk_window(text: str, base_min: int, base_max: int) -> Tuple[int, int]:
     base_min = max(16, int(base_min))
     base_max = max(base_min + 16, int(base_max))
@@ -426,6 +513,7 @@ def _apply_uniform_chunks(
     *,
     min_tokens: int = DEFAULT_CHUNK_MIN_TOKENS,
     max_tokens: int = DEFAULT_CHUNK_MAX_TOKENS,
+    overlap_tokens: int = 0,
 ) -> "pd.DataFrame":
     if pd is None or df is None or df.empty or "text" not in df.columns:
         return df
@@ -436,7 +524,26 @@ def _apply_uniform_chunks(
     for record in records:
         base_text = str(record.get("text") or "")
         adaptive_min, adaptive_max = _adaptive_chunk_window(base_text, min_tokens, max_tokens)
-        spans = _token_chunk_spans(base_text, min_tokens=adaptive_min, max_tokens=adaptive_max)
+        original_text = record.get("text_original") or ""
+        base_len = len(base_text)
+
+        spans: List[Tuple[int, int, int]] = []
+        headings: List[str] = []
+        if _is_markdown_record(record):
+            overlap = max(0, int(overlap_tokens or 30))
+            for section_start, section_end, heading in _iter_markdown_sections(base_text):
+                section_text = base_text[section_start:section_end]
+                for start_char, end_char, token_count in _token_chunk_spans_with_overlap(
+                    section_text,
+                    min_tokens=adaptive_min,
+                    max_tokens=adaptive_max,
+                    overlap_tokens=overlap,
+                ):
+                    spans.append((section_start + start_char, section_start + end_char, token_count))
+                    headings.append(heading)
+        else:
+            spans = _token_chunk_spans(base_text, min_tokens=adaptive_min, max_tokens=adaptive_max)
+            headings = ["" for _ in spans]
         if not spans:
             new_rec = dict(record)
             new_rec["chunk_id"] = 1
@@ -452,8 +559,6 @@ def _apply_uniform_chunks(
             continue
 
         chunk_count = max(1, len(spans))
-        base_len = len(base_text)
-        original_text = record.get("text_original") or ""
 
         for idx, (start_char, end_char, token_count) in enumerate(spans, start=1):
             chunk_slice = base_text[start_char:end_char].strip()
@@ -466,6 +571,8 @@ def _apply_uniform_chunks(
             new_rec["chunk_count"] = chunk_count
             new_rec["chunk_tokens"] = token_count
             new_rec["text"] = filtered_chunk
+            if headings and idx - 1 < len(headings) and headings[idx - 1]:
+                new_rec["heading"] = headings[idx - 1]
 
             if isinstance(original_text, str) and original_text:
                 orig_chunk = _slice_text_by_ratio(original_text, start_char, end_char, base_len)
@@ -1194,6 +1301,7 @@ class ExtractRecord:
     ctime: Optional[float] = None
     owner: Optional[str] = None
     doc_hash: str = ""
+    file_hash: str = ""
 
 class CorpusBuilder:
     MAX_TRANSLATE_CHARS = 4000
@@ -1289,6 +1397,8 @@ class CorpusBuilder:
     def _extract_one(self, row: Dict[str, Any]) -> ExtractRecord:
         path = Path(row["path"])
         ext = path.suffix.lower()
+        file_hash = str(row.get("hash") or row.get("file_hash") or "").strip()
+        mask_pii = bool(row.get("policy_mask_pii") or row.get("mask_pii"))
         ex = EXT_MAP.get(ext)
         if not ex:
             return ExtractRecord(
@@ -1302,15 +1412,25 @@ class CorpusBuilder:
                 row.get("mtime"),
                 row.get("ctime"),
                 row.get("owner"),
+                "",
+                file_hash,
             )
         try:
             out = ex.extract(path)
-            original_text = (out.get("text", "") or "")[:self.max_text_chars]
+            raw_text = (out.get("text", "") or "")[:self.max_text_chars]
+            doc_hash = _hash_text(raw_text)
+
+            if mask_pii and raw_text.strip():
+                # Reuse meeting pipeline masking rules for privacy-preserving corpora.
+                from core.agents.meeting.pii import mask_text as _mask_text
+
+                original_text = _mask_text(raw_text)
+            else:
+                original_text = raw_text
 
             text_for_model = original_text
             if self.translator and original_text.strip():
                 text_for_model = self._translate_text(original_text, context=path.name)
-            doc_hash = _hash_text(original_text)
 
             return ExtractRecord(
                 str(path),
@@ -1324,6 +1444,7 @@ class CorpusBuilder:
                 row.get("ctime"),
                 row.get("owner"),
                 doc_hash,
+                file_hash,
             )
         except Exception as e:
             return ExtractRecord(
@@ -1338,6 +1459,7 @@ class CorpusBuilder:
                 row.get("ctime"),
                 row.get("owner"),
                 "",
+                file_hash,
             )
 
     def _translate_text(self, text: str, *, context: str) -> str:

@@ -16,6 +16,7 @@ import importlib
 import calendar
 import hashlib
 import copy
+import tempfile
 from collections import deque, OrderedDict
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -2260,45 +2261,73 @@ class VectorIndex:
         out_dir.mkdir(parents=True, exist_ok=True)
         emb_path = out_dir / "doc_embeddings.npy"
         meta_path = out_dir / "doc_meta.json"
-        faiss_path: Optional[Path] = None
+        faiss_path: Optional[Path] = out_dir / "doc_index.faiss"
+
+        def _tmp_path(final: Path) -> Path:
+            suffix = f".tmp.{os.getpid()}.{time.time_ns()}"
+            return final.with_name(final.name + suffix)
 
         self._ensure_matrix()
         if self.Z is not None:
-            np.save(emb_path, self.Z.astype(np.float32, copy=False), allow_pickle=False)
+            tmp_emb = _tmp_path(emb_path)
+            np.save(tmp_emb, self.Z.astype(np.float32, copy=False), allow_pickle=False)
+            os.replace(tmp_emb, emb_path)
         else:
+            try:
+                emb_path.unlink()
+            except FileNotFoundError:
+                pass
             emb_path = None
 
         tokens_payload = [self.lexical_tokens.get(doc_id, []) for doc_id in self.doc_ids]
         chunk_id_payload = [self.entries.get(doc_id, {}).get("chunk_id") for doc_id in self.doc_ids]
         chunk_count_payload = [self.entries.get(doc_id, {}).get("chunk_count") for doc_id in self.doc_ids]
         chunk_tokens_payload = [self.entries.get(doc_id, {}).get("chunk_tokens") for doc_id in self.doc_ids]
-        with meta_path.open("w", encoding="utf-8") as f:
-            json.dump(
-                {
-                    "schema_version": self.LEXICAL_SCHEMA_VERSION,
-                    "doc_ids": self.doc_ids,
-                    "paths": self.paths,
-                    "exts": self.exts,
-                    "preview": self.preview,
-                    "sizes": self.sizes,
-                    "mtimes": self.mtimes,
-                    "ctimes": self.ctimes,
-                    "owners": self.owners,
-                    "drives": self.drives,
-                    "tokens": tokens_payload,
-                    "chunk_id": chunk_id_payload,
-                    "chunk_count": chunk_count_payload,
-                    "chunk_tokens": chunk_tokens_payload,
-                },
-                f,
-                ensure_ascii=False,
-            )
+        payload = {
+            "schema_version": self.LEXICAL_SCHEMA_VERSION,
+            "doc_ids": self.doc_ids,
+            "paths": self.paths,
+            "exts": self.exts,
+            "preview": self.preview,
+            "sizes": self.sizes,
+            "mtimes": self.mtimes,
+            "ctimes": self.ctimes,
+            "owners": self.owners,
+            "drives": self.drives,
+            "tokens": tokens_payload,
+            "chunk_id": chunk_id_payload,
+            "chunk_count": chunk_count_payload,
+            "chunk_tokens": chunk_tokens_payload,
+        }
 
+        # Save FAISS before meta so meta acts as the commit marker.
         if faiss is not None:
             self._ensure_faiss_index()
             if self.faiss_index is not None:
-                faiss_path = out_dir / "doc_index.faiss"
-                faiss.write_index(self.faiss_index, str(faiss_path))
+                tmp_faiss = _tmp_path(faiss_path)
+                faiss.write_index(self.faiss_index, str(tmp_faiss))
+                os.replace(tmp_faiss, faiss_path)
+            else:
+                try:
+                    faiss_path.unlink()
+                except FileNotFoundError:
+                    pass
+                faiss_path = None
+        else:
+            try:
+                faiss_path.unlink()
+            except FileNotFoundError:
+                pass
+            faiss_path = None
+
+        tmp_meta = _tmp_path(meta_path)
+        with tmp_meta.open("w", encoding="utf-8") as f:
+            json.dump(
+                payload,
+                f,
+                ensure_ascii=False,
+            )
+        os.replace(tmp_meta, meta_path)
 
         return IndexPaths(emb_npy=emb_path, meta_json=meta_path, faiss_index=faiss_path)
 

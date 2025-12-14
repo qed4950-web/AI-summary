@@ -12,6 +12,8 @@ class PhotoJobConfig:
     roots: List[Path]
     output_dir: Path
     policy_tag: Optional[str] = None
+    policy_engine: Optional[object] = None
+    policy_agent: str = "photo"
     prefer_gpu: bool = False
     created_at: datetime = field(default_factory=datetime.utcnow)
 

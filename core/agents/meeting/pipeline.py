@@ -98,6 +98,7 @@ class MeetingPipeline:
         stt_backend: Optional[str] = None,
         summary_backend: Optional[str] = None,
         stt_options: Optional[dict] = None,
+        mask_pii: Optional[bool] = None,
     ) -> None:
         backend_env = os.getenv("MEETING_STT_BACKEND")
         requested_backend = stt_backend if stt_backend not in {None, ""} else backend_env
@@ -131,8 +132,11 @@ class MeetingPipeline:
         cache_env = os.getenv("MEETING_CACHE", "1").strip().lower()
         self._cache_enabled = cache_env not in {"", "0", "false", "no"}
 
-        pii_env = os.getenv("MEETING_MASK_PII", "0").strip().lower()
-        self._mask_pii_enabled = pii_env not in {"", "0", "false", "no"}
+        if mask_pii is None:
+            pii_env = os.getenv("MEETING_MASK_PII", "0").strip().lower()
+            self._mask_pii_enabled = pii_env not in {"", "0", "false", "no"}
+        else:
+            self._mask_pii_enabled = bool(mask_pii)
 
         chunk_env = os.getenv("MEETING_STT_CHUNK_SECONDS", "0").strip()
         self._chunk_seconds = self._coerce_positive_float(chunk_env, default=0.0)
@@ -434,7 +438,13 @@ class MeetingPipeline:
     # ---------------------------------------------------------------------
     def _transcribe(self, job: MeetingJobConfig) -> MeetingTranscriptionResult:
         text = self._load_transcript_text(job.audio_path)
-        if text is not None:
+        if text is None and self._stt is None:
+            placeholder = "transcript unavailable; STT backend not configured"
+            duration = self._estimate_duration(job.audio_path, placeholder)
+            segments = self._segment_transcript(placeholder, job, duration)
+            language = self._detect_language(placeholder, job.language)
+            text = placeholder
+        elif text is not None:
             duration = self._estimate_duration(job.audio_path, text)
             segments = self._segment_transcript(text, job, duration)
             language = self._detect_language(text, job.language)
@@ -1453,65 +1463,6 @@ def _resource_diagnostics() -> Dict[str, object]:
     except Exception:
         info["gpu_available"] = False
     return info
-
-    def _sync_action_items(self, job: MeetingJobConfig, summary: MeetingSummary) -> None:
-        if not self._integration_config:
-            return
-        entries = summary.structured_summary.get("action_items") or []
-        if not entries:
-            return
-        try:
-            sync_action_items(entries, self._integration_config, output_dir=job.output_dir)
-        except Exception as exc:  # pragma: no cover - defensive
-            LOGGER.warning("action item sync failed: %s", exc)
-
-    def _mask_sensitive_content(
-        self,
-        *,
-        transcription: MeetingTranscriptionResult,
-        summary: MeetingSummary,
-    ) -> None:
-        transcription.text = mask_text(transcription.text)
-        transcription.segments = mask_segments(transcription.segments)
-        summary.raw_summary = mask_text(summary.raw_summary)
-        summary.highlights = [mask_text(text) for text in summary.highlights]
-        summary.action_items = [mask_text(text) for text in summary.action_items]
-        summary.decisions = [mask_text(text) for text in summary.decisions]
-        for section in summary.structured_summary.values():
-            if isinstance(section, list):
-                for item in section:
-                    if isinstance(item, dict) and "text" in item:
-                        item["text"] = mask_text(item.get("text"))
-
-    def _queue_feedback_request(
-        self,
-        job: MeetingJobConfig,
-        summary: MeetingSummary,
-    ) -> Optional[Dict[str, object]]:
-        feedback_entry = {
-            "meeting_id": job.audio_path.stem,
-            "created_at": job.created_at.isoformat(),
-            "summary_backend": self.summary_backend,
-            "status": "pending",
-            "highlights": summary.highlights,
-            "action_items": summary.structured_summary.get("action_items", []),
-            "decisions": summary.structured_summary.get("decisions", []),
-        }
-
-        local_queue = job.output_dir / "feedback_queue.jsonl"
-        append_jsonl(local_queue, feedback_entry)
-
-        global_queue_env = os.getenv("MEETING_FEEDBACK_INBOX")
-        global_path: Optional[Path] = None
-        if global_queue_env:
-            global_path = Path(global_queue_env)
-            append_jsonl(global_path, feedback_entry)
-
-        return {
-            "queue": local_queue.name,
-            "status": "pending",
-            "global_queue": str(global_path) if global_path else None,
-        }
 
 
     # ------------------------------------------------------------------

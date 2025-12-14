@@ -10,7 +10,8 @@ _os.environ.setdefault("OMP_NUM_THREADS", "1")
 _os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
 _os.environ.setdefault("KMP_AFFINITY", "disabled")
 _os.environ.setdefault("KMP_BLOCKTIME", "0")
-_os.environ.setdefault("KMP_SETTINGS", "1")
+if (_os.getenv("INFOPILOT_DEBUG_SHIM") or "").strip().lower() in {"1", "true", "yes", "on"}:
+    _os.environ.setdefault("KMP_SETTINGS", "1")
 
 
 def _debug_runtime_env() -> None:
@@ -29,11 +30,14 @@ def _debug_runtime_env() -> None:
         except Exception as exc:  # pragma: no cover - defensive
             print(">>> _MEIPASS list failed:", exc, flush=True)
 
-
-_debug_runtime_env()
+if (_os.getenv("INFOPILOT_DEBUG_SHIM") or "").strip().lower() in {"1", "true", "yes", "on"}:
+    _debug_runtime_env()
 
 _impl = _import_module("scripts.pipeline.infopilot")
 _sys.modules[__name__] = _impl
 
 if __name__ == "__main__":
-    _impl.cli()  # type: ignore[attr-defined]
+    if hasattr(_impl, "main"):
+        _impl.main()  # type: ignore[attr-defined]
+    else:
+        _impl.cli(obj={})  # type: ignore[attr-defined]

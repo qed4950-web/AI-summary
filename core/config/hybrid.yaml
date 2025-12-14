@@ -5,7 +5,7 @@ storage:
   cold_after_days: 45
 
 audit:
-  log_dir: logs/audit
+  log_dir: artifacts/logs/audit
 
 models:
   default: BAAI/bge-m3

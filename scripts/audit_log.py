@@ -7,7 +7,12 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_AUDIT_PATH = REPO_ROOT / "data" / "audit" / "desktop_agents.jsonl"
+try:
+    from core.config.paths import AUDIT_LOG_DIR  # type: ignore
+except Exception:  # pragma: no cover - best-effort fallback
+    AUDIT_LOG_DIR = REPO_ROOT / "artifacts" / "logs" / "audit"  # type: ignore[assignment]
+
+DEFAULT_AUDIT_PATH = AUDIT_LOG_DIR / "desktop_agents.jsonl"
 
 
 def _ensure_path(path: Path) -> Path:

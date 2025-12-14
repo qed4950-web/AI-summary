@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from core.agents.taskgraph import TaskCancelled, TaskContext, TaskGraph
 
@@ -73,7 +73,7 @@ class PhotoPipeline:
     def _stage_scan(self, context: TaskContext) -> None:
         self._ensure_not_cancelled()
         job: PhotoJobConfig = context.job
-        photos = self._scan(job.roots)
+        photos = self._scan(job)
         context.set("photos", photos)
 
     def _stage_analyse(self, context: TaskContext) -> None:
@@ -99,9 +99,11 @@ class PhotoPipeline:
             raise RuntimeError("photo pipeline persistence stage requires recommendation")
         self._persist(job, recommendation)
 
-    def _scan(self, roots: Iterable[Path]) -> List[PhotoAsset]:
+    def _scan(self, job: PhotoJobConfig) -> List[PhotoAsset]:
+        policy_engine = getattr(job, "policy_engine", None)
+        policy_agent = getattr(job, "policy_agent", "photo")
         assets: List[PhotoAsset] = []
-        for root in roots:
+        for root in job.roots:
             if not root.exists():
                 LOGGER.warning("photo root missing: %s", root)
                 continue
@@ -109,6 +111,13 @@ class PhotoPipeline:
                 self._ensure_not_cancelled()
                 if path.suffix.lower() not in {".jpg", ".jpeg", ".png", ".heic"}:
                     continue
+                if policy_engine and getattr(policy_engine, "has_policies", False):
+                    try:
+                        allowed = policy_engine.allows(path, agent=policy_agent, include_manual=True)
+                    except Exception:  # pragma: no cover - defensive
+                        allowed = False
+                    if not allowed:
+                        continue
                 assets.append(PhotoAsset(path=path, tags=[]))
         LOGGER.info("photos detected: %d", len(assets))
         return assets

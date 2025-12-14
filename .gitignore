@@ -23,6 +23,7 @@ data/topic_model.joblib
 
 # Logs & experiment outputs
 logs/
+artifacts/
 runs/
 results/
 

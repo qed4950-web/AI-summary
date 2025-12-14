@@ -11,48 +11,90 @@
     "id": "meeting-default",
     "label": "녹음/회의 자료",
     "type": "meeting",
-    "path": "~/Desktop/AI Summary/녹음",
+    "path": "~/<USER>/AI Summary/녹음",
     "scope": "policy",
-    "policy": "core/config/meeting_agent.yaml"
+    "policy": "core/config/meeting_agent.yaml",
+    "sensitive_paths": [
+      "~/Desktop/AI Summary/녹음/민감"
+    ],
+    "cache": {
+      "max_bytes": 2147483648,
+      "purge_days": 14
+    }
   },
   {
     "id": "documents-docs",
     "label": "문서 자료 (Documents)",
     "type": "documents",
-    "path": "/Users/david/Documents",
+    "path": "C:/Users/<USER>/Documents",
     "scope": "policy",
-    "policy": "core/config/hybrid.yaml"
+    "policy": "core/config/hybrid.yaml",
+    "sensitive_paths": [
+      "/Users/david/Documents/민감"
+    ],
+    "cache": {
+      "max_bytes": 2147483648,
+      "purge_days": 30
+    }
   },
   {
     "id": "documents-desktop",
     "label": "문서 자료 (Desktop)",
     "type": "documents",
-    "path": "/Users/david/Desktop",
+    "path": "C:/Users/<USER>/Desktop",
     "scope": "policy",
-    "policy": "core/config/hybrid.yaml"
+    "policy": "core/config/hybrid.yaml",
+    "sensitive_paths": [
+      "/Users/david/Desktop/민감"
+    ],
+    "cache": {
+      "max_bytes": 2147483648,
+      "purge_days": 30
+    }
   },
   {
     "id": "documents-downloads",
     "label": "문서 자료 (Downloads)",
     "type": "documents",
-    "path": "/Users/david/Downloads",
+    "path": "C:/Users/<USER>/Downloads",
     "scope": "policy",
-    "policy": "core/config/hybrid.yaml"
+    "policy": "core/config/hybrid.yaml",
+    "sensitive_paths": [
+      "/Users/david/Downloads/민감"
+    ],
+    "cache": {
+      "max_bytes": 2147483648,
+      "purge_days": 30
+    }
   },
   {
     "id": "documents-cloud",
     "label": "문서 자료 (CloudStorage)",
     "type": "documents",
-    "path": "/Users/david/Library/CloudStorage",
+    "path": "C:/Users/<USER>/Library/CloudStorage",
     "scope": "policy",
-    "policy": "core/config/hybrid.yaml"
+    "policy": "core/config/hybrid.yaml",
+    "sensitive_paths": [
+      "/Users/david/Library/CloudStorage/민감"
+    ],
+    "cache": {
+      "max_bytes": 2147483648,
+      "purge_days": 30
+    }
   },
   {
     "id": "photos-default",
     "label": "사진 자료",
     "type": "photos",
-    "path": "~/Desktop/AI Summary/사진",
+    "path": "~/<USER>/AI Summary/사진",
     "scope": "policy",
-    "policy": "core/config/hybrid.yaml"
+    "policy": "core/config/hybrid.yaml",
+    "sensitive_paths": [
+      "~/Desktop/AI Summary/사진/민감"
+    ],
+    "cache": {
+      "max_bytes": 1073741824,
+      "purge_days": 30
+    }
   }
 ]

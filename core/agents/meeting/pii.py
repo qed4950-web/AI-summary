@@ -3,15 +3,17 @@ from __future__ import annotations
 
 from typing import List, Optional
 
-from .constants import PII_EMAIL_RE, PII_PHONE_RE
+from .constants import PII_ADDRESS_RE, PII_EMAIL_RE, PII_PHONE_RE, PII_RRN_RE
 
 
 def mask_text(text: Optional[str]) -> str:
-    """Redact email addresses and phone numbers from free text."""
+    """Redact common sensitive data from free text."""
     if not text:
         return ""
     masked = PII_EMAIL_RE.sub("[REDACTED_EMAIL]", text)
+    masked = PII_RRN_RE.sub("[REDACTED_RRN]", masked)
     masked = PII_PHONE_RE.sub("[REDACTED_PHONE]", masked)
+    masked = PII_ADDRESS_RE.sub("[REDACTED_ADDRESS]", masked)
     return masked
 
 

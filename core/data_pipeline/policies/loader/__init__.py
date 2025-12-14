@@ -5,11 +5,20 @@ import json
 from pathlib import Path
 from typing import Any, Dict, Iterable, List
 
-import jsonschema
-
 from core.utils import get_logger, resolve_repo_root
 
 LOGGER = get_logger("policy.loader")
+
+
+def _require_jsonschema():
+    try:
+        import jsonschema  # type: ignore
+    except ModuleNotFoundError as exc:
+        raise RuntimeError(
+            "Policy schema validation requires `jsonschema`. "
+            "Install dependencies (e.g. `pip install -r requirements.txt`) and retry."
+        ) from exc
+    return jsonschema
 
 
 def load_policy(path: Path) -> Dict[str, Any]:
@@ -31,6 +40,7 @@ def load_policy_file(path: Path) -> List[Dict[str, Any]]:
         raise ValueError("Policy file must contain a JSON object or array of objects")
 
     schema = _load_schema()
+    jsonschema = _require_jsonschema()
     policies: List[Dict[str, Any]] = []
     for idx, data in enumerate(items):
         jsonschema.validate(data, schema)

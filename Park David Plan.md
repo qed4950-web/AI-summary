@@ -2,6 +2,14 @@
 
 1번답안:
 
+업데이트 메모 (2025-03): 현재 코드 기준 주요 정렬 사항
+- 파이프라인 분리: scan → extract → embed → index/chat/watch 단계별 실행 가능, 정책 필수(fail-closed).
+- 임베딩 기본값: macOS=e5-small, Windows/Linux=bge-m3 (`DEFAULT_EMBED_MODEL`으로 덮어쓰기).
+- 정책 확장: `sensitive_paths`, `cache.max_bytes/purge_days` 지원. 캐시 한도 초과 시 경고/중단/초기화 옵션, purge_days로 오래된 캐시 삭제.
+- Meeting/Photo 에이전트도 정책 스코프 적용, 민감 경로 자동 제외.
+- CI 스모크: 정책/민감 경로/미팅·포토 스코프 테스트 포함.
+- 경로 정렬: Smart Folder 설정은 `core/config/smart_folders.json`, 정책 엔진은 `core/data_pipeline/policies/engine.py` (`PolicyEngine`).
+
 좋아. 지금 **AI-summary 프로젝트 최신 리포지토리 상태(develop 브랜치)**를 기준으로,
 현재까지의 **구현 수준·설계 성숙도·리스크·보완 포인트**를 **전문가 평가(아키텍처/ML/제품/실행/운영 관점)**로 종합 분석해줄게.
 
@@ -314,7 +322,8 @@ CLI는 잘 되어 있으나
 
 * Smart Folder / Policy / Scope 개념이 아직:
 
-  * `configs/`, `rules/`에 조각조각 들어있고,
+  * 런타임 설정은 `core/config/`, 프롬프트/가드레일은 `rules/`에 조각조각 들어있고,
+    (`configs/`는 현재 retrieval 평가/실험 설정 용도로만 사용)
   * `core/` 내 주요 함수 시그니처에 **일관된 `scope` 개념으로 통합되진 않음**.
 * 에이전트 레이어(`core/agents`)는:
 
@@ -506,7 +515,7 @@ smart_folders/
   │   ├─ rag.json
 ```
 
-### 2. Policy Engine (core/policy/)
+### 2. Policy Engine (`core/data_pipeline/policies/`)
 
 필수 기능:
 
@@ -690,10 +699,13 @@ core/
 ## 2. Command-Line Layer
 
 ```
-cli/
-  infopilot.py
-  agent_run.py
-  policy_tool.py
+scripts/
+  pipeline/
+    infopilot.py
+  run_meeting_agent.py
+  run_knowledge_agent.py
+  audit_summary.py
+  util/
 ```
 
 ---
@@ -715,11 +727,13 @@ artifacts/
 ## 4. configs 정리
 
 ```
-configs/
-  policy/
-  agent/
-  rag/
-  stt/
+core/config/
+  smart_folders.json
+  os_profiles/
+
+configs/              # (평가/실험) retrieval 평가 설정 등
+  eval_retrieval*.json
+  golden_queries.sample.jsonl
 ```
 
 ---
@@ -796,15 +810,15 @@ ai-summary/
     smartfolder/
     data_pipeline/
     search/
-  cli/
-    infopilot.py
-    agent_meeting.py
-    agent_photo.py
-    tools_policy.py
-  configs/
-    policy/
-    agent/
-    rag/
+    config/
+  scripts/
+    pipeline/
+      infopilot.py
+    run_meeting_agent.py
+    run_knowledge_agent.py
+    audit_summary.py
+    util/
+  configs/             # (평가/실험) retrieval 평가 설정 등
   artifacts/
     embeddings/
     stt/
@@ -845,3 +859,645 @@ ai-summary/
 
 ### ✅ GitHub Project 보드 구성안
 
+## 8) Repository Internal Conventions (레포 내부 규칙)
+
+### 8.1 디렉터리 레벨 규칙
+
+1. **/core**
+
+   * 역할: **제품 로직의 심장부** (파이프라인, 검색, 대화, 에이전트)
+   * 하위 구조(예시):
+
+     * `core/data_pipeline/` : scan/extract/embed/train + 증분 상태 관리
+     * `core/search/` : Retriever, Ranker, RAG, 인덱스 처리
+     * `core/conversation/` : LNP Chat, 세션 관리, 대화 정책
+     * `core/agents/` : Meeting, Photo, (향후 HR/Support) 등 에이전트
+   * 원칙:
+
+     * **비즈니스 로직만** 존재해야 함 (CLI, UI, 실험코드는 금지).
+     * 예외 없이 **Pure Function 우선**, I/O는 상위 레벨(스크립트)에서.
+
+2. **/scripts**
+
+   * 역할: **실행 진입점·Glue 코드**
+   * 예:
+
+     * `scripts/api_server.py`
+     * `scripts/prefect_dag.py`
+     * `scripts/setup_env.sh` 등
+   * 원칙:
+
+     * 이곳엔 “조합/실행”만, **핵심 알고리즘/로직은 core 안으로 즉시 환원**.
+     * 복잡도가 5~10줄을 넘기기 시작하면 `core/`로 함수 추출 후 import.
+
+3. **/core/config**
+
+   * 역할: **환경/정책/스마트 폴더 정의(현재 레포 기준)**
+   * 예:
+
+     * `core/config/smart_folders.json`
+     * (정책 규칙/스키마는 현재 `core/data_pipeline/policies/` 기준)
+   * 원칙:
+
+     * 코드에서 하드코딩 금지.
+     * “환경/고객마다 다른 값”은 모두 이 레이어로.
+
+4. **/docs**
+
+   * 역할: **문서 시스템의 집결지**
+   * 레이어 분할 (제안):
+
+     * `/docs/foundation/` : Unified Spec, 룰북
+     * `/docs/design/` : Architecture, Agents, Smart Folder Design
+     * `/docs/operations/` : Park David Docs 1208, 브랜치/PR/문서 규칙
+     * `/docs/specs/` : PROJECT_FLOW, 에이전트/파이프라인 플로우
+   * 원칙:
+
+     * 코드가 바뀌는데 관련 문서가 안 바뀌면 **PR을 거부**하는 걸 원칙으로.
+
+5. **/tests**
+
+   * 역할: **품질의 최소 안전선**
+   * 구조(예시):
+
+     * `tests/unit/`
+     * `tests/integration/`
+     * `tests/agents/`
+     * `tests/policy/`
+   * 원칙:
+
+     * **새로운 핵심 기능** 추가 시, 최소 1개 이상의 테스트 케이스 필수.
+     * 파이프라인 흐름 변경 시, `integration`/`agents` 레벨 테스트 업데이트 필수.
+
+---
+
+### 8.2 네이밍 규칙 (파일/클래스/함수)
+
+1. **파일명**
+
+   * 파이프라인 단계: `scan`, `extract`, `embed`, `train`, `chat`, `watch` 등 **명령형 단어**.
+   * 에이전트: `meeting_agent.py`, `photo_agent.py`, `hr_agent.py` 등 명시적 이름.
+   * 정책/스마트 폴더: `*_policy.yml`, `smart_folders.json`.
+
+2. **클래스명**
+
+   * 파이프라인: `ScanRunner`, `EmbedRunner`, `TrainRunner`, `ChatSessionManager`.
+   * 에이전트: `MeetingAgent`, `PhotoAgent`, `KnowledgeAgent`.
+   * 정책: `PolicyEngine`, `SmartFolderContext`.
+
+3. **함수명**
+
+   * 규칙: **동사 + 목적어**
+   * 예:
+
+     * `load_smart_folders()`
+     * `apply_policy_filters()`
+     * `run_meeting_pipeline()`
+     * `summarize_meeting()`
+     * `extract_action_items()`
+
+---
+
+### 8.3 Config / Env 규칙
+
+1. `.env.example`는 **반드시 최신 옵션을 포함**해야 함.
+2. LLM/임베딩/정책 관련 키:
+
+   * `LNPCHAT_LLM_BACKEND`
+   * `LNPCHAT_LLM_MODEL`
+   * `MEETING_*`
+3. 코드 내부에서 `os.getenv`를 직접 난사하지 않고:
+
+   * `core/config/settings.py` 같은 곳에서 **단일 진입점으로 관리**.
+
+---
+
+## 9) Dead-Code Purge Rules (삭제 규칙)
+
+### 9.1 삭제 대상 정의
+
+1. 더 이상 사용되지 않는:
+
+   * 모듈, 함수, 클래스, 스크립트
+2. 현재 파이프라인 구조와 맞지 않는 옛 파일:
+
+   * 예전 단일 파일 구조 (`filefinder.py`, `retriever.py`, `lnp_chat.py`, `pipeline.py`)는
+     **모든 로직을 core/로 이관한 뒤 제거**하는 것을 목표로.
+3. “실험만 하고 안 쓰는” Prototype 코드:
+
+   * 예: 옛날 실험용 모델 로더, 사용 안 하는 Vector Store, 데모 API 등.
+
+---
+
+### 9.2 삭제 프로세스
+
+1. **Step 1 – 사용 여부 확인**
+
+   * `git grep` 또는 IDE 검색으로:
+
+     * import 대상인지
+     * CLI entry에서 호출하는지 확인
+2. **Step 2 – 마이그레이션 여부 체크**
+
+   * 동일 기능이 `core/`에 새로 구현되어 있다면:
+
+     * 옛 코드가 참조되지 않는지 재확인
+3. **Step 3 – 테스트**
+
+   * `pytest -q`
+   * `infopilot.py pipeline all` 로 실제 파이프라인 수행
+4. **Step 4 – 삭제 + 기록**
+
+   * 코드 삭제 후:
+
+     * PR 본문에 “Removed legacy XXX, replaced by YYY” 명시
+     * 필요하면 `AUTO_CHANGELOG` 혹은 Release 노트에 기록
+
+---
+
+### 9.3 금지되는 “타협”
+
+1. “혹시 나중에 쓸지도 몰라서” 남겨두기 ❌
+2. 새 구조와 옛 구조를 둘 다 유지한 채로 사용하는 것 ❌
+3. 동일 기능이 두 군데 이상 구현되어 있는 상태 방치 ❌
+
+**원칙:**
+
+> “같은 일을 하는 코드가 2곳 이상 있으면, 그건 버그 후보다. 무조건 1개로 합쳐야 한다.”
+
+---
+
+## 10) 팀 운영 규칙 (브랜치/PR/리뷰)
+
+### 10.1 브랜치 전략
+
+1. **기본 브랜치: `develop`**
+
+   * 모든 기능 개발은 `develop` 기반.
+2. **기능 브랜치 네이밍**
+
+   * `feature/meeting-agent-e2e`
+   * `feature/smart-folder-policy`
+   * `chore/docs-refactor`
+   * `fix/meeting-stt-bug`
+3. **main (또는 release) 브랜치**
+
+   * 실제 배포/사용 기준이 되는 브랜치
+   * `develop`가 안정화되면 **태그 + merge**.
+
+---
+
+### 10.2 PR 규칙
+
+1. **PR 단위**
+
+   * “파이프라인 1단계 변경 혹은 기능 1개” 기준.
+   * Meeting Agent, Smart Folder, RAG 품질처럼 큰 작업은:
+
+     * **기능 브랜치 + 여러 개 PR**로 쪼개기.
+2. **PR 템플릿 최소 항목**
+
+   * 변경 요약
+   * 관련 이슈 / Task
+   * 테스트 결과 (ex: `pytest -q`, `infopilot.py pipeline all`)
+   * 문서 변경 여부(`/docs` 업데이트 여부)
+3. **리뷰 기준**
+
+   * 파이프라인/에이전트/정책 변경이면 최소 1명 이상 리뷰 필수.
+   * Foundation/Fundamental 룰 변경(PR에서 Unified Spec 수정 등)은 **특별 승인**이 필요하게 설정.
+
+---
+
+### 10.3 코드 리뷰 체크리스트
+
+1. **PM 관점**
+
+   * 이 변경이 **사용자 가치**와 직접 연결돼 있는가?
+   * 파이프라인 플로우, Agents Lifecycle 문서와 말이 맞는가?
+
+2. **Tech Lead 관점**
+
+   * core/ 구조와 충돌하거나 우회하는 코드가 없는가?
+   * Dead-code를 남기지 않았는가?
+   * 에러 처리와 로그가 충분한가?
+
+3. **UX 관점**
+
+   * CLI/API/에이전트 인터랙션이 **일관된 프롬프트와 옵션**을 제공하는가?
+   * 에러 메시지가 사람이 이해할 수 있게 되어 있는가?
+
+4. **ML 관점**
+
+   * 모델, 임베딩, RAG 관련 변경 사항이 Drift/품질 측정을 고려하고 있는가?
+   * 실험 코드와 프로덕션 코드가 제대로 분리되어 있는가?
+
+---
+
+## 11) Risks & Safeguards (리스크와 안전장치)
+
+### 11.1 주요 리스크
+
+1. **데이터 경계 붕괴**
+
+   * Smart Folder + Policy가 잘못 작동하면 사용자 민감 문서가 노출될 수 있음.
+2. **RAG 환각**
+
+   * 잘못된 검색 결과 + 모델 환각으로 완전히 틀린 요약/답변이 나올 수 있음.
+3. **Meeting Agent 오동작**
+
+   * STT 오류, 액션 추출 누락, 마스킹 실패 등으로 실무에 직접 피해.
+4. **문서/코드 불일치**
+
+   * README, Docs, Unified Spec과 실제 코드가 달라짐.
+5. **Dead Code 축적**
+
+   * 리팩토링 과정에서 옛 구조가 남아 있어, 버그/혼란/중복 유지 비용 상승.
+
+---
+
+### 11.2 안전장치 (Safeguards)
+
+1. **정책 엔진 중앙집중화**
+
+   * Smart Folder + Policy 체크는:
+
+     * `core/data_pipeline/policies/engine.py` 같은 **단일 엔트리**를 통해서만 실행.
+     * 모든 에이전트, 파이프라인에서 이 엔진만 호출.
+
+2. **RAG 품질 방어선**
+
+   * 인용 강제:
+
+     * “결과 문장 중 최소 N%는 실제 문서에서 발췌된 문장을 기반으로 한다”는 규칙.
+   * Evidence-first UI:
+
+     * 먼저 근거 문서와 하이라이트를 보여주고, 그 다음 요약/답변을 보여주는 패턴.
+
+3. **Meeting Agent 이중 검증**
+
+   * STT 결과에 대해:
+
+     * 키워드 기반 sanity-check (프로젝트명, 사람 이름 등 누락 감지)
+   * 마스킹:
+
+     * 민감 패턴(전화번호, 이메일, 금액 등)을 정규표현식/룰 기반으로 재차 필터링.
+
+4. **문서-코드 연동 규칙**
+
+   * 파이프라인/에이전트 시그니처 변경 시:
+
+     * 관련 `/docs/specs/` 문서 변경 없으면 **PR 리젝**.
+   * 최소:
+
+     * PROJECT_FLOW.md
+     * Agents Lifecycle 문서 갱신.
+
+5. **주기적 Dead-code 스캔**
+
+   * 1주/2주 단위로:
+
+     * 사용되지 않는 모듈/함수/스크립트를 정리하는 리팩토링 전용 Task를 운영.
+
+---
+
+## 12) Final Deliverables Summary (최종 산출물 요약)
+
+이 플랜을 따라가면, 아래와 같은 결과물이 “완성된 상태”로 남는다.
+
+### 12.1 코드 레벨
+
+1. **Smart Folder + Policy 통합된 파이프라인**
+
+   * `core/data_pipeline/` 내부에서 모든 문서 스캔/임베딩이 Smart Folder/Policy를 존중.
+2. **Meeting Agent E2E 구현**
+
+   * STT → 요약 → 액션 추출 → 결과 저장 → 마스킹까지 하나의 Pipeline/API로 완성.
+3. **RAG/Search 안정화**
+
+   * Chunking, 재임베딩, drift 체크, 인용 정책이 반영된 검색/생성 흐름.
+
+---
+
+### 12.2 문서 레벨
+
+1. **Foundation 문서**
+
+   * Unified Spec(V4) + LLM 룰북 = 변하지 않는 “헌법”.
+2. **Design 문서**
+
+   * Architecture Overview, Agents Design, Smart Folder/Policy Design.
+3. **Operations 문서**
+
+   * Park David Docs 1208 (운영 규칙, 브랜치/PR/문서 가이드라인).
+4. **Specs/Flow 문서**
+
+   * PROJECT_FLOW.md
+   * AI Agents Lifecycle (Smart Folder Scope)
+   * Meeting/Knowledge Agent Flow.
+
+---
+
+### 12.3 운영/프로세스 레벨
+
+1. **브랜치 전략**
+
+   * `develop` 중심, 기능 브랜치 → PR → 리뷰 → 머지.
+2. **테스트/배포 플로우**
+
+   * `pytest -q` + `infopilot.py pipeline all`이 항상 통과되는 상태 유지.
+3. **Refactoring/Dead-code 관리**
+
+   * 주기적인 코드 다이어트로 구조 계속 단순화.
+
+---
+
+### 12.4 네 관점( PM / Tech Lead / UX / ML ) 총평
+
+* **PM**
+
+  * “이제 이 프로젝트는 ‘실험용’이 아니라,
+    **사용자에게 설명할 수 있고, 책임을 질 수 있는 프로덕트** 단계로 올라간다.”
+
+* **Tech Lead**
+
+  * “core/ 중심 구조, Dead-code 제거, 정책 엔진 중앙집중으로
+    **앞으로 기능을 추가해도 망가지지 않는 뼈대**가 생겼다.”
+
+* **UX**
+
+  * “Smart Folder, Meeting Agent, RAG 응답이
+    **예측 가능하고, 일관된 프롬프트/에러 메시지/흐름**을 갖게 된다.”
+
+* **ML**
+
+  * “모델 교체·임베딩 재학습·drift 대응이
+    **파이프라인 레벨에서 표준화**되어, 장기적으로 성능 관리가 가능해진다.”
+
+# 13) Implementation Roadmap (12-Week, 3-Cycle Plan)
+
+본 로드맵은 Smart Folder 기반 경량 AI Agents 제품을 **무료 모델 + 서버리스 환경**에서 안정적으로 완성하기 위한 12주 실행 계획이다.
+모든 사이클은 PM / Tech Lead / UX / ML 관점에서의 목표를 포함한다.
+
+---
+
+## **Cycle 1 (Weeks 1–4)**
+
+### 🎯 핵심 목표
+
+* Smart Folder + Policy Engine을 **전 파이프라인에 통합**
+* 기존 레거시 파일 구조 제거 → core/ 중심 구조로 재정렬
+* Document Boundary와 Policy Enforcement를 확립해 **데이터 안전성** 확보
+
+### 🧩 상세 작업
+
+1. **Policy Engine 구축/정리**
+
+   * 정책 엔진 엔트리: `core/data_pipeline/policies/engine.py` (`PolicyEngine`)
+   * 정책 샘플/스키마 정렬: `core/data_pipeline/policies/examples/` (JSON 기반)
+   * Smart Folder 컨텍스트 로딩 모듈 생성
+
+2. **Pipeline 전체에 Smart Folder 적용**
+
+   * scan/extract/embed/train/chat 단계 모두 Smart Folder scope 필터 적용
+   * 스캔 시 폴더 경계 위반 파일 차단
+   * embed/train 단계에서 정책 위반 문서 배제
+
+3. **레거시 구조 제거 및 모듈 이동**
+
+   * filefinder.py → core/data_pipeline/scan.py
+   * retriever.py → core/search/retriever.py
+   * lnp_chat.py → core/conversation/chat_engine.py
+   * pipeline.py → 단계별 Runner로 분산
+
+4. **문서 업데이트**
+
+   * Agents Lifecycle (Smart Folder Scope) 문서 최신화
+   * Architecture Overview 개선
+   * Park David Docs 1208와 정합성 점검
+
+### ✔ Done Criteria
+
+* Smart Folder 정책 위반 시 모든 에이전트/파이프라인이 **즉시 차단**
+* 레거시 파일 최소 80% 제거
+* pipeline all 실행 시 Smart Folder 내 자료만 처리됨
+* 테스트 최소 10개 통과
+
+---
+
+## **Cycle 2 (Weeks 5–8)**
+
+### 🎯 핵심 목표
+
+* Meeting Agent E2E(End-to-End) 완성
+* STT → 요약 → 액션 추출 → 저장 → 마스킹을 단일 파이프라인으로 묶기
+* 사용자 경험(UX) 측면에서 "회의 올리면 끝"인 흐름 구축
+
+### 🧩 상세 작업
+
+1. **STT 모듈 통합**
+
+   * Whisper local 모델 최적화
+   * 긴 오디오 chunking 처리
+   * 실패/잡음 대비 fallback 전략
+
+2. **요약 + 액션 추출 모듈**
+
+   * 무료 모델 최적화 프롬프트 제작
+   * 액션 아이템 추출 규칙 기반 + 모델 hybrid
+   * 프로젝트명/인물 등 누락 검증 로직 추가
+
+3. **Meeting Result Schema**
+
+   * 요약/하이라이트/액션/근거/원문 timestamp 포함된 JSON
+   * Smart Folder별 저장 폴더 구조 확립
+
+4. **민감 정보 마스킹 엔진**
+
+   * 전화번호, 이메일, 금액, 주소 등 패턴 기반 마스킹
+   * 정책 기반 role-based masking
+
+5. **Meeting ↔ Knowledge 연동**
+
+   * 회의 결과가 즉시 색인되어 RAG 검색 가능하게 처리
+
+### ✔ Done Criteria
+
+* 회의 파일 1개 입력 → 전체 파이프라인 자동 수행
+* 환각률 현저히 감소 (근거 기반 요약)
+* Meeting Agent 테스트 20개 이상 통과
+* User Flow가 “3-step → 1-step”으로 단순화됨
+
+---
+
+## **Cycle 3 (Weeks 9–12)**
+
+### 🎯 핵심 목표
+
+* RAG/Search 품질을 제품 수준으로 고도화
+* Drift detection 및 재임베딩 체계 구축
+* Agents 간 교차 동작 완전 정합성 확보
+
+### 🧩 상세 작업
+
+1. **검색 품질 개선**
+
+   * Chunking 고도화 (semantic split + 길이 기반 hybrid)
+   * Index ranking 개선 (context overlap penalty, evidence priority ranking)
+   * Citation enforcement:
+
+     > “최소 70% 이상의 문장은 실제 문서 근거 기반이어야 한다.”
+
+2. **Drift Detection**
+
+   * 문서 해시 비교 → 변경 문서만 재임베딩
+   * 임베딩 벡터 유사도 기반 drift 판단
+   * drift 발생 시 자동 re-embed 모드
+
+3. **watch 모드 안정화**
+
+   * 파일 수백·수천 개 변경에도 안정적으로 증분 embedding
+   * 잠금(락) 없는 캐시 처리
+
+4. **에이전트 교차 기능 완성**
+
+   * Meeting 결과 → Knowledge Agent 검색
+   * Knowledge Agent 근거 문서 기반 → Meeting Agent 요약 확장
+
+### ✔ Done Criteria
+
+* 검색 정확도 80~90% 유지
+* drift check 성능 검증 완료
+* Meeting ↔ Knowledge 루프 완전 연결
+* End-to-End 테스트 30개 이상 통과
+
+---
+
+# 14) Risk-based Execution Order (리스크 기반 우선순위)
+
+프로젝트 위험 요소를 기준으로 **무조건 먼저 해결해야 하는 순서**를 정의한다.
+
+### 1. **데이터 경계 붕괴 위험 (최고 위험)**
+
+* Smart Folder + Policy Engine 미구현 상태에서는 민감 데이터가 노출될 수 있음
+  → 해결: Cycle 1에서 최우선 처리
+
+### 2. **Meeting Agent 환각·오역 위험 (중위/상위)**
+
+* STT 오류 + 요약 오류 → 실무 사용 불가
+  → 해결: Cycle 2에서 요약·근거 기반 처리 강화
+
+### 3. **검색 품질 저하 위험 (중위)**
+
+* 잘못된 정보 검색 → 신뢰도 하락
+  → 해결: Cycle 3의 RAG 고도화
+
+### 4. **레거시 코드 유지 위험 (지속 위험)**
+
+* 구조 중복 → 개발 비용 증가 / 버그 증가
+  → 해결: Dead-Code Purge 규칙 준수
+
+---
+
+# 15) Testing Strategy (단위 / 통합 / E2E 구조)
+
+### ■ Unit Tests
+
+* 대상: Policy Engine, Chunking, Meeting Functions
+* 목표: Pure Logic 100% 커버
+* 위치: `/tests/unit/`
+
+### ■ Integration Tests
+
+* 대상: scan/extract/embed/train pipeline
+* 목적: Smart Folder 적용 + 증분 처리 테스트
+* 위치: `/tests/integration/`
+
+### ■ Agent Tests
+
+* Meeting Agent E2E
+* Knowledge Agent RAG end-to-end
+* 위치: `/tests/agents/`
+
+### ■ E2E Tests
+
+* 실제 Smart Folder + 실제 문서 + 실제 회의 파일로
+  “사용자 시나리오 전체” 검증
+* 30개 이상 시나리오 목표
+* 위치: `/tests/e2e/`
+
+### ■ Drift Detection Tests
+
+* 문서 변경 여부에 따라 embedding 재처리 여부 확인
+
+### ✔ 테스트 통과 기준
+
+```
+pytest -q 100% 통과
+infopilot.py pipeline all 정상 실행
+Meeting Agent, Knowledge Agent 둘 다 end-to-end 성공
+```
+
+---
+
+# 16) Release Checklist (릴리즈 절차)
+
+### 🔧 Pre-Release
+
+1. 문서 최신화 (Unified Spec + Agents Lifecycle + Plan 업데이트)
+2. Dead-code 제거
+3. 테스트 전체 통과
+4. Smart Folder 정책 검증
+
+### 🚀 Release
+
+1. develop → main merge
+2. 태그 생성:
+   `v1.0.0-smartfolder`
+3. release note 작성:
+
+   * 변경 기능
+   * 삭제된 기능
+   * known issues
+
+### 📦 Post-Release
+
+1. drift 체크 스케줄 실행
+2. feedback 로그 기반 개선 로드맵 확정
+
+---
+
+# 17) Operating Manual (운영 가이드)
+
+### ■ 폴더 운영 규칙
+
+1. Smart Folder 외부 파일은 절대 파이프라인에 넣지 않음
+2. 정책 변경 시 즉시 재온보딩 수행
+3. drift 체크 주기: 1일 또는 3일
+
+### ■ 개발 운영 규칙
+
+1. 모든 기능 추가는 PR + 문서 변경이 동시에 필요
+2. 레거시 또는 중복 코드 발견 시 즉시 삭제 PR 제출
+3. 테스트 깨진 상태로 merge 불가
+
+### ■ 회의 에이전트 운영 규칙
+
+* STT 실패 시 fallback 안내
+* 민감 단어 마스킹 로그 별도 저장
+* 회의 결과 저장 폴더는 Smart Folder 하위로 강제
+
+### ■ 검색/RAG 운영 규칙
+
+* 재임베딩 필요 문서 자동 감지
+* Citation 없는 응답은 실패로 간주
+* evidence-first UI 원칙 준수
+
+---
+
+# ★ Final Summary
+
+13~17은 제품을 “운영 가능한 수준”에서 “실제로 유지·확장 가능한 제품”으로 만드는 실행계획이다.
+이제 Park David Plan은 완전한 상태에 가까우며,
+이후 단계는 실제 개발 착수와 테스트 작성으로 자연스럽게 이어진다.
+
+원하면 **전체 1~17 통합본**도 만들어줄게.

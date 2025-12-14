@@ -1,7 +1,7 @@
 """Policy engine for smart folder configurations."""
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence
 
@@ -24,15 +24,51 @@ def _normalize_path(path: Path) -> Path:
         return path
 
 
+def _normalize_ext(value: str) -> str:
+    raw = (value or "").strip().lower()
+    if not raw:
+        return ""
+    if not raw.startswith("."):
+        raw = f".{raw}"
+    return raw
+
+
+def _normalize_exts(values: object) -> frozenset[str]:
+    if not values:
+        return frozenset()
+    if not isinstance(values, list):
+        values = [values]
+    normalized = []
+    for item in values:
+        if item is None:
+            continue
+        ext = _normalize_ext(str(item))
+        if ext:
+            normalized.append(ext)
+    return frozenset(normalized)
+
+
+@dataclass(frozen=True)
+class AgentRule:
+    allow_types: frozenset[str] = frozenset()
+    deny_types: frozenset[str] = frozenset()
+    max_file_size_mb: int | None = None
+    masking: Dict[str, bool] = field(default_factory=dict)
+
+
 @dataclass(frozen=True)
 class SmartFolderPolicy:
     path: Path
-    agents: frozenset[str]
-    sensitive_paths: frozenset[Path]
-    security: Dict[str, object]
-    indexing: Dict[str, object]
-    retention: Dict[str, object]
-    cache: Dict[str, object]
+    agents: frozenset[str] = frozenset()
+    sensitive_paths: frozenset[Path] = frozenset()
+    allow_types: frozenset[str] = frozenset()
+    deny_types: frozenset[str] = frozenset()
+    max_file_size_mb: int | None = None
+    agent_rules: Dict[str, AgentRule] = field(default_factory=dict)
+    security: Dict[str, object] = field(default_factory=dict)
+    indexing: Dict[str, object] = field(default_factory=dict)
+    retention: Dict[str, object] = field(default_factory=dict)
+    cache: Dict[str, object] = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, data: Dict[str, object], *, base: Path) -> "SmartFolderPolicy":
@@ -53,6 +89,51 @@ class SmartFolderPolicy:
                 raw_path = base / raw_path
         normalized_path = _normalize_path(raw_path)
         agents = frozenset(str(item) for item in data.get("agents", []) or [])
+        allow_types = _normalize_exts(data.get("allow_types"))
+        deny_types = _normalize_exts(data.get("deny_types"))
+        max_file_size_mb_raw = data.get("max_file_size_mb")
+        max_file_size_mb: int | None
+        if max_file_size_mb_raw is None or max_file_size_mb_raw == "":
+            max_file_size_mb = None
+        else:
+            try:
+                max_file_size_mb = int(max_file_size_mb_raw)  # type: ignore[arg-type]
+            except (TypeError, ValueError):
+                max_file_size_mb = None
+
+        agent_rules: Dict[str, AgentRule] = {}
+        raw_agent_rules = data.get("agent_rules") or {}
+        if isinstance(raw_agent_rules, dict):
+            for agent_name, raw_rule in raw_agent_rules.items():
+                if not agent_name:
+                    continue
+                if not isinstance(raw_rule, dict):
+                    continue
+                rule_allow = _normalize_exts(raw_rule.get("allow_types"))
+                rule_deny = _normalize_exts(raw_rule.get("deny_types"))
+                rule_max_raw = raw_rule.get("max_file_size_mb")
+                rule_max: int | None
+                if rule_max_raw is None or rule_max_raw == "":
+                    rule_max = None
+                else:
+                    try:
+                        rule_max = int(rule_max_raw)  # type: ignore[arg-type]
+                    except (TypeError, ValueError):
+                        rule_max = None
+                masking_raw = raw_rule.get("masking") or {}
+                masking: Dict[str, bool] = {}
+                if isinstance(masking_raw, dict):
+                    for key, value in masking_raw.items():
+                        if not key:
+                            continue
+                        masking[str(key)] = bool(value)
+                agent_rules[str(agent_name)] = AgentRule(
+                    allow_types=rule_allow,
+                    deny_types=rule_deny,
+                    max_file_size_mb=rule_max,
+                    masking=masking,
+                )
+
         sensitive_paths_raw = data.get("sensitive_paths") or []
         sensitive_paths: List[Path] = []
         for entry in sensitive_paths_raw:
@@ -73,6 +154,10 @@ class SmartFolderPolicy:
             path=normalized_path,
             agents=agents,
             sensitive_paths=frozenset(sensitive_paths),
+            allow_types=allow_types,
+            deny_types=deny_types,
+            max_file_size_mb=max_file_size_mb,
+            agent_rules=agent_rules,
             security=security,
             indexing=indexing,
             retention=retention,
@@ -169,19 +254,70 @@ class PolicyEngine:
                 continue
         return None
 
-    def allows(self, path: Path, *, agent: str, include_manual: bool = True) -> bool:
+    def check(self, path: Path, *, agent: str, include_manual: bool = True) -> tuple[bool, str]:
         if not self._policies:
-            return True
+            return True, "no_policies"
+        policy = self.policy_for_path(path)
+        if policy is None:
+            return False, "out_of_scope"
+        if policy.is_sensitive(path):
+            return False, "sensitive_path"
+        if not policy.allows_agent(agent):
+            return False, "agent_denied"
+        if not include_manual and policy.indexing_mode == "manual":
+            return False, "manual_policy"
+
+        effective_allow = policy.allow_types
+        effective_deny = policy.deny_types
+        max_size_mb = policy.max_file_size_mb
+        rule = policy.agent_rules.get(agent)
+        if rule:
+            if rule.allow_types:
+                effective_allow = rule.allow_types
+            if rule.deny_types:
+                effective_deny = frozenset(set(effective_deny) | set(rule.deny_types))
+            if rule.max_file_size_mb is not None:
+                max_size_mb = rule.max_file_size_mb
+
+        if path.is_file():
+            ext = _normalize_ext(path.suffix)
+            if effective_deny and ext in effective_deny:
+                return False, "type_denied"
+            if effective_allow and ext not in effective_allow:
+                return False, "type_not_allowed"
+            if max_size_mb is not None:
+                try:
+                    size_bytes = path.stat().st_size
+                except OSError:
+                    return False, "stat_failed"
+                if size_bytes > int(max_size_mb) * 1024 * 1024:
+                    return False, "file_too_large"
+        return True, "ok"
+
+    def allows(self, path: Path, *, agent: str, include_manual: bool = True) -> bool:
+        allowed, _ = self.check(path, agent=agent, include_manual=include_manual)
+        return allowed
+
+    def masking_rules_for_path(self, path: Path, *, agent: str) -> Dict[str, bool]:
+        """Return policy masking rules for a given path/agent."""
+        policy = self.policy_for_path(path)
+        if policy is None:
+            return {}
+        rule = policy.agent_rules.get(agent)
+        if rule and rule.masking:
+            return dict(rule.masking)
+        return {}
+
+    def pii_mask_enabled_for_path(self, path: Path, *, agent: str) -> bool:
+        """Best-effort toggle to enable meeting-style PII masking."""
         policy = self.policy_for_path(path)
         if policy is None:
             return False
-        if policy.is_sensitive(path):
-            return False
-        if not policy.allows_agent(agent):
-            return False
-        if not include_manual and policy.indexing_mode == "manual":
-            return False
-        return True
+        rules = self.masking_rules_for_path(path, agent=agent)
+        if any(bool(value) for value in rules.values()):
+            return True
+        security = policy.security or {}
+        return bool(security.get("pii_filter", False))
 
     def filter_records(
         self,

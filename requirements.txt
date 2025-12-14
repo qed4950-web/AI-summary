@@ -27,7 +27,8 @@ faiss-cpu>=1.9,<2   # (Windows 3.13 → 실제 설치는 faiss-cpu==1.9.0.post1 
 faster-whisper>=1.0,<1.1   # 회의 비서 STT 백엔드(대체); 기본은 transformers 기반 wav2vec2
 transformers>=4.44,<5   # KoBART summarisation
 # pykospacing는 macOS/arm64 wheel 미제공 -> 필요시 수동설치
-kosspacing>=0.5,<0.6; python_version >= "3.12"   # torch 기반 띄어쓰기 대체
+# kosspacing는 환경에 따라 배포/휠이 없어 설치가 실패할 수 있음 -> 필요 시 수동 설치
+# kosspacing>=0.5,<0.6; python_version >= "3.12"   # torch 기반 띄어쓰기 대체
 # py-hanspell은 구버전 pip API 의존 (필요 시 수동 설치)
 
 # === 시스템 유틸 ===

@@ -21,14 +21,21 @@ LOGGER = get_logger("photo.agent")
 class PhotoAgentConfig:
     output_root: Path = DATA_DIR / "photo_outputs"
     policy_tag: Optional[str] = None
+    policy_engine: Optional[object] = None
+    policy_agent: str = "photo"
 
 
 class PhotoAgent(ConversationalAgent):
     name = "photo_manager"
     description = "사진 폴더를 분석해 베스트샷과 중복을 정리합니다. roots가 필요합니다."
 
-    def __init__(self, config: Optional[PhotoAgentConfig] = None) -> None:
-        self.config = config or PhotoAgentConfig()
+    def __init__(self, config: Optional[PhotoAgentConfig | PhotoJobConfig] = None) -> None:
+        self._preset_job: Optional[PhotoJobConfig] = None
+        if isinstance(config, PhotoJobConfig):
+            self._preset_job = config
+            self.config = PhotoAgentConfig()
+        else:
+            self.config = config or PhotoAgentConfig()
         self.pipeline = PhotoPipeline()
 
     def prepare(self) -> None:
@@ -50,6 +57,8 @@ class PhotoAgent(ConversationalAgent):
             roots=roots,
             output_dir=output_dir,
             policy_tag=context.get("policy_tag") or self.config.policy_tag,
+            policy_engine=context.get("policy_engine") or self.config.policy_engine,
+            policy_agent=context.get("policy_agent") or self.config.policy_agent,
             prefer_gpu=bool(context.get("prefer_gpu", False)),
         )
         LOGGER.info("photo agent running job: %s", job)
@@ -73,6 +82,13 @@ class PhotoAgent(ConversationalAgent):
                 "stages": events,
             },
         )
+
+    def _collect_files(self, job: Optional[PhotoJobConfig] = None):
+        """테스트/도구용: 정책을 적용한 파일 스캔 결과를 반환합니다."""
+        target = job or self._preset_job
+        if target is None:
+            raise ValueError("스캔할 PhotoJobConfig가 필요합니다.")
+        return self.pipeline._scan(target)  # type: ignore[attr-defined]
 
     def _default_output_root(self) -> Path:
         env_value = os.getenv("PHOTO_OUTPUT_DIR")

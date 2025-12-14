@@ -23,6 +23,7 @@ from core.search.retriever import (
     _similarity_to_percent,
     _split_tokens,
 )  # Step3 검색기 재사용
+from core.agents.rag.citation import build_allowed_refs, ensure_citations_or_append_sources, format_ref_id
 
 _PREVIEW_TOKEN_PATTERN = re.compile(r"(?u)(?:[가-힣]{1,}|[A-Za-z0-9]{2,})")
 _GREETINGS = {
@@ -125,7 +126,7 @@ class Spinner:
 class LNPChat:
     model_path: Path
     corpus_path: Path
-    cache_dir: Path = Path("./index_cache")
+    cache_dir: Path = Path("data/cache")
     topk: int = 5
     translate: bool = False  # 기본은 다국어 Sentence-BERT로 번역 없이 처리
     rerank: bool = field(default_factory=lambda: _env_flag("LNPCHAT_RERANK", default=True))
@@ -367,13 +368,13 @@ class LNPChat:
             try:
                 next(self.cache_dir.iterdir())
             except StopIteration:
-                self.index_reasons.append("index_cache 디렉터리가 비어 있습니다.")
+                self.index_reasons.append(f"cache 디렉터리가 비어 있습니다 → {self.cache_dir}")
                 cache_hint_added = True
             except OSError as exc:
-                self.index_reasons.append(f"index_cache 확인 실패: {exc}")
+                self.index_reasons.append(f"cache 디렉터리 확인 실패({self.cache_dir}): {exc}")
                 cache_hint_added = True
 
-        self.index_reasons.append("python infopilot.py pipeline all --out data/found_files.csv 로 scan/train을 다시 실행해보세요.")
+        self.index_reasons.append("python3 infopilot.py pipeline all --out data/found_files.csv 로 scan/train을 다시 실행해보세요.")
         if cache_hint_added:
             self.index_reasons.append("파이프라인 완료 후 --cache 옵션을 chat 명령과 동일하게 지정했는지 확인해주세요.")
 
@@ -959,14 +960,21 @@ class LNPChat:
         if client is None:
             return None
         context_blocks: List[str] = []
+        allowed_refs = build_allowed_refs(hits)
         for idx, hit in enumerate(hits[:3], start=1):
-            path_label = str(hit.get("path") or "")
+            raw_path = str(hit.get("path") or "")
+            try:
+                path_label = Path(raw_path).name
+            except Exception:
+                path_label = raw_path
             ext_label = str(hit.get("ext") or "")
             preview = str(hit.get("preview") or "").strip()
+            ref_id = format_ref_id(path_label, hit.get("chunk_id"))
             snippet = preview[:400]
             block = textwrap.dedent(
                 f"""
                 {idx}. 경로: {path_label} [{ext_label}]
+                   ref: {ref_id}
                    요약: {snippet}
                 """
             ).strip()
@@ -980,8 +988,10 @@ class LNPChat:
             검색 결과 요약:
             {os.linesep.join(context_blocks)}
 
-            위 정보를 근거로 질문에 명확하고 간결하게 답변해주세요.
-            핵심 근거를 bullet 형식으로 제시하고, 부족한 정보가 있으면 추가 조사 필요성을 언급하세요.
+            위 정보만을 근거로 질문에 명확하고 간결하게 답변해주세요.
+            - 근거가 없는 내용은 만들지 마세요.
+            - bullet 형태로 작성하고, 각 bullet 끝에 반드시 [ref: <ref_id>] 형식으로 인용을 붙이세요.
+            - ref_id는 위 블록의 ref 값만 사용하세요.
             """
         ).strip()
         system_prompt = "You are a helpful assistant that summarises enterprise documents in Korean."
@@ -993,7 +1003,9 @@ class LNPChat:
         except Exception as exc:
             print(f"⚠️ 로컬 LLM 예외: {exc}")
             return None
-        return summary or None
+        if not summary:
+            return None
+        return ensure_citations_or_append_sources(summary, hits, allowed_refs=allowed_refs)
 
     def _respond_to_hit_reference(self, query: str) -> Optional[Dict[str, Any]]:
         if not self.last_hits:

@@ -22,6 +22,51 @@
       },
       "description": "Agents enabled for this folder"
     },
+    "allow_types": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "Optional file extension allowlist (e.g. ['pdf', '.md'])"
+    },
+    "deny_types": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "Optional file extension denylist (e.g. ['exe', 'zip'])"
+    },
+    "max_file_size_mb": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Optional max allowed file size in MB"
+    },
+    "agent_rules": {
+      "type": "object",
+      "description": "Per-agent overrides for allow/deny types and size limits",
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "allow_types": {
+            "type": "array",
+            "items": {"type": "string"}
+          },
+          "deny_types": {
+            "type": "array",
+            "items": {"type": "string"}
+          },
+          "max_file_size_mb": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "masking": {
+            "type": "object",
+            "additionalProperties": {"type": "boolean"}
+          }
+        },
+        "additionalProperties": false
+      }
+    },
     "sensitive_paths": {
       "type": "array",
       "items": {

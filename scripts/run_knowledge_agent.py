@@ -14,15 +14,17 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, TYPE_CHECKING
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from audit_log import record_event
-from core.conversation.lnp_chat import LNPChat
-from core.data_pipeline.policies.engine import PolicyEngine
+from scripts.audit_log import record_event
+
+if TYPE_CHECKING:  # pragma: no cover
+    from core.conversation.lnp_chat import LNPChat
+    from core.data_pipeline.policies.engine import PolicyEngine
 
 KNOWLEDGE_AGENT = "knowledge_search"
 DEFAULT_MODEL = Path("data/topic_model.joblib")
@@ -67,6 +69,15 @@ def _resolve_path(value: str) -> Optional[Path]:
 
 
 def _load_policy_engine(policy_path: Optional[Path]) -> PolicyEngine:
+    try:
+        from core.data_pipeline.policies.engine import PolicyEngine
+    except ModuleNotFoundError as exc:
+        raise RuntimeError(
+            "Smart folder policy support requires extra dependencies. "
+            "Run inside the project env (e.g. `conda run -n ai-summary python3 ...`) "
+            "or install missing packages (e.g. `pip install jsonschema`)."
+        ) from exc
+
     if not policy_path:
         return PolicyEngine.empty()
     try:
@@ -189,6 +200,22 @@ def main() -> None:
         _emit({"ok": False, "error": str(exc), "data": None}, exit_code=3)
 
     scope_value = _policy_scope(folder.scope, policy_engine.has_policies if policy_engine else False)
+
+    try:
+        from core.conversation.lnp_chat import LNPChat
+    except ModuleNotFoundError as exc:
+        _emit(
+            {
+                "ok": False,
+                "error": (
+                    "Knowledge agent requires project dependencies. "
+                    "Run inside the project env (e.g. `conda run -n ai-summary python3 ...`). "
+                    f"(detail: {exc})"
+                ),
+                "data": None,
+            },
+            exit_code=5,
+        )
 
     chat = LNPChat(
         model_path=model_path,

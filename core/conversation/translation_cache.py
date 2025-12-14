@@ -24,12 +24,20 @@ class TranslationCache:
         self._lock = threading.Lock()
         self._init_db()
 
+    def _connect(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self.db_path, timeout=5.0, check_same_thread=False)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("PRAGMA temp_store=MEMORY")
+        conn.execute("PRAGMA busy_timeout=3000")
+        return conn
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
     def get(self, doc_path: str, original_text: str, target_lang: str) -> Optional[str]:
         key = self._fingerprint(doc_path, original_text)
-        with self._lock, sqlite3.connect(self.db_path) as conn:
+        with self._lock, self._connect() as conn:
             cur = conn.execute(
                 "SELECT translated_text FROM translations WHERE source_key=? AND target_lang=?",
                 (key, target_lang),
@@ -42,7 +50,7 @@ class TranslationCache:
     def set(self, doc_path: str, original_text: str, target_lang: str, translated_text: str) -> None:
         key = self._fingerprint(doc_path, original_text)
         timestamp = int(time.time())
-        with self._lock, sqlite3.connect(self.db_path) as conn:
+        with self._lock, self._connect() as conn:
             conn.execute(
                 """
                 INSERT INTO translations(source_key, target_lang, translated_text, updated_at)
@@ -59,7 +67,7 @@ class TranslationCache:
     # Internal helpers
     # ------------------------------------------------------------------
     def _init_db(self) -> None:
-        with self._lock, sqlite3.connect(self.db_path) as conn:
+        with self._lock, self._connect() as conn:
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS translations (
