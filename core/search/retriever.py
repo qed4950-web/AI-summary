@@ -2022,3 +2022,6 @@ def _prepare_text_frame(df: "pd.DataFrame") -> "pd.DataFrame":
         for idx in range(len(df))
     ]
     return df
+
+# Backward compatibility alias
+HybridRetriever = Retriever
