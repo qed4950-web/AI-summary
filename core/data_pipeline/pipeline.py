@@ -59,6 +59,16 @@ from core.data_pipeline.models import (
     MODEL_TYPE_SENTENCE_TRANSFORMER,
 )
 
+# Backward compatibility: corpus_builder extracted to corpus_builder.py
+from core.data_pipeline.corpus_builder import (
+    ExtractRecord,
+    CorpusBuilder,
+    _load_existing_corpus,
+    _is_cache_fresh,
+    _split_cache,
+    _collect_existing_rows,
+)
+
 import numpy as np
 
 # New Utils
