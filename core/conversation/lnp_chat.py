@@ -248,7 +248,7 @@ class LNPChat:
              return {"answer": "검색 엔진이 준비되지 않았습니다."}
              
         with self.ui.spinner("문서 검색 중..."):
-             hits = self.retr.search(query, topk=k)
+             hits = self.retr.search(query, top_k=k)
         
         if not hits:
             return {"answer": "검색 결과가 없습니다.", "hits": []}
