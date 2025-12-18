@@ -11,6 +11,7 @@ import sys
 import threading
 import time
 import types
+import unicodedata
 import weakref
 import importlib
 import calendar
@@ -21,8 +22,25 @@ from collections import deque, OrderedDict
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from functools import lru_cache
-from pathlib import Path
-from typing import Any, Callable, Deque, Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from pathlib import Path, PurePath
+from typing import (
+    Any,
+    Callable,
+    Deque,
+    Dict,
+    Iterable,
+    List,
+    Optional,
+    Sequence,
+    Set,
+    Tuple,
+    Union,
+    cast,
+)
+
+# New Utils
+from core.utils.stopwords import STOPWORDS
+from core.utils.nlp import split_tokens as _split_tokens_util
 
 from core.config.paths import MODELS_DIR
 
@@ -84,9 +102,16 @@ except Exception:
     torch = None
 
 try:
-    import faiss  # type: ignore
-except Exception:
+    import faiss  # noqa: F401
+except ImportError:
     faiss = None
+    # We will log a warning only if user explicitly tries to use FAISS features later
+    # to avoid noise in pure-lexical environments.
+
+try:
+    import hnswlib  # noqa: F401
+except ImportError:
+    hnswlib = None
 else:
     if hasattr(faiss, "omp_set_num_threads"):
         try:
@@ -117,19 +142,35 @@ except Exception:
 
 from .index_manager import IndexManager
 
+# Backward compatibility: VectorIndex extracted to vector_index.py
+from .vector_index import VectorIndex, IndexPaths
+
+# Backward compatibility: SessionState extracted to session.py
+from .session import SessionState
+
+# Backward compatibility: QueryEncoder extracted to query_encoder.py  
+from .query_encoder import QueryEncoder, DEFAULT_EMBED_MODEL as _QE_DEFAULT_EMBED_MODEL
+
+# Backward compatibility: MetadataFilters extracted to query_parser.py
+from .query_parser import MetadataFilters, _apply_metadata_filters, _extract_metadata_filters
+
+# Backward compatibility: scoring helpers extracted to scoring.py
+from .scoring import (
+    _compute_extension_bonus,
+    _compute_owner_bonus,
+    _format_human_time,
+    _format_size,
+    _minmax_scale,
+    _normalize_ext,
+    _prioritize_ext_hits,
+    _similarity_to_percent,
+)
+
+# Backward compatibility: reranker extracted to reranker.py
+from .reranker import CrossEncoderReranker, EarlyStopConfig, EarlyStopState
+
 MODEL_TEXT_COLUMN = "text_model"
-MODEL_TYPE_SENTENCE_TRANSFORMER = "sentence-transformer"
-def _default_embed_model() -> str:
-    env_model = os.getenv("DEFAULT_EMBED_MODEL")
-    if env_model:
-        return env_model
-    if platform.system() == "Darwin":
-        # Prefer the bundled multilingual-e5-small copy on macOS to reduce load
-        return "models--intfloat--multilingual-e5-small"
-    return "BAAI/bge-m3"
-
-
-DEFAULT_EMBED_MODEL = _default_embed_model()
+DEFAULT_EMBED_MODEL = _QE_DEFAULT_EMBED_MODEL
 MAX_BM25_TOKENS = 8000
 MAX_PREVIEW_CHARS = 180
 DEFAULT_MMR_LAMBDA = 0.7
@@ -144,9 +185,229 @@ _SESSION_CLICK_WEIGHT = 0.35
 _SESSION_PIN_WEIGHT = 0.6
 _SESSION_LIKE_WEIGHT = 0.45
 _SESSION_DISLIKE_WEIGHT = -0.5
-_SESSION_EXT_PREF_SCALE = 0.05
-_SESSION_OWNER_PREF_SCALE = 0.04
 _META_SPLIT_RE = re.compile(r"[^0-9A-Za-z가-힣]+")
+_EXACT_TERM_RE = re.compile(r"^[가-힣]{2,4}$")
+_EXACT_TERM_STRIP_SUFFIXES: Tuple[str, ...] = (
+    "관련문서",
+    "관련자료",
+    "관련",
+    "문서",
+    "자료",
+    "찾아줘",
+    "찾아",
+    "검색",
+    "찾기",
+    "요약",
+    "정리",
+)
+_EXACT_TERM_STOPWORDS: Set[str] = {
+    "관련",
+    "문서",
+    "자료",
+    "검색",
+    "찾아",
+    "찾아줘",
+    "찾기",
+    "요약",
+    "정리",
+    "이력서",
+    "resume",
+    "cv",
+    "경력기술서",
+    "포트폴리오",
+    "사업계획서",
+    "사업계획",
+    "비즈니스플랜",
+    "business",
+    "businessplan",
+    "business plan",
+    "pitch",
+    "deck",
+    "ir",
+    "proposal",
+    "제안서",
+    "계약서",
+    "견적서",
+}
+
+_STRICT_KEYWORDS: Tuple[str, ...] = (
+    "이력서",
+    "resume",
+    "cv",
+    "경력기술서",
+    "포트폴리오",
+    "사업계획서",
+    "사업계획",
+    "비즈니스플랜",
+    "business",
+    "businessplan",
+    "business plan",
+    "pitch",
+    "deck",
+    "ir",
+    "proposal",
+    "제안서",
+    "계약서",
+    "견적서",
+)
+
+_STRICT_INTENT_TOKENS: Tuple[str, ...] = (
+    "찾아",
+    "찾아줘",
+    "찾기",
+    "검색",
+    "검색해",
+    "검색해줘",
+    "파일",
+    "문서",
+    "자료",
+    "원본",
+    "pdf",
+    "doc",
+    "docx",
+    "hwp",
+    "ppt",
+    "pptx",
+    "xlsx",
+    "xls",
+    "csv",
+    "template",
+    "템플릿",
+    "양식",
+    "샘플",
+    "예시",
+    "서식",
+)
+
+def _path_parts_lower(path: str) -> Tuple[str, ...]:
+    if not path:
+        return tuple()
+    try:
+        parts = PurePath(path).parts
+    except Exception:
+        return tuple()
+    return tuple(str(part).lower() for part in parts if part)
+
+
+# [Refactor] Meeting logic removed. Filtering should be handled by the caller or Policy.
+
+
+
+def _should_apply_strict_search(query: str) -> bool:
+    """Heuristic: apply strict filtering only when the user likely wants a specific file."""
+    if not query:
+        return False
+    lowered = str(query).strip().lower()
+    tokens = [tok for tok in _split_tokens(lowered) if tok]
+    if not tokens:
+        return False
+
+    # Avoid strict filtering for broad/long queries; semantic is better there.
+    if len(tokens) >= 10:
+        return False
+
+    has_intent = any(tok in lowered for tok in _STRICT_INTENT_TOKENS)
+    has_exact = bool(_extract_exact_query_terms(query))
+    has_strict_kw = bool(_extract_strict_keywords(query))
+    has_identifier = any(_looks_like_identifier(tok) for tok in tokens)
+    return bool(has_intent and (has_exact or has_strict_kw or has_identifier))
+
+
+def _extract_strict_keywords(query: str) -> List[str]:
+    if not query:
+        return []
+    lowered = str(query).strip().lower()
+    tokens = {tok for tok in _split_tokens(lowered) if tok}
+    matches: List[str] = []
+    for kw in _STRICT_KEYWORDS:
+        kw_l = kw.lower()
+        if kw_l in lowered or kw_l in tokens:
+            matches.append(kw_l)
+            # Expand intent keywords to likely synonyms found in filenames/content.
+            if kw_l in {"이력서", "resume", "cv", "경력기술서", "포트폴리오"}:
+                matches.extend(["이력서", "resume", "cv", "경력기술서", "포트폴리오", "portfolio", "profile"])
+            if kw_l in {"사업계획서", "사업계획", "비즈니스플랜", "business plan", "businessplan"}:
+                matches.extend(["사업계획서", "사업계획", "비즈니스플랜", "business", "businessplan", "plan", "proposal", "pitch", "deck", "ir"])
+    seen: Set[str] = set()
+    ordered: List[str] = []
+    for kw in matches:
+        if kw and kw not in seen:
+            seen.add(kw)
+            ordered.append(kw)
+    return ordered[:5]
+
+
+def _apply_strict_filter(query: str, hits: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], bool]:
+    """Filter hits to those that contain exact terms / strict keywords; returns (hits, fallback_used).
+
+    When no candidates match, returns the original hits and sets fallback_used=True so the caller can
+    annotate that strict filtering did not apply.
+    """
+    if not hits:
+        return hits, False
+    exact_terms = _extract_exact_query_terms(query)
+    strict_keywords = _extract_strict_keywords(query)
+    if not exact_terms and not strict_keywords:
+        return hits, False
+
+    filtered: List[Dict[str, Any]] = []
+    for hit in hits:
+        hit_tokens = _collect_hit_tokens(hit)
+        if exact_terms and not all(term in hit_tokens for term in exact_terms):
+            continue
+        if strict_keywords and not any(kw in hit_tokens for kw in strict_keywords):
+            continue
+        filtered.append(hit)
+
+    if filtered:
+        return filtered, False
+    return hits, True
+
+def _extract_exact_query_terms(query: str) -> List[str]:
+    """Extract short literal terms (e.g., Korean names) that users likely expect as exact matches.
+
+    This improves UX for queries like "홍길동 관련 문서 찾아줘" where semantic similarity may
+    return unrelated documents with high embedding scores.
+    """
+    if not query:
+        return []
+    tokens = _split_tokens(str(query).strip())
+    if not tokens:
+        return []
+
+    def _strip_suffixes(token: str) -> str:
+        token = token.strip()
+        if not token:
+            return ""
+        changed = True
+        while changed:
+            changed = False
+            for suffix in _EXACT_TERM_STRIP_SUFFIXES:
+                if token.endswith(suffix) and len(token) > len(suffix):
+                    token = token[: -len(suffix)]
+                    changed = True
+        return token.strip()
+
+    extracted: List[str] = []
+    for token in tokens:
+        candidate = token.strip()
+        if not candidate:
+            continue
+        if _EXACT_TERM_RE.fullmatch(candidate) and candidate not in _EXACT_TERM_STOPWORDS:
+            extracted.append(candidate)
+            continue
+        stripped = _strip_suffixes(candidate)
+        if stripped and _EXACT_TERM_RE.fullmatch(stripped) and stripped not in _EXACT_TERM_STOPWORDS:
+            extracted.append(stripped)
+
+    # Preserve order while de-duplicating.
+    seen: Set[str] = set()
+    ordered: List[str] = []
+    for term in extracted:
+        if term and term not in seen:
+            seen.add(term)
+            ordered.append(term)
+    return ordered[:3]
 
 
 logger = logging.getLogger(__name__)
@@ -154,21 +415,10 @@ if not logger.handlers:
     logger.addHandler(logging.NullHandler())
 
 
-def _clamp(value: float, lower: float, upper: float) -> float:
-    return max(lower, min(upper, value))
-
-
-@lru_cache(maxsize=4096)
-def _split_tokens_cached(source: str) -> Tuple[str, ...]:
-    if not source:
-        return ()
-    return tuple(tok for tok in _META_SPLIT_RE.split(source) if tok)
-
-
 def _split_tokens(source: Any) -> List[str]:
     if not source:
         return []
-    return list(_split_tokens_cached(str(source)))
+    return _split_tokens_util(str(source))
 
 
 def _temporal_weight(mtime: Any, ctime: Any = None) -> float:
@@ -191,6 +441,11 @@ def _temporal_weight(mtime: Any, ctime: Any = None) -> float:
     return max(TEMPORAL_WEIGHT_FLOOR, min(TEMPORAL_WEIGHT_CEILING, weight))
 
 
+
+def _clamp(val: float, min_val: float, max_val: float) -> float:
+    return max(min_val, min(val, max_val))
+
+
 def _mask_path(path: str) -> str:
     if not path:
         return ""
@@ -198,17 +453,6 @@ def _mask_path(path: str) -> str:
         return Path(path).name
     except Exception:
         return "<invalid-path>"
-
-
-def _normalize_ext(ext: str) -> str:
-    if not ext:
-        return ""
-    ext = str(ext).strip().lower()
-    if not ext:
-        return ""
-    if not ext.startswith('.'):
-        ext = f".{ext}"
-    return ext
 
 
 def _looks_like_extension(token: str) -> bool:
@@ -302,12 +546,18 @@ _DOMAIN_EXT_HINTS: Dict[str, Set[str]] = {
     "보고서": {".pdf", ".docx", ".hwp"},
     "회의록": {".docx", ".hwp", ".pdf"},
     "계약서": {".pdf", ".hwp"},
+    "사업계획서": {".pdf", ".docx", ".hwp", ".pptx"},
+    "사업계획": {".pdf", ".docx", ".hwp", ".pptx"},
+    "이력서": {".pdf", ".docx", ".hwp"},
     "예산": {".xlsx", ".xls", ".xlsm"},
     "세금": {".xlsx", ".xls", ".pdf"},
     "레퍼런스": {".pdf", ".xlsx"},
     "참고": {".pdf", ".xlsx"},
     "초안": {".doc", ".docx", ".hwp"},
     "참고문헌": {".docx", ".xlsx", ".csv"},
+    "ir": {".pdf", ".pptx"},
+    "피치": {".pdf", ".pptx"},
+    "피치덱": {".pdf", ".pptx"},
 }
 
 _DOMAIN_KEYWORDS_BY_EXT: Dict[str, Set[str]] = {}
@@ -326,6 +576,10 @@ _SEMANTIC_SYNONYMS: Dict[str, Set[str]] = {
     "예산": {"budget", "financial plan"},
     "발표": {"presentation", "slide", "deck"},
     "제안서": {"proposal", "pitch", "offer"},
+    "사업계획서": {"business plan", "businessplan", "plan", "proposal", "pitch deck", "ir", "investment"},
+    "사업계획": {"business plan", "businessplan", "plan", "strategy", "roadmap"},
+    "이력서": {"resume", "cv", "curriculum vitae", "profile"},
+    "경력기술서": {"resume", "cv", "work experience", "profile"},
     "계획": {"plan", "planning"},
     "정리": {"summary", "overview"},
     "ml": {"machine learning", "머신러닝", "머신 러닝", "기계학습", "기계 학습"},
@@ -371,7 +625,6 @@ for keyword, exts in _DOMAIN_EXT_HINTS.items():
 
 # 기본 BM25 가중치 (DocumentAgent 설정값과 동기화)
 _LEXICAL_WEIGHT = 0.35
-_EXTENSION_MATCH_BONUS = 0.05
 
 
 _LEXICAL_KEYWORD_HINTS_RAW: Tuple[Tuple[Set[str], float], ...] = (
@@ -402,6 +655,24 @@ _LEXICAL_KEYWORD_HINTS_RAW: Tuple[Tuple[Set[str], float], ...] = (
             "제안요청서",
         },
         0.5,
+    ),
+    (
+        {
+            "이력서",
+            "resume",
+            "cv",
+            "경력기술서",
+            "포트폴리오",
+            "사업계획서",
+            "사업계획",
+            "비즈니스플랜",
+            "사업제안서",
+            "투자제안서",
+            "ir",
+            "피치",
+            "피치덱",
+        },
+        0.65,
     ),
 )
 
@@ -462,26 +733,6 @@ def _negative_template_penalty(hit: Dict[str, Any]) -> Tuple[float, List[str]]:
     return penalty, matched
 
 
-def _resolve_sentence_transformer_location(model_name: str) -> str:
-    """Prefer locally cached SentenceTransformer snapshots when available."""
-    base_dir = MODELS_DIR / "sentence_transformers"
-    if base_dir.exists():
-        direct = base_dir / model_name
-        if direct.exists():
-            return str(direct)
-        cache_dir = base_dir / f"models--{model_name.replace('/', '--')}"
-        snapshots = cache_dir / "snapshots"
-        if snapshots.exists():
-            candidates = sorted(snapshots.iterdir(), key=lambda item: item.stat().st_mtime, reverse=True)
-            for candidate in candidates:
-                if any(
-                    (candidate / marker).exists()
-                    for marker in ("config.json", "modules.json", "config_sentence_transformers.json")
-                ):
-                    return str(candidate)
-    return model_name
-
-
 def _iter_query_units(lowered: str) -> Set[str]:
     tokens = _split_tokens(lowered)
     units: Set[str] = set(tokens)
@@ -517,143 +768,6 @@ def _token_contains(unit: str, keyword: str) -> bool:
     if keyword_tokens and all(tok in unit_tokens for tok in keyword_tokens):
         return True
     return False
-
-
-@dataclass
-class SessionState:
-    recent_queries: Deque[str] = field(default_factory=lambda: deque(maxlen=_SESSION_HISTORY_LIMIT))
-    clicked_doc_ids: Set[int] = field(default_factory=set)
-    preferred_exts: Dict[str, float] = field(default_factory=dict)
-    owner_prior: Dict[str, float] = field(default_factory=dict)
-    chat_history: Deque[Tuple[str, str]] = field(
-        default_factory=lambda: deque(maxlen=_SESSION_CHAT_HISTORY_LIMIT)
-    )
-
-    def add_query(self, query: str) -> None:
-        if not query:
-            return
-        self.recent_queries.append(query)
-
-    def record_user_message(self, message: str) -> None:
-        self._append_chat_turn("user", message)
-
-    def record_assistant_message(self, message: str) -> None:
-        self._append_chat_turn("assistant", message)
-
-    def get_chat_history(self) -> List[Tuple[str, str]]:
-        return list(self.chat_history)
-
-    def record_click(
-        self,
-        *,
-        doc_id: Optional[int] = None,
-        ext: Optional[str] = None,
-        owner: Optional[str] = None,
-    ) -> None:
-        if doc_id is not None:
-            self.clicked_doc_ids.add(int(doc_id))
-        self._apply_preference(ext=ext, owner=owner, delta=_SESSION_CLICK_WEIGHT)
-
-    def record_pin(
-        self,
-        *,
-        doc_id: Optional[int] = None,
-        ext: Optional[str] = None,
-        owner: Optional[str] = None,
-    ) -> None:
-        if doc_id is not None:
-            self.clicked_doc_ids.add(int(doc_id))
-        self._apply_preference(ext=ext, owner=owner, delta=_SESSION_PIN_WEIGHT)
-
-    def record_like(
-        self,
-        *,
-        ext: Optional[str] = None,
-        owner: Optional[str] = None,
-    ) -> None:
-        self._apply_preference(ext=ext, owner=owner, delta=_SESSION_LIKE_WEIGHT)
-
-    def record_dislike(
-        self,
-        *,
-        ext: Optional[str] = None,
-        owner: Optional[str] = None,
-    ) -> None:
-        self._apply_preference(ext=ext, owner=owner, delta=_SESSION_DISLIKE_WEIGHT)
-
-    def _apply_preference(
-        self,
-        *,
-        ext: Optional[str],
-        owner: Optional[str],
-        delta: float,
-    ) -> None:
-        if ext:
-            normalized_ext = _normalize_ext(ext)
-            if normalized_ext:
-                self._update_pref(self.preferred_exts, normalized_ext, delta)
-        if owner:
-            normalized_owner = _normalize_owner(owner)
-            if normalized_owner:
-                self._update_pref(self.owner_prior, normalized_owner, delta)
-
-    def _update_pref(self, store: Dict[str, float], key: str, delta: float) -> None:
-        current = store.get(key, 0.0) * _SESSION_PREF_DECAY
-        updated = _clamp(current + delta, -1.0, 1.0)
-        if abs(updated) < 1e-4:
-            store.pop(key, None)
-        else:
-            store[key] = updated
-
-    def _append_chat_turn(self, role: str, message: str) -> None:
-        text = (message or "").strip()
-        if not text:
-            return
-        normalized_role = role if role in {"user", "assistant"} else "assistant"
-        self.chat_history.append((normalized_role, text))
-
-@dataclass
-class EarlyStopConfig:
-    score_threshold: float = 0.05
-    window_size: int = 0
-    patience: int = 2
-
-    def create_state(self, batch_size: int) -> "EarlyStopState":
-        window = self.window_size or batch_size
-        return EarlyStopState(
-            threshold=max(0.0, float(self.score_threshold)),
-            window=max(1, int(window)),
-            patience=max(1, int(self.patience)),
-        )
-
-
-@dataclass
-class EarlyStopState:
-    threshold: float
-    window: int
-    patience: int
-    scores: Deque[float] = field(default_factory=deque)
-    patience_hits: int = 0
-    last_average: float = 0.0
-
-    def observe(self, new_scores: Iterable[float]) -> bool:
-        for score in new_scores:
-            self.scores.append(float(score))
-            if len(self.scores) > self.window:
-                self.scores.popleft()
-        if len(self.scores) < self.window:
-            self.patience_hits = 0
-            self.last_average = 0.0
-            return False
-        self.last_average = sum(self.scores) / len(self.scores)
-        if self.last_average < self.threshold:
-            self.patience_hits += 1
-            if self.patience_hits >= self.patience:
-                return True
-        else:
-            self.patience_hits = 0
-        return False
-
 
 
 def _extract_query_exts(query: str, *, available_exts: Set[str]) -> Set[str]:
@@ -703,56 +817,6 @@ def _extract_query_exts(query: str, *, available_exts: Set[str]) -> Set[str]:
                 if norm in available_exts:
                     requested.add(norm)
     return requested
-
-
-def _prioritize_ext_hits(
-    hits: List[Dict[str, Any]], *, desired_exts: Set[str], top_k: int
-) -> List[Dict[str, Any]]:
-    if not hits:
-        return []
-    if not desired_exts:
-        return hits[:top_k]
-
-    desired_hits: List[Dict[str, Any]] = []
-    other_hits: List[Dict[str, Any]] = []
-
-    for hit in hits:
-        ext = _normalize_ext(hit.get("ext", ""))
-        if ext in desired_exts:
-            desired_hits.append(hit)
-        else:
-            other_hits.append(hit)
-
-    if not desired_hits:
-        return hits[:top_k]
-
-    required_matches = max(1, min(top_k, int(math.ceil(top_k * 0.95))))
-    take_from_desired = min(len(desired_hits), required_matches)
-
-    ordered: List[Dict[str, Any]] = desired_hits[:take_from_desired]
-
-    remaining_slots = top_k - len(ordered)
-    if remaining_slots > 0 and take_from_desired < len(desired_hits):
-        additional = desired_hits[take_from_desired : take_from_desired + remaining_slots]
-        ordered.extend(additional)
-        remaining_slots = top_k - len(ordered)
-
-    if remaining_slots > 0:
-        ordered.extend(other_hits[:remaining_slots])
-
-    return ordered[:top_k]
-
-
-def _minmax_scale(values: Sequence[float]) -> List[float]:
-    data = [float(v) for v in values if v is not None]
-    if not data:
-        return []
-    vmin = min(data)
-    vmax = max(data)
-    if math.isclose(vmax, vmin, abs_tol=1e-12):
-        return [0.5] * len(values)
-    span = vmax - vmin
-    return [((float(v) - vmin) / span) if v is not None else 0.0 for v in values]
 
 
 def _dynamic_oversample(
@@ -827,33 +891,6 @@ def _dynamic_search_params(
     }
 
 
-def _compute_extension_bonus(
-    ext: Optional[str],
-    desired_exts: Set[str],
-    session: Optional[SessionState],
-) -> Tuple[float, float, float]:
-    normalized = _normalize_ext(ext)
-    desired_bonus = _EXTENSION_MATCH_BONUS if normalized and normalized in desired_exts else 0.0
-    session_bonus = 0.0
-    if session is not None and normalized:
-        preference = session.preferred_exts.get(normalized, 0.0)
-        if preference:
-            session_bonus = preference * _SESSION_EXT_PREF_SCALE
-    return desired_bonus + session_bonus, desired_bonus, session_bonus
-
-
-def _compute_owner_bonus(owner: Optional[str], session: Optional[SessionState]) -> float:
-    if session is None or not owner:
-        return 0.0
-    normalized = _normalize_owner(str(owner))
-    if not normalized:
-        return 0.0
-    preference = session.owner_prior.get(normalized, 0.0)
-    if not preference:
-        return 0.0
-    return preference * _SESSION_OWNER_PREF_SCALE
-
-
 def _should_expand_query(
     query: str,
     *,
@@ -919,7 +956,9 @@ def _mmr(
 
     D = np.vstack(doc_vectors).astype(np.float32, copy=False)
     q = VectorIndex._normalize_vector(np.asarray(qvec, dtype=np.float32))
-    sim_to_query = (D @ q.reshape(-1, 1)).ravel()
+    # NOTE: On some macOS Python builds (Accelerate + NumPy 2.0.x),
+    # `matmul` can emit spurious RuntimeWarnings; use `np.dot` for stability.
+    sim_to_query = np.dot(D, q)
 
     selected_indices: List[int] = []
     chosen_hits: List[Dict[str, Any]] = []
@@ -934,7 +973,7 @@ def _mmr(
             continue
 
         selected_matrix = D[selected_indices]
-        inter = D @ selected_matrix.T
+        inter = np.dot(D, selected_matrix.T)
         max_inter = inter.max(axis=1)
         mmr_scores = lambda_ * sim_to_query - (1.0 - lambda_) * max_inter
         for idx in selected_indices:
@@ -1075,6 +1114,11 @@ def _annotate_hits(
             else:
                 reasons.append("세션 비선호 작성자 페널티")
 
+        meeting_bonus = _safe_float(hit.get("meeting_artifact_bonus"))
+        if meeting_bonus is not None and meeting_bonus > 0.0:
+            breakdown["meeting_bonus"] = round(meeting_bonus, 4)
+            reasons.append("회의 산출물(요약/전사) 우선")
+
         metadata_reasons = metadata_summary if metadata_summary else []
 
         if matched_terms:
@@ -1084,6 +1128,18 @@ def _annotate_hits(
             snippet = ", ".join(synonym_matches[:4])
             reasons.append(f"확장/동의어 매칭: {snippet}")
         reasons.extend(metadata_reasons)
+
+        exact_terms = hit.get("exact_terms_matched")
+        if isinstance(exact_terms, list) and exact_terms:
+            snippet = ", ".join(str(t) for t in exact_terms[:3] if t)
+            if snippet:
+                reasons.append(f"정확 일치: {snippet}")
+
+        filename_terms = hit.get("filename_terms_matched")
+        if isinstance(filename_terms, list) and filename_terms:
+            snippet = ", ".join(str(t) for t in filename_terms[:3] if t)
+            if snippet:
+                reasons.append(f"파일명 일치: {snippet}")
 
         hit["score_breakdown"] = breakdown
         hit["matched_terms"] = matched_terms
@@ -1106,8 +1162,6 @@ def _extension_related_tokens_cached(ext: str) -> Tuple[str, ...]:
     related.add(normalized)
     for keyword in _EXT_SYNONYMS.get(normalized, set()):
         related.update(_keyword_forms(keyword))
-    for domain_keyword in _DOMAIN_KEYWORDS_BY_EXT.get(normalized, set()):
-        related.update(_keyword_forms(domain_keyword))
     return tuple(sorted({tok for tok in related if tok}))
 
 
@@ -1265,175 +1319,25 @@ def _compose_model_text(base_text: str, metadata: str) -> str:
     return base_text
 
 
-@dataclass
-class MetadataFilters:
-    mtime_from: Optional[float] = None
-    mtime_to: Optional[float] = None
-    ctime_from: Optional[float] = None
-    ctime_to: Optional[float] = None
-    size_min: Optional[int] = None
-    size_max: Optional[int] = None
-    owners: Set[str] = field(default_factory=set)
-
-    def is_active(self) -> bool:
-        return any(
-            value is not None
-            for value in (
-                self.mtime_from,
-                self.mtime_to,
-                self.ctime_from,
-                self.ctime_to,
-                self.size_min,
-                self.size_max,
-            )
-        ) or bool(self.owners)
-
-    def matches(self, hit: Dict[str, Any]) -> bool:
-        if not self.is_active():
-            return True
-        mtime = _to_float(hit.get("mtime"))
-        ctime = _to_float(hit.get("ctime"))
-        size = _to_int(hit.get("size"))
-        owner = _clean_token(hit.get("owner", ""))
-
-        if self.mtime_from is not None and (mtime is None or mtime < self.mtime_from):
-            return False
-        if self.mtime_to is not None and (mtime is None or mtime > self.mtime_to):
-            return False
-        if self.ctime_from is not None and (ctime is None or ctime < self.ctime_from):
-            return False
-        if self.ctime_to is not None and (ctime is None or ctime > self.ctime_to):
-            return False
-        if self.size_min is not None and (size is None or size < self.size_min):
-            return False
-        if self.size_max is not None and (size is None or size > self.size_max):
-            return False
-        if self.owners and owner and owner not in self.owners:
-            return False
-        if self.owners and not owner:
-            return False
-        return True
-
-
-def _to_float(value: Any) -> Optional[float]:
-    if value is None:
-        return None
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return None
-
-
-def _to_int(value: Any) -> Optional[int]:
-    if value is None:
-        return None
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return None
-
-
-def _year_bounds(year: int) -> Tuple[float, float]:
-    start = datetime(year, 1, 1)
-    end = datetime(year, 12, 31, 23, 59, 59)
-    return start.timestamp(), end.timestamp()
-
-
-def _month_bounds(now: datetime, months_ago: int) -> Tuple[float, float]:
-    year = now.year
-    month = now.month - months_ago
-    while month <= 0:
-        month += 12
-        year -= 1
-    start = datetime(year, month, 1)
-    last_day = calendar.monthrange(year, month)[1]
-    end = datetime(year, month, last_day, 23, 59, 59)
-    return start.timestamp(), end.timestamp()
-
-
-def _approx_range(value: int, *, tolerance: float = 0.15) -> Tuple[float, float]:
-    delta = max(1.0, value * tolerance)
-    return value - delta, value + delta
-
-
-def _normalize_owner(owner: str) -> str:
-    return _clean_token(owner)
-
-
-def _parse_size_expression(value: str, unit: str) -> int:
-    base = float(value)
-    unit = unit.lower()
-    multiplier = {
-        "kb": 1024,
-        "mb": 1024 ** 2,
-        "gb": 1024 ** 3,
-        "tb": 1024 ** 4,
-    }.get(unit, 1)
-    return int(base * multiplier)
-
-
-def _extract_metadata_filters(query: str) -> MetadataFilters:
-    filters = MetadataFilters()
-    lowered = query.lower()
-    now = datetime.now()
-
-    year_match = re.search(r"(20\d{2}|19\d{2})\s*년", lowered)
-    if year_match:
-        year = int(year_match.group(1))
-        filters.mtime_from, filters.mtime_to = _year_bounds(year)
-
-    rel_year = re.search(r"(\d+)\s*년\s*전", lowered)
-    if rel_year:
-        years = int(rel_year.group(1))
-        target_year = now.year - years
-        filters.mtime_from, filters.mtime_to = _year_bounds(target_year)
-
-    if "작년" in lowered:
-        filters.mtime_from, filters.mtime_to = _year_bounds(now.year - 1)
-    if "재작년" in lowered:
-        filters.mtime_from, filters.mtime_to = _year_bounds(now.year - 2)
-    if "올해" in lowered or "올 해" in lowered or "금년" in lowered:
-        filters.mtime_from, filters.mtime_to = _year_bounds(now.year)
-
-    rel_month = re.search(r"(\d+)\s*개월\s*전", lowered)
-    if rel_month:
-        months = int(rel_month.group(1))
-        filters.mtime_from, filters.mtime_to = _month_bounds(now, months)
-    if "지난달" in lowered:
-        filters.mtime_from, filters.mtime_to = _month_bounds(now, 1)
-    if "이번달" in lowered or "이 달" in lowered:
-        filters.mtime_from, filters.mtime_to = _month_bounds(now, 0)
-
-    if any(keyword in lowered for keyword in ["최근", "요즘", "요근래", "최근에"]):
-        horizon = now - timedelta(days=180)
-        filters.mtime_from = horizon.timestamp()
-
-    for match in re.finditer(r"(\d+(?:\.\d+)?)\s*(kb|mb|gb|tb)\s*(이상|이하|초과|미만|보다 큰|보다 작은|at least|over|under|at most)?", lowered):
-        value = match.group(1)
-        unit = match.group(2)
-        qualifier = match.group(3) or ""
-        size_bytes = _parse_size_expression(value, unit)
-        if any(token in qualifier for token in ["이상", "초과", "보다 큰", "at least", "over"]):
-            filters.size_min = max(filters.size_min or 0, size_bytes)
-        elif any(token in qualifier for token in ["이하", "미만", "보다 작은", "at most", "under"]):
-            filters.size_max = min(filters.size_max or size_bytes, size_bytes)
-        else:
-            approx_min, approx_max = _approx_range(size_bytes)
-            filters.size_min = max(filters.size_min or 0, int(approx_min))
-            filters.size_max = min(filters.size_max or int(approx_max), int(approx_max))
-
-    for match in re.finditer(r"(?:작성자|author|owner)[:\s]+([\w가-힣@.]+)", query, re.IGNORECASE):
-        filters.owners.add(_normalize_owner(match.group(1)))
-    for mention in re.findall(r"@([\w가-힣._-]+)", query):
-        filters.owners.add(_normalize_owner(mention))
-
-    return filters
-
-
-def _apply_metadata_filters(hits: List[Dict[str, Any]], filters: MetadataFilters) -> List[Dict[str, Any]]:
-    if not filters.is_active():
-        return hits
-    return [hit for hit in hits if filters.matches(hit)]
+def _ensure_unique_paths(
+    selected: List[Dict[str, Any]],
+    pool: List[Dict[str, Any]],
+    top_k: int,
+) -> List[Dict[str, Any]]:
+    """Ensure top-k results contain unique `path` entries, filling from pool when needed."""
+    if not selected or top_k <= 0:
+        return selected[: max(top_k, 0)]
+    seen: Set[str] = set()
+    unique: List[Dict[str, Any]] = []
+    for hit in list(selected) + list(pool):
+        path = str(hit.get("path") or "")
+        if not path or path in seen:
+            continue
+        seen.add(path)
+        unique.append(hit)
+        if len(unique) >= top_k:
+            break
+    return unique
 
 
 def _collect_hit_tokens(hit: Dict[str, Any]) -> Set[str]:
@@ -1479,10 +1383,28 @@ def _rerank_hits(
     if not hits:
         return []
 
+    query_lower = (raw_query or "").strip().lower()
+    meeting_intent = False
+
     base_tokens = {tok for tok in _split_tokens(raw_query.lower()) if tok}
     expanded_tokens = {tok for tok in _split_tokens(expanded_query.lower()) if tok}
     query_tokens = base_tokens or expanded_tokens
     synonym_tokens = expanded_tokens - base_tokens
+    exact_terms = _extract_exact_query_terms(raw_query)
+    exact_bonus_env = os.getenv("INFOPILOT_EXACT_MATCH_BONUS", "").strip()
+    exact_bonus = 0.75
+    if exact_bonus_env:
+        try:
+            exact_bonus = float(exact_bonus_env)
+        except ValueError:
+            pass
+    filename_bonus_env = os.getenv("INFOPILOT_FILENAME_MATCH_BONUS", "").strip()
+    filename_bonus = 0.25
+    if filename_bonus_env:
+        try:
+            filename_bonus = float(filename_bonus_env)
+        except ValueError:
+            pass
     scored_hits: List[Dict[str, Any]] = []
     use_lexical_overlap = _LEXICAL_WEIGHT > 0.0
 
@@ -1534,7 +1456,34 @@ def _rerank_hits(
         )
         owner_bonus = _compute_owner_bonus(hit.get("owner"), session)
         temporal_factor = _temporal_weight(hit.get("mtime"), hit.get("ctime"))
+        matched_exact_terms: List[str] = []
+        if exact_terms:
+            matched_exact_terms = [term for term in exact_terms if term in hit_tokens]
         final_score = (float(base_score) * temporal_factor) + total_ext_bonus + owner_bonus
+        if matched_exact_terms and exact_bonus:
+            final_score += float(exact_bonus)
+            hit["exact_terms_matched"] = matched_exact_terms
+            path = str(hit.get("path") or "")
+            if path:
+                try:
+                    filename = Path(path).name.lower()
+                except Exception:
+                    filename = ""
+                filename_terms_matched = [term for term in matched_exact_terms if term.lower() in filename] if filename else []
+                if filename_terms_matched and filename_bonus:
+                    final_score += float(filename_bonus)
+                    hit["filename_terms_matched"] = filename_terms_matched
+
+        meeting_bonus = 0.0
+        if meeting_intent:
+            path = str(hit.get("path") or "")
+            if _is_user_facing_meeting_artifact(path):
+                parts = _path_parts_lower(path)
+                if parts:
+                    meeting_bonus = float(_MEETING_ARTIFACT_SCORE_BONUS.get(parts[-1], 0.0))
+                    if meeting_bonus:
+                        final_score += meeting_bonus
+                        hit["meeting_artifact_bonus"] = meeting_bonus
         hit["score"] = final_score
         hit["temporal_weight"] = temporal_factor
         if "vector_similarity" in hit:
@@ -1548,205 +1497,6 @@ def _rerank_hits(
 
     scored_hits.sort(key=lambda item: item.get("score", item.get("similarity", 0.0)), reverse=True)
     return _prioritize_ext_hits(scored_hits, desired_exts=desired_exts, top_k=top_k)
-
-
-def _compose_rerank_document(hit: Dict[str, Any]) -> str:
-    sections: List[str] = []
-    path = str(hit.get("path") or "").strip()
-    if path:
-        sections.append(f"파일 경로: {_mask_path(path)}")
-    ext = str(hit.get("ext") or "").strip()
-    if ext:
-        sections.append(f"확장자: {ext}")
-    drive = str(hit.get("drive") or "").strip()
-    if drive:
-        sections.append(f"드라이브: {drive}")
-    owner = str(hit.get("owner") or "").strip()
-    if owner:
-        sections.append(f"작성자: {owner}")
-    mtime_label = _format_human_time(hit.get("mtime"))
-    if mtime_label:
-        sections.append(f"수정일: {mtime_label}")
-    size_label = _format_size(hit.get("size"))
-    if size_label:
-        sections.append(f"파일 크기: {size_label}")
-    preview = str(hit.get("preview") or "").strip()
-    if preview:
-        sections.append(preview)
-    return "\n".join(section for section in sections if section)
-
-
-class CrossEncoderReranker:
-    def __init__(
-        self,
-        model_name: str,
-        *,
-        device: Optional[str] = None,
-        batch_size: int = 16,
-        early_stop: Optional[EarlyStopConfig] = None,
-    ) -> None:
-        if CrossEncoder is None:
-            raise RuntimeError("sentence-transformers의 CrossEncoder를 사용할 수 없습니다.")
-        self.model_name = model_name
-        self.device = device or None
-        self.batch_size = max(1, int(batch_size) if batch_size else 1)
-        self.early_stop_config = early_stop or EarlyStopConfig(window_size=self.batch_size)
-        if self.early_stop_config.window_size <= 0:
-            self.early_stop_config.window_size = self.batch_size
-
-        load_kwargs: Dict[str, Any] = {}
-        if self.device:
-            load_kwargs["device"] = self.device
-
-        t0 = time.time()
-        try:
-            self.model = CrossEncoder(model_name, **load_kwargs)
-        except RuntimeError as exc:
-            message = str(exc).lower()
-            if "meta tensor" in message or "to_empty" in message:
-                logger.warning(
-                    "CrossEncoder load failed on device=%s; retrying on CPU. %s",
-                    load_kwargs.get("device", "auto"),
-                    exc,
-                )
-                load_kwargs["device"] = "cpu"
-                self.device = "cpu"
-                self.model = CrossEncoder(model_name, **load_kwargs)
-            else:
-                raise
-        dt = time.time() - t0
-        device_label = self.device or getattr(self.model, "device", "cpu")
-        logger.info("reranker loaded: model=%s device=%s dt=%.1fs", model_name, device_label, dt)
-
-    def rerank(
-        self,
-        query: str,
-        hits: List[Dict[str, Any]],
-        *,
-        desired_exts: Optional[Set[str]] = None,
-        session: Optional[SessionState] = None,
-    ) -> List[Dict[str, Any]]:
-        if not hits:
-            return []
-
-        pairs: List[List[str]] = []
-        prepared_hits: List[Dict[str, Any]] = []
-        for hit in hits:
-            doc_text = _compose_rerank_document(hit)
-            pairs.append([query, doc_text])
-            prepared_hits.append(dict(hit))
-
-        collected: List[float] = []
-        try:
-            for batch_scores in self._predict_iter(pairs):
-                collected.extend(batch_scores)
-        except Exception as exc:  # pragma: no cover - defensive path
-            logger.warning("rerank inference failed, fallback to previous scores: %s", exc)
-            return hits
-
-        if not collected:
-            return hits
-
-        ext_preferences = desired_exts or set()
-        rerank_raw = [float(s) for s in collected[: len(prepared_hits)]]
-        vector_components = [float(h.get("vector_similarity", 0.0)) for h in prepared_hits]
-        lexical_components = [float(h.get("lexical_score", 0.0)) for h in prepared_hits]
-
-        rerank_scaled = _minmax_scale(rerank_raw)
-        vector_scaled = _minmax_scale(vector_components)
-        lexical_scaled = _minmax_scale(lexical_components)
-
-        alpha, beta, gamma = 0.60, 0.25, 0.15
-        combined_hits: List[Dict[str, Any]] = []
-
-        for idx, hit in enumerate(prepared_hits):
-            rerank_score = rerank_raw[idx] if idx < len(rerank_raw) else 0.0
-            rerank_component = rerank_scaled[idx] if idx < len(rerank_scaled) else 0.0
-            vector_component = vector_scaled[idx] if idx < len(vector_scaled) else 0.0
-            lexical_component = lexical_scaled[idx] if idx < len(lexical_scaled) else 0.0
-
-            ext = _normalize_ext(hit.get("ext"))
-            total_ext_bonus, desired_ext_bonus, session_ext_bonus = _compute_extension_bonus(
-                ext,
-                ext_preferences,
-                session,
-            )
-            owner_bonus = _compute_owner_bonus(hit.get("owner"), session)
-            temporal_factor = float(hit.get("temporal_weight", 1.0))
-
-            combined = (
-                (alpha * rerank_component)
-                + (beta * vector_component)
-                + (gamma * lexical_component)
-                + total_ext_bonus
-                + owner_bonus
-            )
-            combined *= temporal_factor
-
-            negative_penalty = float(hit.get("negative_penalty", 0.0) or 0.0)
-            if negative_penalty > 0.0:
-                combined = max(0.0, combined - negative_penalty)
-
-            original_vector = float(hit.get("vector_similarity", hit.get("similarity", 0.0)))
-            hit["vector_similarity"] = original_vector
-            hit.setdefault("pre_rerank_score", float(hit.get("score", 0.0)))
-            hit["rerank_score"] = float(rerank_score)
-            hit["combined_score"] = float(combined)
-            hit["score"] = float(combined)
-            hit["similarity"] = original_vector
-            hit["desired_extension_bonus"] = float(desired_ext_bonus)
-            hit["session_ext_bonus"] = float(session_ext_bonus)
-            hit["session_owner_bonus"] = float(owner_bonus)
-            hit["temporal_weight"] = temporal_factor
-            if total_ext_bonus:
-                hit["rerank_ext_bonus"] = total_ext_bonus
-            match_reasons = hit.get("match_reasons")
-            if match_reasons is not None and session_ext_bonus:
-                label = "세션 선호 확장자 가중치" if session_ext_bonus > 0 else "세션 비선호 확장자 페널티"
-                if label not in match_reasons:
-                    match_reasons.append(label)
-            if match_reasons is not None and owner_bonus:
-                owner_label = "세션 선호 작성자 가중치" if owner_bonus > 0 else "세션 비선호 작성자 페널티"
-                if owner_label not in match_reasons:
-                    match_reasons.append(owner_label)
-            combined_hits.append(hit)
-
-        combined_hits.sort(key=lambda item: item.get("score", 0.0), reverse=True)
-        return combined_hits
-
-    def _predict_iter(self, pairs: List[List[str]]) -> Iterable[np.ndarray]:
-        total = len(pairs)
-        if total <= self.batch_size:
-            yield self.model.predict(
-                pairs,
-                batch_size=self.batch_size,
-                convert_to_numpy=True,
-                show_progress_bar=False,
-            )
-            return
-
-        start = 0
-        stop_state = self.early_stop_config.create_state(self.batch_size)
-        while start < total:
-            end = min(total, start + self.batch_size)
-            batch = pairs[start:end]
-            batch_scores = self.model.predict(
-                batch,
-                batch_size=self.batch_size,
-                convert_to_numpy=True,
-                show_progress_bar=False,
-            )
-            yield batch_scores
-            if stop_state.observe(batch_scores):
-                logger.info(
-                    "reranker early stop: avg=%.4f window=%d processed=%d/%d",
-                    stop_state.last_average,
-                    stop_state.window,
-                    end,
-                    total,
-                )
-                break
-            start = end
 
 
 try:
@@ -1769,1117 +1519,6 @@ try:
     import joblib  # noqa: F811 - re-import for static analyzers
 except Exception:  # pragma: no cover
     joblib = None
-
-
-def _alias_legacy_modules() -> bool:
-    candidates = ["pipeline", "step2_module_progress", "step2_pipeline", "Step2_module_progress"]
-    for name in candidates:
-        try:
-            mod = importlib.import_module(name)
-            sys.modules["TextCleaner"] = mod
-            return True
-        except Exception:
-            continue
-    shim = types.ModuleType("TextCleaner")
-    sys.modules["TextCleaner"] = shim
-    return False
-
-
-class QueryEncoder:
-    def __init__(self, model_path: Path):
-        if joblib is None:
-            raise RuntimeError("joblib이 필요합니다. pip install joblib")
-
-        try:
-            obj = joblib.load(model_path)
-        except ModuleNotFoundError as e:
-            if "TextCleaner" in str(e):
-                logger.warning("legacy model detected; injecting TextCleaner alias and retrying")
-                _alias_legacy_modules()
-                obj = joblib.load(model_path)
-            else:
-                raise
-
-        self.model_type = MODEL_TYPE_SENTENCE_TRANSFORMER
-        self.embedding_dim: Optional[int] = None
-        self.embedder: Optional[SentenceTransformer] = None
-        self.pipeline = None
-        self.tfidf = None
-        self.svd = None
-
-        if isinstance(obj, dict) and obj.get("model_type") == MODEL_TYPE_SENTENCE_TRANSFORMER:
-            if SentenceTransformer is None:
-                raise RuntimeError(
-                    "sentence-transformers 라이브러리가 필요합니다. pip install sentence-transformers"
-                )
-            model_name = obj.get("model_name") or DEFAULT_EMBED_MODEL
-            resolved_model = _resolve_sentence_transformer_location(model_name)
-            if resolved_model != model_name:
-                logger.info("Sentence-BERT loaded (local): %s -> %s", model_name, resolved_model)
-            else:
-                logger.info("Sentence-BERT loaded: %s", model_name)
-            try:
-                self.embedder = SentenceTransformer(resolved_model)
-            except (RuntimeError, NotImplementedError) as exc:
-                message = str(exc).lower()
-                meta_issue = "meta tensor" in message or "to_empty" in message
-                if meta_issue:
-                    logger.warning("SentenceTransformer auto-device load failed; falling back to CPU. %s", exc)
-                    try:
-                        self.embedder = SentenceTransformer(resolved_model, device="cpu")
-                    except Exception as inner_exc:
-                        raise RuntimeError(TORCH_META_HINT) from inner_exc
-                else:
-                    raise
-            detected_dim = obj.get("embedding_dim")
-            if detected_dim:
-                try:
-                    self.embedding_dim = int(detected_dim)
-                except (TypeError, ValueError):
-                    self.embedding_dim = self.embedder.get_sentence_embedding_dimension()
-            else:
-                self.embedding_dim = self.embedder.get_sentence_embedding_dimension()
-            self.cluster_model = obj.get("cluster_model")
-            self.train_config = obj.get("train_config")
-        else:
-            self.model_type = "tfidf"
-            self.pipeline = obj["pipeline"]
-            self.tfidf = self.pipeline.named_steps["tfidf"]
-            self.svd = self.pipeline.named_steps["svd"]
-            self.embedding_dim = getattr(self.svd, "n_components", None)
-            self.cluster_model = None
-            self.train_config = obj.get("cfg") if isinstance(obj, dict) else None
-
-    @staticmethod
-    def _sanitize_texts(texts: List[Any]) -> List[str]:
-        cleaned: List[str] = []
-        for raw in texts:
-            if raw is None:
-                cleaned.append("")
-                continue
-            cleaned.append(str(raw))
-        return cleaned
-
-    def encode_docs(self, texts: List[str]) -> np.ndarray:
-        texts = self._sanitize_texts(texts)
-        if self.model_type == MODEL_TYPE_SENTENCE_TRANSFORMER and self.embedder is not None:
-            batch_size = int(os.getenv("INDEX_EMBED_BATCH", "16") or 16)
-            Z = self.embedder.encode(
-                texts,
-                batch_size=max(1, batch_size),
-                show_progress_bar=False,
-                convert_to_numpy=True,
-                normalize_embeddings=True,
-            )
-            return np.asarray(Z, dtype=np.float32)
-
-        if self.tfidf is None or self.svd is None:
-            raise RuntimeError("TF-IDF 파이프라인이 초기화되지 않았습니다.")
-        X = self.tfidf.transform(texts)
-        Z = self.svd.transform(X)
-        return Z.astype(np.float32, copy=False)
-
-    def encode_query(self, query: str) -> np.ndarray:
-        clean_query = self._sanitize_texts([query])
-        if self.model_type == MODEL_TYPE_SENTENCE_TRANSFORMER and self.embedder is not None:
-            batch_size = int(os.getenv("INDEX_QUERY_BATCH", "4") or 4)
-            Zq = self.embedder.encode(
-                clean_query,
-                batch_size=max(1, batch_size),
-                show_progress_bar=False,
-                convert_to_numpy=True,
-                normalize_embeddings=True,
-            )
-            return np.asarray(Zq, dtype=np.float32)
-
-        if self.tfidf is None or self.svd is None:
-            raise RuntimeError("TF-IDF 파이프라인이 초기화되지 않았습니다.")
-        Xq = self.tfidf.transform(clean_query)
-        Zq = self.svd.transform(Xq)
-        return Zq.astype(np.float32, copy=False)
-
-
-@dataclass
-class IndexPaths:
-    emb_npy: Optional[Path]
-    meta_json: Path
-    faiss_index: Optional[Path] = None
-
-
-class VectorIndex:
-    LEXICAL_SCHEMA_VERSION = 2.0
-    def __init__(self) -> None:
-        self.dimension: Optional[int] = None
-        self.doc_ids: List[int] = []
-        self.entries: Dict[int, Dict[str, Any]] = {}
-        self.lexical_tokens: Dict[int, List[str]] = {}
-        self.embeddings: Dict[int, np.ndarray] = {}
-        self._path_to_id: Dict[str, int] = {}
-
-        self.paths: List[str] = []
-        self.exts: List[str] = []
-        self.preview: List[str] = []
-        self.sizes: List[Optional[int]] = []
-        self.mtimes: List[Optional[float]] = []
-        self.ctimes: List[Optional[float]] = []
-        self.owners: List[Optional[str]] = []
-        self.drives: List[Optional[str]] = []
-        self.chunk_ids: List[Optional[int]] = []
-        self.chunk_counts: List[Optional[int]] = []
-        self.chunk_tokens: List[Optional[int]] = []
-
-        self.Z: Optional[np.ndarray] = None
-        self.faiss_index = None
-        self.lexical_index: Optional[BM25Okapi] = None
-        self.ann_index = None
-        self._ann_backend_active: Optional[str] = None
-        self._ann_hnsw = None
-
-        self._matrix_dirty = True
-        self._faiss_dirty = True
-        self._lexical_dirty = True
-        self._ann_dirty = True
-
-        self.lexical_weight = 0.0
-        self.ann_threshold = 50000
-        self.ann_m = 32
-        self.ann_ef_construction = 80
-        self.ann_ef_search = 64
-        self.faiss_use_pq = True
-        self.faiss_pq_threshold = 2000
-        self.faiss_pq_m = 32
-        self.faiss_pq_nbits = 8
-        self.faiss_pq_min_nlist = 64
-        self.faiss_pq_max_nlist = 4096
-        self.faiss_pq_nprobe = 64
-        self._faiss_pq_active = False
-
-    @staticmethod
-    def _normalize_rows(matrix: np.ndarray) -> np.ndarray:
-        norms = np.linalg.norm(matrix, axis=1, keepdims=True) + 1e-12
-        return (matrix / norms).astype(np.float32, copy=False)
-
-    @staticmethod
-    def _normalize_vector(vec: np.ndarray) -> np.ndarray:
-        arr = np.asarray(vec, dtype=np.float32).reshape(-1)
-        norm = float(np.linalg.norm(arr)) + 1e-12
-        return (arr / norm).astype(np.float32, copy=False)
-
-    @staticmethod
-    def _ann_backend() -> Optional[str]:
-        if os.getenv("DISABLE_ANN") == "1":
-            return None
-        prefer_faiss = os.getenv("FORCE_FAISS") == "1" or os.getenv("DISABLE_HNSWLIB") == "1"
-        if not prefer_faiss and hnswlib is not None:
-            return "hnswlib"
-        if faiss is not None:
-            return "faiss"
-        if hnswlib is not None:
-            return "hnswlib"
-        return None
-
-    @staticmethod
-    def _normalize_path(path: str) -> str:
-        try:
-            return os.path.normcase(str(Path(path).resolve()))
-        except Exception:
-            return os.path.normcase(str(path))
-
-    @staticmethod
-    def _truncate_preview(text: str, limit: int = MAX_PREVIEW_CHARS) -> str:
-        src = (text or "").strip()
-        return src if len(src) <= limit else f"{src[:limit]}…"
-
-    @staticmethod
-    def _generate_doc_ids(paths: Iterable[str]) -> List[int]:
-        assigned: Set[int] = set()
-        ids: List[int] = []
-        mask = (1 << 63) - 1
-        for raw_path in paths:
-            norm = VectorIndex._normalize_path(raw_path)
-            digest = hashlib.sha1(norm.encode("utf-8")).digest()
-            candidate = int.from_bytes(digest[:8], byteorder="big") & mask
-            while candidate in assigned:
-                candidate = (candidate + 1) & mask
-            assigned.add(candidate)
-            ids.append(candidate)
-        return ids
-
-    def _allocate_doc_id(self, path: str) -> int:
-        normalized = self._normalize_path(path)
-        existing = self._path_to_id.get(normalized)
-        if existing is not None:
-            return existing
-        mask = (1 << 63) - 1
-        digest = hashlib.sha1(normalized.encode("utf-8")).digest()
-        candidate = int.from_bytes(digest[:8], byteorder="big") & mask
-        while candidate in self.entries and self.entries[candidate].get("path") != path:
-            candidate = (candidate + 1) & mask
-        return candidate
-
-    def _rebuild_lists(self) -> None:
-        self.paths = []
-        self.exts = []
-        self.preview = []
-        self.sizes = []
-        self.mtimes = []
-        self.ctimes = []
-        self.owners = []
-        self.drives = []
-        self.chunk_ids = []
-        self.chunk_counts = []
-        self.chunk_tokens = []
-        for doc_id in self.doc_ids:
-            entry = self.entries.get(doc_id, {})
-            self.paths.append(entry.get("path", ""))
-            self.exts.append(entry.get("ext", ""))
-            self.preview.append(entry.get("preview", ""))
-            self.sizes.append(entry.get("size"))
-            self.mtimes.append(entry.get("mtime"))
-            self.ctimes.append(entry.get("ctime"))
-            self.owners.append(entry.get("owner"))
-            self.drives.append(entry.get("drive"))
-            self.chunk_ids.append(entry.get("chunk_id"))
-            self.chunk_counts.append(entry.get("chunk_count"))
-            self.chunk_tokens.append(entry.get("chunk_tokens"))
-
-    def _mark_faiss_dirty(self) -> None:
-        self._faiss_dirty = True
-
-    def _mark_lexical_dirty(self) -> None:
-        self._lexical_dirty = True
-
-    def _mark_ann_dirty(self) -> None:
-        self._ann_dirty = True
-        self._ann_backend_active = None
-
-    def _ensure_matrix(self) -> None:
-        if not self._matrix_dirty:
-            return
-        if not self.embeddings:
-            self.Z = None
-            self._matrix_dirty = False
-            return
-        ordered = [self.embeddings[doc_id] for doc_id in self.doc_ids if doc_id in self.embeddings]
-        if not ordered:
-            self.Z = None
-            self._matrix_dirty = False
-            return
-        self.Z = np.vstack(ordered).astype(np.float32, copy=False)
-        self.dimension = self.Z.shape[1]
-        self._matrix_dirty = False
-
-    def _ensure_faiss_index(self) -> None:
-        if not self._faiss_dirty:
-            return
-        if faiss is None or self._ann_backend() == "hnswlib":
-            self.faiss_index = None
-            self._faiss_dirty = False
-            return
-        if not self.doc_ids:
-            self.faiss_index = None
-            self._faiss_dirty = False
-            return
-        if self.Z is None:
-            self._ensure_matrix()
-        if self.Z is None or self.Z.size == 0:
-            self.faiss_index = None
-            self._faiss_dirty = False
-            return
-        dim = self.Z.shape[1]
-        use_pq = (
-            self.faiss_use_pq
-            and len(self.doc_ids) >= max(1, self.faiss_pq_threshold)
-        )
-        index = None
-        if use_pq:
-            index = self._build_ivfpq_index(dim)
-        if index is None:
-            base = faiss.IndexFlatIP(dim)
-            index = faiss.IndexIDMap(base)
-            ids = np.asarray(self.doc_ids, dtype=np.int64)
-            index.add_with_ids(self.Z, ids)
-            self._faiss_pq_active = False
-        else:
-            self._faiss_pq_active = True
-        self.faiss_index = index
-        self.dimension = dim
-        self._faiss_dirty = False
-
-    def _ensure_lexical_index(self) -> None:
-        if not self._lexical_dirty:
-            return
-        if BM25Okapi is None or not self.doc_ids:
-            self.lexical_index = None
-            self._lexical_dirty = False
-            return
-        corpus = [self.lexical_tokens.get(doc_id, []) for doc_id in self.doc_ids]
-        try:
-            self.lexical_index = BM25Okapi(corpus) if corpus else None
-        except Exception:
-            self.lexical_index = None
-        self._lexical_dirty = False
-
-    def _resolve_pq_nlist(self) -> int:
-        total = len(self.doc_ids)
-        if total <= 0:
-            return 0
-        base = max(self.faiss_pq_min_nlist, total // 8)
-        nlist = min(self.faiss_pq_max_nlist, base)
-        nlist = max(1, min(nlist, total - 1))
-        return nlist
-
-    def _resolve_pq_m(self, dim: int) -> int:
-        target = min(max(1, self.faiss_pq_m), dim)
-        while target > 1 and dim % target != 0:
-            target -= 1
-        return max(1, target)
-
-    def _build_ivfpq_index(self, dim: int):
-        if faiss is None or self.Z is None or self.Z.size == 0:
-            return None
-        nlist = self._resolve_pq_nlist()
-        if nlist <= 0:
-            return None
-        subvectors = self._resolve_pq_m(dim)
-        if subvectors <= 0:
-            return None
-        try:
-            quantizer = faiss.IndexFlatIP(dim)
-            metric = getattr(faiss, "METRIC_INNER_PRODUCT", faiss.METRIC_L2)
-            index = faiss.IndexIVFPQ(
-                quantizer,
-                dim,
-                nlist,
-                subvectors,
-                max(1, int(self.faiss_pq_nbits)),
-                metric,
-            )
-        except Exception:
-            return None
-        try:
-            index.train(self.Z)
-        except Exception:
-            return None
-        ids = np.asarray(self.doc_ids, dtype=np.int64)
-        try:
-            index.add_with_ids(self.Z, ids)
-        except Exception:
-            return None
-        nprobe = max(1, min(self.faiss_pq_nprobe, nlist))
-        try:
-            index.nprobe = int(nprobe)
-        except Exception:
-            pass
-        return index
-
-    def _tokenize_entry(self, entry: Dict[str, Any]) -> List[str]:
-        corpus = " ".join(
-            str(entry.get(field, "")) for field in ("preview", "path", "ext", "owner", "drive")
-        )
-        return [tok for tok in _split_tokens(corpus.lower()) if tok]
-
-    def build(
-        self,
-        embeddings: np.ndarray,
-        paths: List[str],
-        exts: List[str],
-        preview_texts: List[str],
-        *,
-        tokens: Optional[List[List[str]]] = None,
-        sizes: Optional[List[Optional[int]]] = None,
-        mtimes: Optional[List[Optional[float]]] = None,
-        ctimes: Optional[List[Optional[float]]] = None,
-        owners: Optional[List[Optional[str]]] = None,
-        drives: Optional[List[Optional[str]]] = None,
-        doc_ids: Optional[List[int]] = None,
-        extra_meta: Optional[List[Dict[str, Any]]] = None,
-    ) -> None:
-        if embeddings.ndim != 2:
-            raise ValueError("embeddings는 2차원이어야 합니다.")
-
-        normalized_embeddings = self._normalize_rows(embeddings)
-        count = normalized_embeddings.shape[0]
-        if doc_ids is None:
-            doc_ids = self._generate_doc_ids(paths)
-        if len(doc_ids) != count:
-            raise ValueError("doc_id 수와 임베딩 수가 다릅니다.")
-
-        self.dimension = normalized_embeddings.shape[1]
-        self.doc_ids = [int(doc_id) for doc_id in doc_ids]
-        self.entries.clear()
-        self.lexical_tokens.clear()
-        self.embeddings = {
-            doc_id: normalized_embeddings[idx]
-            for idx, doc_id in enumerate(self.doc_ids)
-        }
-        self._path_to_id.clear()
-
-        def _meta_list(values: Optional[List[Any]], fallback: Any) -> List[Any]:
-            if values is None:
-                return [fallback] * count
-            if len(values) != count:
-                raise ValueError("메타데이터 길이가 문서 수와 다릅니다.")
-            return list(values)
-
-        size_list = _meta_list(sizes, 0)
-        mtime_list = _meta_list(mtimes, 0.0)
-        ctime_list = _meta_list(ctimes, 0.0)
-        owner_list = _meta_list(owners, "")
-        drive_list = _meta_list(drives, "")
-
-        for idx, doc_id in enumerate(self.doc_ids):
-            entry = {
-                "path": paths[idx],
-                "ext": exts[idx],
-                "preview": preview_texts[idx],
-                "size": size_list[idx],
-                "mtime": mtime_list[idx],
-                "ctime": ctime_list[idx],
-                "owner": owner_list[idx],
-                "drive": drive_list[idx],
-            }
-            if extra_meta and idx < len(extra_meta):
-                for key, value in extra_meta[idx].items():
-                    entry[key] = value
-            entry["preview"] = self._truncate_preview(entry.get("preview", ""))
-            self.entries[doc_id] = entry
-            provided_tokens = tokens[idx] if tokens and idx < len(tokens) else None
-            self.lexical_tokens[doc_id] = list(provided_tokens) if provided_tokens else self._tokenize_entry(entry)
-            self._path_to_id[self._normalize_path(entry["path"])] = doc_id
-
-        self._rebuild_lists()
-        self._matrix_dirty = True
-        self._mark_faiss_dirty()
-        self._mark_lexical_dirty()
-        self._mark_ann_dirty()
-        self._ensure_matrix()
-        self._ensure_faiss_index()
-        self._ensure_lexical_index()
-
-    def save(self, out_dir: Path) -> IndexPaths:
-        out_dir.mkdir(parents=True, exist_ok=True)
-        emb_path = out_dir / "doc_embeddings.npy"
-        meta_path = out_dir / "doc_meta.json"
-        faiss_path: Optional[Path] = out_dir / "doc_index.faiss"
-
-        def _tmp_path(final: Path) -> Path:
-            suffix = f".tmp.{os.getpid()}.{time.time_ns()}"
-            return final.with_name(final.name + suffix)
-
-        self._ensure_matrix()
-        if self.Z is not None:
-            tmp_emb = _tmp_path(emb_path)
-            np.save(tmp_emb, self.Z.astype(np.float32, copy=False), allow_pickle=False)
-            os.replace(tmp_emb, emb_path)
-        else:
-            try:
-                emb_path.unlink()
-            except FileNotFoundError:
-                pass
-            emb_path = None
-
-        tokens_payload = [self.lexical_tokens.get(doc_id, []) for doc_id in self.doc_ids]
-        chunk_id_payload = [self.entries.get(doc_id, {}).get("chunk_id") for doc_id in self.doc_ids]
-        chunk_count_payload = [self.entries.get(doc_id, {}).get("chunk_count") for doc_id in self.doc_ids]
-        chunk_tokens_payload = [self.entries.get(doc_id, {}).get("chunk_tokens") for doc_id in self.doc_ids]
-        payload = {
-            "schema_version": self.LEXICAL_SCHEMA_VERSION,
-            "doc_ids": self.doc_ids,
-            "paths": self.paths,
-            "exts": self.exts,
-            "preview": self.preview,
-            "sizes": self.sizes,
-            "mtimes": self.mtimes,
-            "ctimes": self.ctimes,
-            "owners": self.owners,
-            "drives": self.drives,
-            "tokens": tokens_payload,
-            "chunk_id": chunk_id_payload,
-            "chunk_count": chunk_count_payload,
-            "chunk_tokens": chunk_tokens_payload,
-        }
-
-        # Save FAISS before meta so meta acts as the commit marker.
-        if faiss is not None:
-            self._ensure_faiss_index()
-            if self.faiss_index is not None:
-                tmp_faiss = _tmp_path(faiss_path)
-                faiss.write_index(self.faiss_index, str(tmp_faiss))
-                os.replace(tmp_faiss, faiss_path)
-            else:
-                try:
-                    faiss_path.unlink()
-                except FileNotFoundError:
-                    pass
-                faiss_path = None
-        else:
-            try:
-                faiss_path.unlink()
-            except FileNotFoundError:
-                pass
-            faiss_path = None
-
-        tmp_meta = _tmp_path(meta_path)
-        with tmp_meta.open("w", encoding="utf-8") as f:
-            json.dump(
-                payload,
-                f,
-                ensure_ascii=False,
-            )
-        os.replace(tmp_meta, meta_path)
-
-        return IndexPaths(emb_npy=emb_path, meta_json=meta_path, faiss_index=faiss_path)
-
-    def load(
-        self,
-        emb_npy: Optional[Path],
-        meta_json: Path,
-        *,
-        faiss_path: Optional[Path] = None,
-        use_mmap: bool = True,
-    ) -> None:
-        if not meta_json.exists():
-            raise FileNotFoundError(f"메타데이터 파일을 찾을 수 없습니다: {meta_json}")
-
-        with meta_json.open("r", encoding="utf-8") as f:
-            meta = json.load(f)
-
-        schema_version = float(meta.get("schema_version", 1.0))
-        if schema_version < self.LEXICAL_SCHEMA_VERSION:
-            raise ValueError(
-                f"index schema v{schema_version:.1f} detected; requires v{self.LEXICAL_SCHEMA_VERSION:.1f}"
-            )
-
-        paths = meta.get("paths", [])
-        exts = meta.get("exts", [])
-        previews = meta.get("preview", [])
-        doc_ids = [int(x) for x in meta.get("doc_ids", list(range(len(paths))))]
-        sizes = meta.get("sizes", [0] * len(paths))
-        mtimes = meta.get("mtimes", [0.0] * len(paths))
-        ctimes = meta.get("ctimes", [0.0] * len(paths))
-        owners = meta.get("owners", [""] * len(paths))
-        drives = meta.get("drives", [""] * len(paths))
-        tokens_payload = meta.get("tokens", [[] for _ in doc_ids])
-        chunk_id_payload = meta.get("chunk_id", [None for _ in doc_ids])
-        chunk_count_payload = meta.get("chunk_count", [None for _ in doc_ids])
-        chunk_tokens_payload = meta.get("chunk_tokens", [None for _ in doc_ids])
-
-        self.doc_ids = doc_ids
-        self.entries.clear()
-        self.lexical_tokens.clear()
-        self.embeddings.clear()
-        self._path_to_id.clear()
-
-        for idx, doc_id in enumerate(self.doc_ids):
-            entry = {
-                "path": paths[idx] if idx < len(paths) else "",
-                "ext": exts[idx] if idx < len(exts) else "",
-                "preview": previews[idx] if idx < len(previews) else "",
-                "size": sizes[idx] if idx < len(sizes) else 0,
-                "mtime": mtimes[idx] if idx < len(mtimes) else 0.0,
-                "ctime": ctimes[idx] if idx < len(ctimes) else 0.0,
-                "owner": owners[idx] if idx < len(owners) else "",
-                "drive": drives[idx] if idx < len(drives) else "",
-            }
-            def _coerce_optional_int(raw: Any) -> Optional[int]:
-                if raw in (None, "", "null"):
-                    return None
-                if isinstance(raw, int):
-                    return raw
-                try:
-                    as_float = float(raw)
-                except (TypeError, ValueError):
-                    return None
-                if math.isnan(as_float):
-                    return None
-                return int(as_float)
-
-            if idx < len(chunk_id_payload):
-                entry["chunk_id"] = _coerce_optional_int(chunk_id_payload[idx])
-            if idx < len(chunk_count_payload):
-                entry["chunk_count"] = _coerce_optional_int(chunk_count_payload[idx])
-            if idx < len(chunk_tokens_payload):
-                entry["chunk_tokens"] = _coerce_optional_int(chunk_tokens_payload[idx])
-            entry["preview"] = self._truncate_preview(entry.get("preview", ""))
-            self.entries[doc_id] = entry
-            provided_tokens = tokens_payload[idx] if idx < len(tokens_payload) else []
-            self.lexical_tokens[doc_id] = list(provided_tokens)
-            self._path_to_id[self._normalize_path(entry["path"])] = doc_id
-
-        self._rebuild_lists()
-
-        if emb_npy and emb_npy.exists():
-            mmap_mode = "r" if use_mmap else None
-            matrix = np.load(emb_npy, mmap_mode=mmap_mode)
-            if matrix.dtype != np.float32:
-                matrix = matrix.astype(np.float32, copy=False)
-            self.Z = matrix
-            self.dimension = matrix.shape[1] if matrix.ndim == 2 and matrix.size else None
-            for idx, doc_id in enumerate(self.doc_ids):
-                if idx < matrix.shape[0]:
-                    self.embeddings[doc_id] = matrix[idx]
-            self._matrix_dirty = False
-        else:
-            self.Z = None
-            self._matrix_dirty = True
-
-        if faiss is not None and faiss_path and faiss_path.exists():
-            try:
-                self.faiss_index = faiss.read_index(str(faiss_path))
-                self.dimension = getattr(self.faiss_index, "d", self.dimension)
-                try:
-                    self._faiss_pq_active = isinstance(self.faiss_index, faiss.IndexIVFPQ)
-                except Exception:
-                    self._faiss_pq_active = False
-                self._faiss_dirty = False
-            except Exception:
-                self.faiss_index = None
-                self._faiss_dirty = True
-        else:
-            self.faiss_index = None
-            self._faiss_dirty = True
-
-        if self.dimension is None and self.embeddings:
-            any_vec = next(iter(self.embeddings.values()))
-            self.dimension = len(any_vec)
-
-        self._mark_lexical_dirty()
-        self._ensure_lexical_index()
-        self._mark_ann_dirty()
-
-    def configure_ann(
-        self,
-        *,
-        threshold: Optional[int] = None,
-        ef_search: Optional[int] = None,
-        ef_construction: Optional[int] = None,
-        m: Optional[int] = None,
-    ) -> None:
-        rebuild = False
-        if threshold is not None:
-            new_threshold = max(0, int(threshold))
-            if new_threshold != self.ann_threshold:
-                self.ann_threshold = new_threshold
-                rebuild = True
-        if ef_construction is not None:
-            new_ef_construction = max(16, int(ef_construction))
-            if new_ef_construction != self.ann_ef_construction:
-                self.ann_ef_construction = new_ef_construction
-                rebuild = True
-        if m is not None:
-            new_m = max(8, int(m))
-            if new_m != self.ann_m:
-                self.ann_m = new_m
-                rebuild = True
-        if rebuild:
-            self._mark_ann_dirty()
-        if ef_search is not None:
-            new_ef_search = max(8, int(ef_search))
-            if new_ef_search != self.ann_ef_search:
-                self.ann_ef_search = new_ef_search
-                if self.ann_index is not None:
-                    try:
-                        self.ann_index.hnsw.efSearch = self.ann_ef_search
-                    except Exception:
-                        pass
-
-    def search(
-        self,
-        qvec: np.ndarray,
-        top_k: int = 5,
-        *,
-        oversample: int = 1,
-        lexical_weight: float = 0.0,
-        query_tokens: Optional[List[str]] = None,
-        min_similarity: float = 0.0,
-        use_ann: Optional[bool] = None,
-    ) -> List[Dict[str, Any]]:
-        if not self.doc_ids:
-            return []
-        q = self._normalize_vector(qvec)
-        fetch = max(1, min(len(self.doc_ids), top_k * max(1, oversample)))
-
-        vector_scores, vector_order = self._vector_scores(q, fetch, use_ann=use_ann)
-        lex_weight = max(0.0, min(1.0, lexical_weight))
-        use_lexical = lex_weight > 0.0 and bool(query_tokens)
-
-        lexical_scores: Dict[int, float] = {}
-        if use_lexical:
-            lexical_fetch = min(len(self.doc_ids), max(fetch, top_k * 8))
-            lexical_scores = self._lexical_scores(query_tokens, lexical_fetch)
-
-        candidate_ids: Set[int] = set(vector_scores.keys())
-        if use_lexical:
-            candidate_ids |= set(lexical_scores.keys())
-        if not candidate_ids:
-            candidate_ids = set(self.doc_ids[:fetch])
-        lexical_max = max(lexical_scores.values(), default=0.0)
-
-        def _lexical_component(raw: float) -> float:
-            if lexical_max <= 0.0:
-                return 0.0
-            return float(raw) / float(lexical_max) if lexical_max else 0.0
-
-        threshold = max(0.0, min(1.0, float(min_similarity)))
-
-        results: List[Dict[str, Any]] = []
-        for doc_id in candidate_ids:
-            entry = self.entries.get(doc_id)
-            if not entry:
-                continue
-            vector_raw = float(vector_scores.get(doc_id, 0.0))
-            vector_component = _rescale_inner_product(vector_raw)
-            lexical_raw = float(lexical_scores.get(doc_id, 0.0))
-            lexical_component = _lexical_component(lexical_raw)
-            hybrid_score = ((1.0 - lex_weight) * vector_component) + (lex_weight * lexical_component)
-
-            if threshold > 0.0:
-                passes_vector = vector_component >= threshold
-                passes_hybrid = hybrid_score >= threshold if use_lexical else False
-                if not (passes_vector or passes_hybrid):
-                    continue
-
-            hit = {
-                "doc_id": doc_id,
-                "path": entry.get("path"),
-                "ext": entry.get("ext"),
-                "preview": entry.get("preview"),
-                "size": entry.get("size"),
-                "mtime": entry.get("mtime"),
-                "ctime": entry.get("ctime"),
-                "owner": entry.get("owner"),
-                "drive": entry.get("drive"),
-                "chunk_id": entry.get("chunk_id"),
-                "chunk_count": entry.get("chunk_count"),
-                "chunk_tokens": entry.get("chunk_tokens"),
-                "vector_similarity": vector_component,
-                "vector_raw": vector_raw,
-                "lexical_score": lexical_component,
-                "lexical_raw": lexical_raw,
-                "score": hybrid_score,
-                "hybrid_score": hybrid_score,
-                "similarity": vector_component,
-            }
-            results.append(hit)
-
-        if not results:
-            return []
-
-        vector_rank = {doc_id: idx for idx, doc_id in enumerate(vector_order)}
-        results.sort(
-            key=lambda item: (
-                item.get("score", 0.0),
-                item.get("vector_similarity", 0.0),
-                -vector_rank.get(item.get("doc_id"), len(vector_rank)),
-            ),
-            reverse=True,
-        )
-
-        limit = min(len(results), max(top_k, fetch))
-        return results[:limit]
-
-    def _vector_scores(
-        self,
-        qvec: np.ndarray,
-        fetch: int,
-        *,
-        use_ann: Optional[bool] = None,
-    ) -> Tuple[Dict[int, float], List[int]]:
-        scores: Dict[int, float] = {}
-        order: List[int] = []
-        ann_choice = use_ann
-        if ann_choice is None and self._should_use_ann():
-            ann_choice = True
-        if ann_choice:
-            scores, order = self._ann_scores(qvec, fetch)
-            if scores:
-                return scores, order
-        elif ann_choice is False:
-            pass
-        self._ensure_faiss_index()
-        if self.faiss_index is not None and faiss is not None:
-            query = qvec.reshape(1, -1).astype(np.float32, copy=False)
-            k = min(fetch, len(self.doc_ids))
-            if k <= 0:
-                return scores, order
-            distances, ids = self.faiss_index.search(query, k)
-            for score, doc_id in zip(distances[0], ids[0]):
-                if doc_id < 0:
-                    continue
-                doc_id_int = int(doc_id)
-                scores[doc_id_int] = float(score)
-                order.append(doc_id_int)
-            return scores, order
-
-        self._ensure_matrix()
-        if self.Z is None or self.Z.size == 0:
-            return scores, order
-
-        sims = (self.Z @ qvec.reshape(-1, 1)).ravel()
-        limit = min(fetch, sims.shape[0])
-        idx = np.argpartition(-sims, limit - 1)[:limit]
-        idx = idx[np.argsort(-sims[idx])]
-        for pos in idx:
-            doc_id = self.doc_ids[pos]
-            scores[doc_id] = float(sims[pos])
-            order.append(doc_id)
-        return scores, order
-
-    def _should_use_ann(self) -> bool:
-        backend = self._ann_backend()
-        if backend is None:
-            return False
-        if len(self.doc_ids) < max(1, self.ann_threshold):
-            return False
-        self._ensure_ann_index()
-        return self.ann_index is not None
-
-    def _ensure_ann_index(self) -> None:
-        if not self._ann_dirty:
-            return
-        backend = self._ann_backend()
-        if backend is None or not self.doc_ids:
-            self.ann_index = None
-            self._ann_dirty = False
-            self._ann_backend_active = None
-            return
-        if len(self.doc_ids) < max(1, self.ann_threshold):
-            self.ann_index = None
-            self._ann_dirty = False
-            self._ann_backend_active = None
-            return
-        self._ensure_matrix()
-        if self.Z is None or self.Z.size == 0:
-            self.ann_index = None
-            self._ann_dirty = False
-            self._ann_backend_active = None
-            return
-        dim = self.Z.shape[1]
-
-        if backend == "faiss":
-            try:
-                hnsw_index = faiss.IndexHNSWFlat(dim, max(8, int(self.ann_m)))
-            except Exception:
-                self.ann_index = None
-                self._ann_dirty = False
-                self._ann_backend_active = None
-                return
-            hnsw_index.hnsw.efConstruction = max(16, int(self.ann_ef_construction))
-            hnsw_index.hnsw.efSearch = max(8, int(self.ann_ef_search))
-            ids = np.asarray(self.doc_ids, dtype=np.int64)
-            target_index = hnsw_index if hasattr(hnsw_index, "add_with_ids") else faiss.IndexIDMap(hnsw_index)
-            try:
-                target_index.add_with_ids(self.Z, ids)
-            except Exception:
-                target_index = faiss.IndexIDMap(hnsw_index)
-                target_index.add_with_ids(self.Z, ids)
-            self.ann_index = target_index
-            self._ann_hnsw = hnsw_index
-            self._ann_backend_active = "faiss"
-            self._ann_dirty = False
-            return
-
-        try:
-            index = hnswlib.Index(space="ip", dim=dim)
-            index.init_index(
-                max_elements=len(self.doc_ids),
-                ef_construction=max(16, int(self.ann_ef_construction)),
-                M=max(8, int(self.ann_m)),
-            )
-            ids = np.asarray(self.doc_ids, dtype=np.int64)
-            index.add_items(self.Z.astype(np.float32, copy=False), ids)
-            index.set_ef(max(8, int(self.ann_ef_search)))
-        except Exception:
-            self.ann_index = None
-            self._ann_backend_active = None
-            self._ann_dirty = False
-            return
-
-        self.ann_index = index
-        self._ann_hnsw = None
-        self._ann_backend_active = "hnswlib"
-        self._ann_dirty = False
-
-    def _ann_scores(self, qvec: np.ndarray, fetch: int) -> Tuple[Dict[int, float], List[int]]:
-        self._ensure_ann_index()
-        if self.ann_index is None:
-            return {}, []
-        k = min(len(self.doc_ids), max(fetch, self.ann_ef_search))
-        if k <= 0:
-            return {}, []
-        backend = self._ann_backend_active or self._ann_backend()
-        query_matrix = qvec.reshape(1, -1).astype(np.float32, copy=False)
-        try:
-            if backend == "faiss":
-                hnsw_struct = None
-                if hasattr(self.ann_index, "hnsw"):
-                    hnsw_struct = self.ann_index.hnsw
-                elif hasattr(self, "_ann_hnsw") and hasattr(self._ann_hnsw, "hnsw"):
-                    hnsw_struct = self._ann_hnsw.hnsw
-                if hnsw_struct is not None:
-                    hnsw_struct.efSearch = max(self.ann_ef_search, fetch)
-                _, ids = self.ann_index.search(query_matrix, k)
-            elif backend == "hnswlib":
-                try:
-                    self.ann_index.set_ef(max(self.ann_ef_search, fetch))
-                except Exception:
-                    pass
-                ids, _ = self.ann_index.knn_query(query_matrix, k=k)
-            else:
-                return {}, []
-        except Exception:
-            return {}, []
-
-        scores: Dict[int, float] = {}
-        order: List[int] = []
-        if np.size(ids) == 0:
-            return scores, order
-
-        candidate_ids = ids[0] if ids.ndim > 1 else ids
-        for doc_id in candidate_ids:
-            if doc_id < 0:
-                continue
-            doc_id_int = int(doc_id)
-            vec = self.embeddings.get(doc_id_int)
-            if vec is None:
-                continue
-            raw = float(np.dot(vec, qvec))
-            scores[doc_id_int] = raw
-            order.append(doc_id_int)
-            if len(order) >= fetch:
-                break
-        return scores, order
-
-    def _lexical_scores(self, query_tokens: Optional[List[str]], fetch: int) -> Dict[int, float]:
-        if not query_tokens:
-            return {}
-        self._ensure_lexical_index()
-        if self.lexical_index is None:
-            return {}
-        try:
-            scores = self.lexical_index.get_scores(query_tokens)
-        except Exception:
-            return {}
-        scores_arr = np.asarray(scores, dtype=np.float32)
-        if scores_arr.size == 0:
-            return {}
-        limit = min(fetch, scores_arr.shape[0])
-        idx = np.argpartition(-scores_arr, limit - 1)[:limit]
-        idx = idx[np.argsort(-scores_arr[idx])]
-        result: Dict[int, float] = {}
-        for pos in idx:
-            score = float(scores_arr[pos])
-            if score <= 0:
-                continue
-            doc_id = self.doc_ids[pos]
-            result[doc_id] = score
-        return result
-
-    def remove_paths(self, paths: Iterable[str]) -> int:
-        to_remove: List[int] = []
-        for raw in paths:
-            doc_id = self._path_to_id.pop(self._normalize_path(raw), None)
-            if doc_id is not None:
-                to_remove.append(doc_id)
-
-        removed = 0
-        for doc_id in to_remove:
-            if self._remove_doc_id(doc_id):
-                removed += 1
-
-        if removed:
-            self._rebuild_lists()
-            self._matrix_dirty = True
-            self._mark_faiss_dirty()
-            self._mark_lexical_dirty()
-        return removed
-
-    def _remove_doc_id(self, doc_id: int) -> bool:
-        if doc_id not in self.entries:
-            return False
-        self.entries.pop(doc_id, None)
-        self.lexical_tokens.pop(doc_id, None)
-        self.embeddings.pop(doc_id, None)
-        if doc_id in self.doc_ids:
-            self.doc_ids.remove(doc_id)
-        return True
-
-    def upsert(
-        self,
-        *,
-        path: str,
-        ext: str,
-        embedding: np.ndarray,
-        preview: str,
-        size: Optional[int] = None,
-        mtime: Optional[float] = None,
-        ctime: Optional[float] = None,
-        owner: Optional[str] = None,
-        tokens: Optional[List[str]] = None,
-    ) -> int:
-        doc_id = self._allocate_doc_id(path)
-        normalized_path = self._normalize_path(path)
-        self._path_to_id[normalized_path] = doc_id
-
-        self.embeddings[doc_id] = self._normalize_vector(embedding)
-        entry = {
-            "path": path,
-            "ext": ext,
-            "preview": preview,
-            "size": size or 0,
-            "mtime": mtime or 0.0,
-            "ctime": ctime or 0.0,
-            "owner": owner or "",
-        }
-        entry["preview"] = self._truncate_preview(entry.get("preview", ""))
-        self.entries[doc_id] = entry
-        self.lexical_tokens[doc_id] = list(tokens) if tokens is not None else self._tokenize_entry(entry)
-
-        if doc_id not in self.doc_ids:
-            self.doc_ids.append(doc_id)
-
-        self._rebuild_lists()
-        self._matrix_dirty = True
-        self._mark_faiss_dirty()
-        self._mark_lexical_dirty()
-        return doc_id
-
-
-def _format_human_time(epoch: Any) -> str:
-    value = _to_float(epoch)
-    if value is None or value <= 0:
-        return ""
-    try:
-        return datetime.fromtimestamp(value).strftime("%Y-%m-%d")
-    except Exception:
-        return ""
-
-
-def _format_size(size: Any) -> str:
-    num = _to_int(size)
-    if num is None or num <= 0:
-        return ""
-    units = ["B", "KB", "MB", "GB", "TB"]
-    value = float(num)
-    for unit in units:
-        if value < 1024 or unit == units[-1]:
-            if unit == "B":
-                return f"{int(value)}{unit}"
-            return f"{value:.1f}{unit}"
-        value /= 1024
-    return f"{num}B"
-
-
-def _similarity_to_percent(value: Any, *, decimals: int = 1) -> str:
-    try:
-        score = float(value)
-    except (TypeError, ValueError):
-        return "-"
-    score = max(0.0, min(score, 1.0))
-    pct = score * 100.0
-    return f"{pct:.{decimals}f}%"
-
 
 def _pick_rerank_device(requested: Optional[str]) -> str:
     if requested:
@@ -3109,6 +1748,7 @@ class Retriever:
         rerank_min_score: Optional[float] = 0.35,
         lexical_weight: float = 0.0,
         min_similarity: float = 0.35,
+        strict_search: bool = False,
         auto_refresh: bool = True,
         refresh_interval: float = 1.5,
         refresh_stability_checks: int = 2,
@@ -3131,6 +1771,7 @@ class Retriever:
         self.base_lexical_weight = base_weight
         self.lexical_weight = base_weight
         self.min_similarity = max(0.0, min(1.0, float(min_similarity)))
+        self.strict_search = bool(strict_search)
         try:
             self.rerank_min_score = float(rerank_min_score) if rerank_min_score is not None else None
         except (TypeError, ValueError):
@@ -3269,6 +1910,7 @@ class Retriever:
         )
         vector_query = _expand_query_text(query) if should_expand else query
         query_lower = (query or "").lower()
+        meeting_intent = False
         raw_query_tokens_set: Set[str] = {tok for tok in _split_tokens(query_lower) if tok}
         expanded_query_tokens_set: Set[str] = {
             tok for tok in _split_tokens(vector_query.lower()) if tok
@@ -3329,6 +1971,9 @@ class Retriever:
             use_ann=use_ann,
         )
         filtered_hits = _apply_metadata_filters(raw_hits, metadata_filters)
+        # [Refactor] Meeting noise filtering removed.
+        # filtered_hits = _filter_meeting_ai_agent_noise(filtered_hits, query)
+
         if not filtered_hits:
             return self._return_cached(cache_key, [], session)
 
@@ -3348,7 +1993,17 @@ class Retriever:
         if not use_rerank:
             mmr_limit = max(top_k, min(len(lexical_ranking), fusion_depth))
             mmr_candidates = lexical_ranking[:mmr_limit]
-            final_hits = _mmr(index, mmr_candidates, q_vector, top_k)
+            strict_fallback = False
+            if getattr(self, "strict_search", False) and _should_apply_strict_search(query):
+                mmr_candidates, strict_fallback = _apply_strict_filter(query, mmr_candidates)
+            use_meeting_bias = meeting_intent and any(
+                _is_user_facing_meeting_artifact(str(hit.get("path") or "")) for hit in mmr_candidates
+            )
+            if use_meeting_bias:
+                final_hits = mmr_candidates[: max(1, int(top_k))]
+            else:
+                final_hits = _mmr(index, mmr_candidates, q_vector, top_k)
+            final_hits = _ensure_unique_paths(final_hits, mmr_candidates, top_k)
             annotated = _annotate_hits(
                 final_hits,
                 desired_exts=requested_exts,
@@ -3357,6 +2012,12 @@ class Retriever:
                 metadata_filters=metadata_filters,
                 lexical_weight=adaptive_lex_weight,
             )
+            if strict_fallback and annotated:
+                note = "정확 검색 조건에 맞는 문서가 없어 일반 검색 결과를 표시합니다."
+                for hit in annotated:
+                    reasons = hit.setdefault("match_reasons", [])
+                    if note not in reasons:
+                        reasons.append(note)
             if can_use_semantic_cache and semantic_cache is not None and q_vector is not None:
                 semantic_cache.store(q_vector, annotated)
                 self._record_cache_event("semantic", hit=False)
@@ -3425,7 +2086,17 @@ class Retriever:
             fused_candidates = reranked[:fusion_depth]
         mmr_pool_size = max(top_k * 2, fusion_depth)
         mmr_candidates = fused_candidates[:mmr_pool_size]
-        final_hits = _mmr(index, mmr_candidates, q_vector, top_k)
+        strict_fallback = False
+        if getattr(self, "strict_search", False) and _should_apply_strict_search(query):
+            mmr_candidates, strict_fallback = _apply_strict_filter(query, mmr_candidates)
+        use_meeting_bias = meeting_intent and any(
+            _is_user_facing_meeting_artifact(str(hit.get("path") or "")) for hit in mmr_candidates
+        )
+        if use_meeting_bias:
+            final_hits = mmr_candidates[: max(1, int(top_k))]
+        else:
+            final_hits = _mmr(index, mmr_candidates, q_vector, top_k)
+        final_hits = _ensure_unique_paths(final_hits, mmr_candidates, top_k)
         annotated = _annotate_hits(
             final_hits,
             desired_exts=requested_exts,
@@ -3434,6 +2105,12 @@ class Retriever:
             metadata_filters=metadata_filters,
             lexical_weight=adaptive_lex_weight,
         )
+        if strict_fallback and annotated:
+            note = "정확 검색 조건에 맞는 문서가 없어 일반 검색 결과를 표시합니다."
+            for hit in annotated:
+                reasons = hit.setdefault("match_reasons", [])
+                if note not in reasons:
+                    reasons.append(note)
         if rerank_pruned_all and annotated:
             note = (
                 "Cross-Encoder 임계값 미달 후보는 제외되어 임베딩/키워드 순위로 대체했습니다."
