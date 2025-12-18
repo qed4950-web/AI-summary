@@ -10,7 +10,7 @@ from typing import Dict, Optional
 from core.agents import AgentRequest, AgentResult, ConversationalAgent
 from core.agents.supervisor import SummarySupervisor, SupervisorDecision
 from core.conversation.lnp_chat import LNPChat
-from core.data_pipeline.policies.engine import PolicyEngine
+from core.policy.engine import PolicyEngine
 from core.config.llm_defaults import DEFAULT_LLM_MODEL, resolve_backend
 
 
@@ -34,6 +34,7 @@ class DocumentAgentConfig:
     show_translation: bool = False
     translation_lang: str = "en"
     auto_search: bool = False
+    strict_search: bool = False
     llm_backend: Optional[str] = None
     llm_model: Optional[str] = None
     llm_host: Optional[str] = None
@@ -84,12 +85,13 @@ class DocumentAgent(ConversationalAgent):
             show_translation=config.show_translation,
             translation_lang=config.translation_lang,
             auto_search=config.auto_search,
+            strict_search=config.strict_search,
             llm_backend=effective_backend,
             llm_model=effective_model,
             llm_host=config.llm_host,
             llm_options=llm_options,
-            llm_health_timeout=config.llm_health_timeout,
-            llm_timeout=config.llm_timeout,
+            llm_health_timeout=config.llm_health_timeout if config.llm_health_timeout is not None else None,
+            llm_timeout=config.llm_timeout if config.llm_timeout is not None else None,
             policy_engine=config.policy_engine,
             policy_scope=config.policy_scope,
             policy_agent=config.policy_agent,
@@ -107,7 +109,8 @@ class DocumentAgent(ConversationalAgent):
         return getattr(self._chat, "llm_client", None)
 
     def prepare(self) -> None:
-        self._chat.ready(rebuild=self.config.rebuild_index)
+        wait_timeout = None if self.config.rebuild_index else 0.1
+        self._chat.ready(rebuild=self.config.rebuild_index, wait_timeout=wait_timeout)
 
     def rebuild_index(self) -> None:
         retr = getattr(self._chat, "retr", None)

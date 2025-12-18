@@ -3,7 +3,7 @@ from pathlib import Path
 import pytest
 
 from core.data_pipeline.pipeline import CorpusBuilder
-from core.data_pipeline.policies.engine import PolicyEngine
+from core.policy.engine import PolicyEngine
 from scripts.pipeline.infopilot import _load_scan_rows
 
 
@@ -30,7 +30,7 @@ def test_scan_rows_respects_sensitive_paths(tmp_path: Path):
     )
     engine = PolicyEngine.from_file(policy_json)
 
-    filtered = list(_load_scan_rows(scan_csv, policy_engine=engine, include_manual=True))
+    filtered = list(_load_scan_rows(scan_csv, agent="knowledge_search", policy_engine=engine, include_manual=True))
     filtered_paths = {row["path"] for row in filtered}
     assert str(tmp_path / "public" / "b.txt") in filtered_paths
     assert str(tmp_path / "secret" / "a.txt") not in filtered_paths

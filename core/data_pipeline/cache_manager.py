@@ -77,8 +77,20 @@ class ChunkCache:
             return
         self.cache_path.parent.mkdir(parents=True, exist_ok=True)
         serialized = {path: asdict(entry) for path, entry in self._entries.items()}
-        self.cache_path.write_text(json.dumps(serialized, ensure_ascii=False, indent=2), encoding="utf-8")
-        self._dirty = False
+        
+        # Atomic write: write to tmp then replace
+        tmp_path = self.cache_path.with_suffix(".tmp")
+        try:
+            tmp_path.write_text(json.dumps(serialized, ensure_ascii=False, indent=2), encoding="utf-8")
+            os.replace(tmp_path, self.cache_path)
+            self._dirty = False
+        except Exception:
+            if tmp_path.exists():
+                try:
+                    tmp_path.unlink()
+                except OSError:
+                    pass
+            raise
 
     def unchanged_paths(self, df: "pd.DataFrame") -> Set[str]:
         """Return paths whose doc_hash matches cached value."""

@@ -18,6 +18,7 @@ class MeetingJobConfig:
     context_dirs: List[Path] = field(default_factory=list)
     enable_resume: bool = False
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    meeting_id: Optional[str] = None
 
 
 @dataclass
@@ -30,12 +31,15 @@ class MeetingTranscriptionResult:
 
 @dataclass
 class MeetingSummary:
+    id: str
     highlights: List[str]
     action_items: List[str]
     decisions: List[str]
     raw_summary: str
     transcript_path: Path
     structured_summary: dict
+    masked_transcript: Optional[str] = None
+    action_items_structured: List[Dict[str, str]] = field(default_factory=list)
     context: Optional[str] = None
     attachments: Dict[str, List[dict] | dict | str] = field(default_factory=dict)
 

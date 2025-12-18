@@ -1,28 +1,38 @@
-"""Smart Folder + Policy aware scanner skeleton (Park David spec alignment).
-
-이 모듈은 기존 FileFinder/PolicyEngine 흐름을 감싸서
-allowed/denied 메타를 명시적으로 수집하는 베이스 스켈레톤이다.
-현 시점에서는 infopilot의 scan 흐름과 병행 사용되며,
-추후 통합 시 ScanResult를 파이프라인 입력으로 일관되게 전달하는 용도로 확장할 수 있다.
-"""
+"""Smart Folder + Policy aware scanner."""
 from __future__ import annotations
 
-import csv
+import os
+import time
 import hashlib
+import platform
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional
+from typing import Dict, Iterable, List, Optional, Set, Any
 
-from core.data_pipeline.filefinder import FileFinder
-from core.data_pipeline.policies.engine import PolicyEngine
+try:
+    import pwd
+except ImportError:
+    pwd = None
 
+# Default extensions from legacy FileFinder
+DEFAULT_EXTS = {
+    ".hwp", ".doc", ".docx",
+    ".xlsx", ".xls", ".xlsm", ".xlsb", ".xltx",
+    ".pdf",
+    ".ppt", ".pptx",
+    ".csv", ".txt", ".md", ".rst", ".json",
+}
+
+SKIP_DIRS = {
+    "__pycache__", ".git", ".svn", ".hg", ".idea", ".vscode", "node_modules",
+    "venv", ".venv", "env", ".env", "dist", "build", "site-packages"
+}
 
 @dataclass
 class ScanConfig:
     roots: List[Path]
     exts: Optional[Iterable[str]] = None
     allow_hash: bool = False
-
 
 @dataclass
 class ScanResult:
@@ -43,45 +53,125 @@ class ScanResult:
             "hash": self.content_hash,
         }
 
-
 def _hash_file(path: Path) -> str:
     try:
         data = path.read_bytes()
+        return hashlib.sha256(data).hexdigest()
     except OSError:
         return ""
-    return hashlib.sha256(data).hexdigest()
 
+def _resolve_owner(stat_result) -> str:
+    if not stat_result or pwd is None:
+        return ""
+    try:
+        return pwd.getpwuid(stat_result.st_uid).pw_name
+    except (KeyError, AttributeError):
+        return ""
 
-def run_scan(cfg: ScanConfig, policy_engine: Optional[PolicyEngine] = None) -> List[ScanResult]:
-    finder = FileFinder(exts=cfg.exts or FileFinder.DEFAULT_EXTS, show_progress=False, scan_all_drives=False)
-    records = finder.find(roots=cfg.roots, run_async=False)
+def collect_file_metadata(path: Path, *, allowed_exts: Optional[Iterable[str]] = None) -> Optional[Dict[str, Any]]:
+    """Build a single metadata row for a file."""
+    try:
+        p = Path(path).expanduser().resolve(strict=True)
+    except (OSError, RuntimeError):
+        return None
+
+    if allowed_exts:
+        valid_exts = {e.lower() if e.startswith(".") else f".{e.lower()}" for e in allowed_exts}
+        if p.suffix.lower() not in valid_exts:
+            return None
+    
+    try:
+        st = p.stat()
+    except (FileNotFoundError, PermissionError, OSError):
+        return None
+        
+    return {
+        "path": str(p),
+        "size": st.st_size,
+        "mtime": st.st_mtime,
+        "ctime": st.st_ctime,
+        "ext": p.suffix.lower(),
+        "drive": p.anchor,
+        "owner": _resolve_owner(st),
+    }
+
+def scan_directory(root: Path, exts: Optional[Iterable[str]] = None) -> List[Dict[str, Any]]:
+    """Legacy-compatible scanner function. Returns list of dicts."""
+    target_exts = set(exts or DEFAULT_EXTS)
+    target_exts = {e.lower() if e.startswith(".") else e.lower() for e in target_exts}
+    
+    results = []
+    
+    # Simple recursive walk
+    # Use os.walk for simplicity and robustness
+    for current_root, dirs, files in os.walk(root):
+        # Filter directories in-place
+        # SKIP_DIRS 제외 & .으로 시작하는 숨김 폴더 제외 (단, .ai_agent는 허용)
+        dirs[:] = [
+            d for d in dirs
+            if d not in SKIP_DIRS and (not d.startswith(".") or d == ".ai_agent")
+        ]
+        
+        for name in files:
+            if name.startswith(".") and name != ".htaccess": # Skip hidden files
+                continue
+                
+            _, ext = os.path.splitext(name)
+            if ext.lower() not in target_exts:
+                continue
+                
+            full_path = Path(current_root) / name
+            try:
+                st = full_path.stat()
+                results.append({
+                    "path": str(full_path),
+                    "size": st.st_size,
+                    "mtime": st.st_mtime,
+                    "ctime": st.st_ctime,
+                    "ext": ext.lower(),
+                    "drive": full_path.anchor,
+                    "owner": _resolve_owner(st)
+                })
+            except (OSError, PermissionError):
+                continue
+                
+    return results
+
+def run_scan(cfg: ScanConfig, policy_engine: Any = None) -> List[ScanResult]:
+    """
+    Run scan using configuration and optional policy engine.
+    """
     results: List[ScanResult] = []
-    for rec in records:
+    targets = cfg.roots
+    exts = cfg.exts or DEFAULT_EXTS
+    
+    scanned_dicts = []
+    for root in targets:
+        if root.exists():
+            scanned_dicts.extend(scan_directory(root, exts))
+            
+    for rec in scanned_dicts:
         path = Path(rec["path"])
         allowed = True
         deny_reason = ""
-        if policy_engine and policy_engine.has_policies:
+        
+        if policy_engine and hasattr(policy_engine, "allows"):
             if not policy_engine.allows(path, agent="knowledge_search", include_manual=True):
                 allowed = False
                 deny_reason = "policy_denied"
-        content_hash = _hash_file(path) if cfg.allow_hash and allowed else ""
-        results.append(
-            ScanResult(
-                path=path,
-                size=int(rec.get("size", 0) or 0),
-                mtime=float(rec.get("mtime", 0.0) or 0.0),
-                allowed=allowed,
-                deny_reason=deny_reason,
-                content_hash=content_hash,
-            )
-        )
+                
+        content_hash = ""
+        if cfg.allow_hash and allowed:
+            content_hash = _hash_file(path)
+            
+        results.append(ScanResult(
+            path=path,
+            size=int(rec["size"]),
+            mtime=float(rec["mtime"]),
+            allowed=allowed,
+            deny_reason=deny_reason,
+            content_hash=content_hash
+        ))
+        
     return results
 
-
-def write_csv(results: List[ScanResult], dest: Path) -> None:
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    with dest.open("w", encoding="utf-8", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=["path", "size", "mtime", "allowed", "deny_reason", "hash"])
-        writer.writeheader()
-        for row in results:
-            writer.writerow(row.to_row())

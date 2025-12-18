@@ -3,10 +3,14 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import os
+
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-DATA_DIR = PROJECT_ROOT / "data"
+env_data = os.getenv("INFOPILOT_DATA_DIR")
+DATA_DIR = Path(env_data) if env_data else PROJECT_ROOT / "data"
 CACHE_DIR = DATA_DIR / "cache"
 SUMMARIES_DIR = DATA_DIR / "summaries"
+DOCS_DIR = DATA_DIR / "documents"
 MODELS_DIR = PROJECT_ROOT / "models"
 ARTIFACTS_DIR = PROJECT_ROOT / "artifacts"
 LOGS_DIR = ARTIFACTS_DIR / "logs"

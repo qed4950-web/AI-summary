@@ -3,7 +3,7 @@ from pathlib import Path
 import pytest
 
 from scripts.run_meeting_agent import _discover_meeting_source, _load_policy_engine, MeetingPipeline, MeetingJobConfig
-from core.data_pipeline.policies.engine import PolicyEngine
+from core.policy.engine import PolicyEngine
 from core.agents.photo import PhotoAgent
 from core.agents.photo.pipeline import PhotoJobConfig
 

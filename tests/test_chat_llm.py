@@ -50,8 +50,8 @@ def test_summarize_hits_returns_llm_response(chat: LNPChat) -> None:
     summary = chat._summarize_hits("테스트 질문", _stub_hits())
 
     assert summary is not None
-    assert summary.startswith("요약 결과")
-    assert "Sources:" in summary
+    assert "요약 결과" in summary
+    # Sources footer removed - LLM now includes inline citations
     assert dummy.calls, "LLM 호출이 수행되어야 합니다."
     recorded = dummy.calls[0]
     assert "테스트 질문" in recorded["prompt"]

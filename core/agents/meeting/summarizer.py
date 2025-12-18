@@ -2,13 +2,16 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import logging
 import os
 import re
 import shutil
 import subprocess
+import sys
 import textwrap
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Protocol
 
 try:
@@ -23,8 +26,22 @@ DEFAULT_OLLAMA_PROMPT = textwrap.dedent(
     """
     You are a helpful meeting assistant.
     Summarise the following meeting transcript in the user's language.
-    Highlight key decisions and actionable follow-up items.
-    Respond using concise bullet points.
+    
+    Structure your response exactly as follows:
+    ## Highlights
+    - Key point 1
+    - Key point 2
+
+    ## Decisions
+    - Decision 1
+    - Decision 2
+
+    ## Action Items
+    - [Owner] Task description (Due: YYYY-MM-DD or TBD)
+    - [Owner] Task description (Due: YYYY-MM-DD or TBD)
+
+    ## Summary
+    (Concise summary paragraph)
 
     Transcript:
     {transcript}
@@ -67,6 +84,7 @@ class SummariserConfig:
     llama_model: str = os.getenv("MEETING_SUMMARY_LLAMA_MODEL", "")
     llama_n_ctx: int = _int_env("MEETING_SUMMARY_LLAMA_N_CTX", 4096)
     llama_n_threads: int = _int_env("MEETING_SUMMARY_LLAMA_THREADS", 0)
+    llama_gpu_layers: int = _int_env("MEETING_SUMMARY_LLAMA_GPU_LAYERS", 0)
     llama_max_new_tokens: int = _int_env("MEETING_SUMMARY_LLAMA_MAX_NEW_TOKENS", 256)
 
 
@@ -296,18 +314,34 @@ class LlamaCppSummariser:
 
     def __init__(self, config: SummariserConfig | None = None) -> None:
         self.config = config or SummariserConfig()
-        if Llama is None:
-            raise RuntimeError("llama-cpp-python is required for llama backend")
         model_path = (self.config.llama_model or "").strip()
         if not model_path:
             raise RuntimeError("MEETING_SUMMARY_LLAMA_MODEL must point to a GGUF file")
+        if not Path(model_path).expanduser().exists():
+            raise RuntimeError(f"MEETING_SUMMARY_LLAMA_MODEL not found: {model_path}")
+
+        self._use_subprocess = os.getenv("MEETING_LLAMA_CPP_SUBPROCESS", "1").strip().lower() not in {
+            "",
+            "0",
+            "false",
+            "no",
+        }
+        self._model_path = str(Path(model_path).expanduser())
+        if self._use_subprocess:
+            self._llm = None
+            return
+
+        if Llama is None:
+            raise RuntimeError("llama-cpp-python is required for llama backend")
         n_ctx = max(256, int(self.config.llama_n_ctx))
         n_threads = int(self.config.llama_n_threads)
+        n_gpu_layers = int(self.config.llama_gpu_layers)
         try:
             self._llm = Llama(
                 model_path=model_path,
                 n_ctx=n_ctx,
                 n_threads=n_threads if n_threads > 0 else None,
+                n_gpu_layers=n_gpu_layers,
                 logits_all=False,
             )
         except Exception as exc:  # pragma: no cover - optional dependency
@@ -321,6 +355,9 @@ class LlamaCppSummariser:
         text = (text or "").strip()
         if not text:
             return ""
+
+        if getattr(self, "_use_subprocess", False):
+            return self._summarise_auto(text)
 
         chunks = self._chunk_text(text, self.config.chunk_char_limit)
         parts = [self._summarise_chunk(chunk) for chunk in chunks if chunk.strip()]
@@ -354,6 +391,89 @@ class LlamaCppSummariser:
         if not text:
             text = str(out)
         return text.strip()
+
+    def _summarise_auto(self, transcript: str) -> str:
+        mode = os.getenv("MEETING_LLAMA_MODE", "auto").strip().lower()
+        if mode in {"auto", "direct", "llama_cpp", "llamacpp"}:
+            summary = self._summarise_via_subprocess_direct(transcript)
+            if summary:
+                return summary
+        return self._summarise_via_subprocess_cli(transcript)
+
+    def _summarise_via_subprocess_direct(self, transcript: str) -> str:
+        payload = {
+            "transcript": transcript,
+            "model_path": getattr(self, "_model_path", ""),
+            "n_ctx": int(self.config.llama_n_ctx),
+            "n_threads": int(self.config.llama_n_threads),
+            "n_gpu_layers": int(self.config.llama_gpu_layers),
+            "max_new_tokens": int(self.config.llama_max_new_tokens),
+            "chunk_char_limit": int(self.config.chunk_char_limit),
+            "prompt_template": self.config.ollama_prompt or DEFAULT_OLLAMA_PROMPT,
+        }
+
+        try:
+            proc = subprocess.run(
+                [sys.executable, "-m", "core.agents.meeting.llm.llama_cpp_direct_worker"],
+                input=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            LOGGER.warning("llama.cpp direct worker failed to spawn: %s", exc)
+            return ""
+
+        if proc.returncode != 0:
+            err = (proc.stderr or b"").decode("utf-8", "ignore").strip()
+            LOGGER.warning("llama.cpp direct worker failed (code=%s): %s", proc.returncode, err[:300])
+            return ""
+
+        raw = (proc.stdout or b"").decode("utf-8", "ignore").strip()
+        try:
+            data = json.loads(raw) if raw else {}
+        except json.JSONDecodeError:
+            LOGGER.warning("llama.cpp direct worker returned non-json output")
+            return ""
+        summary = str(data.get("summary") or "").strip()
+        return summary
+
+    def _summarise_via_subprocess_cli(self, transcript: str) -> str:
+        payload = {
+            "transcript": transcript,
+            "model_path": getattr(self, "_model_path", ""),
+            "n_ctx": int(self.config.llama_n_ctx),
+            "n_threads": int(self.config.llama_n_threads),
+            "gpu_layers": int(self.config.llama_gpu_layers),
+            "max_new_tokens": int(self.config.llama_max_new_tokens),
+            "chunk_char_limit": int(self.config.chunk_char_limit),
+            "prompt_template": self.config.ollama_prompt or DEFAULT_OLLAMA_PROMPT,
+        }
+        try:
+            proc = subprocess.run(
+                [sys.executable, "-m", "core.agents.meeting.llm.llama_cpp_worker"],
+                input=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            LOGGER.warning("llama.cpp cli worker failed to spawn: %s", exc)
+            return ""
+
+        if proc.returncode != 0:
+            err = (proc.stderr or b"").decode("utf-8", "ignore").strip()
+            LOGGER.warning("llama.cpp cli worker failed (code=%s): %s", proc.returncode, err[:300])
+            return ""
+
+        raw = (proc.stdout or b"").decode("utf-8", "ignore").strip()
+        try:
+            data = json.loads(raw) if raw else {}
+        except json.JSONDecodeError:
+            LOGGER.warning("llama.cpp cli worker returned non-json output")
+            return ""
+        summary = str(data.get("summary") or "").strip()
+        return summary
 
     def _chunk_text(self, text: str, limit: int) -> List[str]:
         if limit <= 0:
@@ -460,6 +580,20 @@ def create_summary_backend(name: str | None, config: SummariserConfig | None = N
     key = _SUMMARY_BACKEND_ALIASES.get(name.lower().strip(), name.lower().strip())
     if key in {"heuristic", "none", "placeholder"}:
         return None
+
+    # Safety: llama-cpp-python can segfault on some setups.
+    # Default to subprocess mode in `LlamaCppSummariser` and allow it without extra flags.
+    # Only allow in-process llama.cpp when explicitly opted in.
+    if key == "llama":
+        subprocess_enabled = os.getenv("MEETING_LLAMA_CPP_SUBPROCESS", "1").strip().lower() not in {
+            "",
+            "0",
+            "false",
+            "no",
+        }
+        if not subprocess_enabled and os.getenv("MEETING_ALLOW_LLAMA_CPP", "0").strip() != "1":
+            LOGGER.warning("llama.cpp in-process backend disabled (set MEETING_ALLOW_LLAMA_CPP=1 to enable)")
+            return None
     backend_cls = _SUMMARY_BACKENDS.get(key)
     if backend_cls is None:
         LOGGER.warning("Unknown summary backend '%s'; using heuristic summary", name)

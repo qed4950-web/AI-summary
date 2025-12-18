@@ -1,17 +1,69 @@
 [
   {
-    "id": "global",
-    "label": "전체 검색 (모든 문서)",
-    "type": "global",
-    "path": "",
-    "scope": "global",
-    "policy": ""
+    "id": "documents-docs",
+    "label": "Documents",
+    "type": "documents",
+    "path": "~/Documents",
+    "scope": "policy",
+    "policy": "core/config/hybrid.yaml",
+    "sensitive_paths": [
+      "~/Documents/민감"
+    ],
+    "cache": {
+      "max_bytes": 2147483648,
+      "purge_days": 30
+    }
+  },
+  {
+    "id": "documents-desktop",
+    "label": "Desktop",
+    "type": "documents",
+    "path": "~/Desktop",
+    "scope": "policy",
+    "policy": "core/config/hybrid.yaml",
+    "sensitive_paths": [
+      "~/Desktop/민감"
+    ],
+    "cache": {
+      "max_bytes": 2147483648,
+      "purge_days": 30
+    }
+  },
+  {
+    "id": "documents-downloads",
+    "label": "Downloads",
+    "type": "documents",
+    "path": "~/Downloads",
+    "scope": "policy",
+    "policy": "core/config/hybrid.yaml",
+    "sensitive_paths": [
+      "~/Downloads/민감"
+    ],
+    "cache": {
+      "max_bytes": 2147483648,
+      "purge_days": 30
+    }
+  },
+  {
+    "id": "documents-icloud",
+    "label": "CloudStorage",
+    "type": "documents",
+    "path": "~/Library/CloudStorage",
+    "scope": "policy",
+    "policy": "core/config/hybrid.yaml",
+    "sensitive_paths": [
+      "~/Library/CloudStorage/민감"
+    ],
+    "cache": {
+      "max_bytes": 2147483648,
+      "purge_days": 30
+    }
   },
   {
     "id": "meeting-default",
-    "label": "녹음/회의 자료",
+    "label": "녹음/회의",
     "type": "meeting",
-    "path": "~/<USER>/AI Summary/녹음",
+    "path": "~/Desktop/AI Summary/녹음",
     "scope": "policy",
     "policy": "core/config/meeting_agent.yaml",
     "sensitive_paths": [
@@ -23,70 +75,10 @@
     }
   },
   {
-    "id": "documents-docs",
-    "label": "문서 자료 (Documents)",
-    "type": "documents",
-    "path": "C:/Users/<USER>/Documents",
-    "scope": "policy",
-    "policy": "core/config/hybrid.yaml",
-    "sensitive_paths": [
-      "/Users/david/Documents/민감"
-    ],
-    "cache": {
-      "max_bytes": 2147483648,
-      "purge_days": 30
-    }
-  },
-  {
-    "id": "documents-desktop",
-    "label": "문서 자료 (Desktop)",
-    "type": "documents",
-    "path": "C:/Users/<USER>/Desktop",
-    "scope": "policy",
-    "policy": "core/config/hybrid.yaml",
-    "sensitive_paths": [
-      "/Users/david/Desktop/민감"
-    ],
-    "cache": {
-      "max_bytes": 2147483648,
-      "purge_days": 30
-    }
-  },
-  {
-    "id": "documents-downloads",
-    "label": "문서 자료 (Downloads)",
-    "type": "documents",
-    "path": "C:/Users/<USER>/Downloads",
-    "scope": "policy",
-    "policy": "core/config/hybrid.yaml",
-    "sensitive_paths": [
-      "/Users/david/Downloads/민감"
-    ],
-    "cache": {
-      "max_bytes": 2147483648,
-      "purge_days": 30
-    }
-  },
-  {
-    "id": "documents-cloud",
-    "label": "문서 자료 (CloudStorage)",
-    "type": "documents",
-    "path": "C:/Users/<USER>/Library/CloudStorage",
-    "scope": "policy",
-    "policy": "core/config/hybrid.yaml",
-    "sensitive_paths": [
-      "/Users/david/Library/CloudStorage/민감"
-    ],
-    "cache": {
-      "max_bytes": 2147483648,
-      "purge_days": 30
-    }
-  },
-  {
     "id": "photos-default",
-    "label": "사진 자료",
+    "label": "사진",
     "type": "photos",
-    "path": "~/<USER>/AI Summary/사진",
+    "path": "~/Desktop/AI Summary/사진",
     "scope": "policy",
     "policy": "core/config/hybrid.yaml",
     "sensitive_paths": [

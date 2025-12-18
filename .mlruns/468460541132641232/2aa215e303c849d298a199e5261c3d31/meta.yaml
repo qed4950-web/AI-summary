@@ -1,0 +1,15 @@
+artifact_uri: file:///Users/david/Desktop/python/github/AI-summary/.mlruns/468460541132641232/2aa215e303c849d298a199e5261c3d31/artifacts
+end_time: 1765979543174
+entry_point_name: ''
+experiment_id: '468460541132641232'
+lifecycle_stage: active
+run_id: 2aa215e303c849d298a199e5261c3d31
+run_name: chat
+run_uuid: 2aa215e303c849d298a199e5261c3d31
+source_name: ''
+source_type: 4
+source_version: ''
+start_time: 1765979537157
+status: 3
+tags: []
+user_id: david

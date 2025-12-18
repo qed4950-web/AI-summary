@@ -8,7 +8,7 @@ DEFAULT_MODEL_PATH = "models/gguf/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf"
 MODEL_PATH = os.path.expanduser(os.getenv("LLAMA_GGUF_PATH", DEFAULT_MODEL_PATH))
 
 
-@pytest.mark.full
+@pytest.mark.integration
 @pytest.mark.skipif(
     not os.path.exists(MODEL_PATH),
     reason="LLM model file not found; set LLAMA_GGUF_PATH or place gguf in models/gguf",

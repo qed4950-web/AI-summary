@@ -17,9 +17,15 @@ Examples (CMD)::
 import argparse
 from pathlib import Path
 
-import torch
-from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
-from langdetect import detect
+try:
+    import torch
+    from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
+    from langdetect import detect
+except ImportError:
+    torch = None
+    AutoModelForSeq2SeqLM = None
+    AutoTokenizer = None
+    detect = None
 
 from core.config.paths import PROJECT_ROOT
 

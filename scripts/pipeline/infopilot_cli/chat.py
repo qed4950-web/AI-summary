@@ -2,23 +2,26 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable, Dict, Iterator, List, Optional
 
 from core.agents.document import DocumentAgent, DocumentAgentConfig
 from core.agents.meeting import MeetingAgent
-from core.agents.photo import PhotoAgent
+from core.agents.photo import PhotoAgent, PhotoAgentConfig
 from core.data_pipeline.pipeline import run_step2
-from core.data_pipeline.policies.engine import PolicyEngine
+from core.policy.engine import PolicyEngine
 from core.errors import PolicyViolationError
 
 from core.conversation.orchestrator import AssistantOrchestrator
+from core.conversation.llm_client import create_llm_client
 
 from .history import load_agent_history, remember_agent_history
 from .policy import enforce_cache_limit, load_policy_engine
 from .scan_rows import load_scan_rows, resolve_scan_csv
 from .train_config import default_train_config
+from core.config.llm_defaults import DEFAULT_LLM_MODEL
 
 
 def ensure_chat_artifacts(
@@ -126,9 +129,27 @@ def cmd_chat(
         env_value = env_value.strip()
         return env_value or default
 
-    llm_backend = _env_or_arg("llm_backend")
-    llm_model = _env_or_arg("llm_model", default="llama3")
+    single_query = getattr(args, "query", None)
+    json_mode = bool(getattr(args, "json", False))
+    # if json_mode and not single_query:
+    #     raise SystemExit("--json 옵션은 --query와 함께 사용해야 합니다.")
+
+    llm_backend = _env_or_arg("llm_backend", default="none")
+    llm_model = _env_or_arg("llm_model", default=DEFAULT_LLM_MODEL)
     llm_host = _env_or_arg("llm_host", default="")
+
+    llm_client = None
+    if llm_backend and llm_backend.lower() != "none":
+        try:
+            llm_client = create_llm_client(
+                backend=llm_backend,
+                model=llm_model,
+                host=llm_host,
+                options={},
+            )
+            print(f"ℹ️ 로컬 LLM 연결: {llm_backend}/{llm_model}")
+        except Exception as e:
+            print(f"⚠️ 로컬 LLM 초기화 실패: {e}")
 
     auto_trained = ensure_chat_artifacts(
         scan_csv=Path(args.scan_csv),
@@ -157,6 +178,7 @@ def cmd_chat(
             show_translation=args.show_translation,
             translation_lang=args.translation_lang,
             min_similarity=args.min_similarity,
+            strict_search=bool(getattr(args, "strict", False)),
             llm_backend=llm_backend,
             llm_model=llm_model,
             llm_host=llm_host,
@@ -167,13 +189,41 @@ def cmd_chat(
             rebuild_index=auto_trained,
         )
     )
-    meeting_agent = MeetingAgent()
-    photo_agent = PhotoAgent()
-
-    orchestrator = AssistantOrchestrator(
-        [document_agent, meeting_agent, photo_agent],
-        llm_client=document_agent.llm_client,
+    agents = [document_agent]
+    # Allow /meeting, /photo commands even in --json mode (non-interactive),
+    # but keep heavy agent dependencies (llama.cpp / transformers) out of the default path.
+    agents.extend(
+        [
+            MeetingAgent(),
+            PhotoAgent(PhotoAgentConfig(policy_engine=policy_engine, policy_tag=str(getattr(args, "policy", "") or ""))),
+        ]
     )
+
+    # Use LLM for intelligent routing (re-enabled for better intent recognition)
+    orchestrator = AssistantOrchestrator(agents, llm_client=llm_client)
+
+    # -------------------------------------------------------------------------
+    # Sprint 2: Performance Optimization (Pre-warming)
+    # -------------------------------------------------------------------------
+    def _warmup_models(agent_list: List[Any]) -> None:
+        """Background thread to pre-load heavy models (Embedding, Whisper, etc)."""
+        import threading
+        # print("🔥 Warming up models in background...", file=sys.stderr)
+        for agent in agent_list:
+            if hasattr(agent, "prepare"):
+                try:
+                    # DocumentAgent: loads embedding model
+                    # MeetingAgent: ensures policy engine / STT backend check
+                    agent.prepare()
+                except Exception as e:
+                    # Ignore warmup errors to avoid crashing main thread
+                    pass
+        # print("✅ Model warmup completed.", file=sys.stderr)
+
+    import threading
+    warmup_thread = threading.Thread(target=_warmup_models, args=(agents,), daemon=True)
+    warmup_thread.start()
+    # -------------------------------------------------------------------------
 
     def _print_response(resp) -> None:
         prefix = f"[{resp.agent}] " if getattr(resp, "agent", None) else ""
@@ -184,11 +234,24 @@ def cmd_chat(
             for suggestion in suggestions:
                 print(f"   - {suggestion}")
 
-    def _cli_progress_handler(agent_label: str) -> Callable[[Dict[str, Any]], None]:
+    def _cli_progress_handler(agent_label: str, json_mode: bool = False) -> Callable[[Dict[str, Any]], None]:
         def _handler(event: Dict[str, Any]) -> None:
             stage = event.get("stage")
             status = event.get("status")
+            
+            # Special case for real-time STT streaming
+            if status == "streaming":
+                chunk = event.get("chunk")
+                if json_mode and chunk:
+                    print(json.dumps({"status": "streaming", "content": chunk}, ensure_ascii=False), flush=True)
+                return
+
             prefix = f"[{agent_label}]"
+            if json_mode:
+                # Optional: emit stage updates as structured JSON logs if desired
+                # For now, we only care about 'streaming' events for the UI visualizer
+                return
+
             if status == "running":
                 print(f"{prefix} ▶ {stage} 시작")
             elif status == "completed":
@@ -257,23 +320,18 @@ def cmd_chat(
             return None
         return {"details": extra}
 
-    def _resolve_follow_up(original_query: str, initial_response) -> Any:
+    def _resolve_follow_up(original_query: str, initial_response, json_mode: bool = False) -> Any:
         response = initial_response
         while getattr(response, "agent", None) == "follow_up":
             follow_context = _prompt_follow_up(getattr(response, "reason", None), getattr(response, "message", ""))
             if not follow_context:
                 break
             if getattr(response, "reason", None) == "needs_audio":
-                follow_context.setdefault("__progress_callback", _cli_progress_handler("회의 비서"))
+                follow_context.setdefault("__progress_callback", _cli_progress_handler("회의 비서", json_mode=json_mode))
             elif getattr(response, "reason", None) == "needs_roots":
-                follow_context.setdefault("__progress_callback", _cli_progress_handler("사진 비서"))
+                follow_context.setdefault("__progress_callback", _cli_progress_handler("사진 비서", json_mode=json_mode))
             response = orchestrator.handle(original_query, follow_context)
         return response
-
-    single_query = getattr(args, "query", None)
-    json_mode = bool(getattr(args, "json", False))
-    if json_mode and not single_query:
-        raise SystemExit("--json 옵션은 --query와 함께 사용해야 합니다.")
 
     enforce_cache_limit(
         Path(args.cache),
@@ -282,64 +340,88 @@ def cmd_chat(
         clean_on_limit=getattr(args, "cache_clean_on_limit", False),
     )
 
+    base_context = {"policy_engine": policy_engine} if policy_engine and policy_engine.has_policies else {"policy_engine": policy_engine}
+
     if single_query:
-        response = orchestrator.handle(single_query)
+        response = orchestrator.handle(single_query, base_context)
         if getattr(response, "agent", None) == "follow_up" and not json_mode:
-            response = _resolve_follow_up(single_query, response)
+            response = _resolve_follow_up(single_query, response, json_mode=json_mode)
         if json_mode:
-            metadata = response.metadata if isinstance(response.metadata, dict) else {}
-            payload: Dict[str, Any] = {
-                "query": single_query,
-                "answer": response.message,
-                "agent": response.agent,
-                "reason": response.reason,
-                "metadata": metadata,
-                "suggestions": response.suggestions or [],
-                "results": [],
-            }
-            if response.agent == "follow_up":
-                metadata["follow_up"] = response.reason
-            hits = response.metadata.get("hits", []) if isinstance(response.metadata, dict) else []
-            for hit in hits[: args.topk]:
-                payload["results"].append(
-                    {
-                        "title": Path(str(hit.get("path") or "")).name,
-                        "path": hit.get("path"),
-                        "ext": hit.get("ext"),
-                        "score": hit.get("similarity", hit.get("vector_similarity")),
-                        "vector_score": hit.get("vector_similarity"),
-                        "lexical_score": hit.get("lexical_score"),
-                        "match_reasons": hit.get("match_reasons") or [],
-                        "preview": hit.get("preview"),
-                        "translation": hit.get("translation"),
-                    }
-                )
-            print(json.dumps(payload, ensure_ascii=False))
+            print(json.dumps(_build_chat_response_payload(single_query, response, args.topk), ensure_ascii=False))
         else:
             _print_response(response)
         return
 
-    print(
-        "\n💬 InfoPilot Chat 모드입니다. 자유롭게 대화하고, 문서 검색이 필요하면 '/search 질문'처럼 입력해 보세요. "
-        "(종료하려면 'exit' 또는 '종료' 입력)"
-    )
-    print("   명령어: /search <질문>, /meeting, /photo")
+    if not json_mode:
+        print(
+            "\n💬 InfoPilot Chat 모드입니다. 자유롭게 대화하고, 문서 검색이 필요하면 '/search 질문'처럼 입력해 보세요. "
+            "(종료하려면 'exit' 또는 '종료' 입력)"
+        )
+        print("   명령어: /search <질문>, /meeting, /photo")
+
     while True:
         try:
-            query = input("질문> ").strip()
+            if not sys.stdin.isatty():
+                query = sys.stdin.read().strip()
+                if not query:  # EOF
+                    break
+            else:
+                query = input("질문> ").strip()
         except (EOFError, KeyboardInterrupt):
-            print("\n👋 종료합니다.")
+            if not json_mode:
+                print("\n👋 종료합니다.")
             break
+
         if not query:
             continue
         if query.lower() in {"exit", "quit", "종료"}:
-            print("👋 종료합니다.")
+            if not json_mode:
+                print("👋 종료합니다.")
             break
 
-        response = orchestrator.handle(query)
-        response = _resolve_follow_up(query, response)
-        _print_response(response)
-        print("-" * 80)
+        response = orchestrator.handle(query, base_context)
+        
+        # Follow-up resolution
+        if getattr(response, "agent", None) == "follow_up" and not json_mode:
+            response = _resolve_follow_up(query, response, json_mode=json_mode)
+
+        if json_mode:
+            print(json.dumps(_build_chat_response_payload(query, response, args.topk), ensure_ascii=False))
+            sys.stdout.flush()
+        else:
+            _print_response(response)
+            print("-" * 80)
+
+
+def _build_chat_response_payload(query: str, response: Any, topk: int) -> Dict[str, Any]:
+    metadata = response.metadata if isinstance(response.metadata, dict) else {}
+    payload = {
+        "query": query,
+        "answer": response.message,
+        "agent": response.agent,
+        "reason": response.reason,
+        "metadata": metadata,
+        "suggestions": response.suggestions or [],
+        "results": [],
+    }
+    if response.agent == "follow_up":
+        metadata["follow_up"] = response.reason
+    hits = metadata.get("hits", []) or []
+    for hit in hits[:topk]:
+        payload["results"].append(
+            {
+                "title": Path(str(hit.get("path") or "")).name,
+                "path": hit.get("path"),
+                "ext": hit.get("ext"),
+                "score": hit.get("similarity", hit.get("vector_similarity")),
+                "vector_score": hit.get("vector_similarity"),
+                "lexical_score": hit.get("lexical_score"),
+                "match_reasons": hit.get("match_reasons") or [],
+                "preview": hit.get("preview"),
+                "translation": hit.get("translation"),
+            }
+        )
+    return payload
 
 
 __all__ = ["cmd_chat", "ensure_chat_artifacts"]

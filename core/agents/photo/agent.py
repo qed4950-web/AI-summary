@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+import json
 from pathlib import Path
 from typing import Iterable, List, Optional
 
@@ -23,6 +24,7 @@ class PhotoAgentConfig:
     policy_tag: Optional[str] = None
     policy_engine: Optional[object] = None
     policy_agent: str = "photo"
+    default_folder_type: str = "photos"
 
 
 class PhotoAgent(ConversationalAgent):
@@ -45,21 +47,51 @@ class PhotoAgent(ConversationalAgent):
         context = dict(request.context or {})
         progress_callback = context.pop("__progress_callback", None)
         cancel_event = context.pop("__cancel_event", None)
+        policy_engine = context.get("policy_engine") or self.config.policy_engine
         roots_raw = context.get("roots")
-        if not roots_raw:
-            raise ValueError("사진 비서를 사용하려면 roots(폴더 경로 목록)가 필요합니다.")
-        roots = self._normalise_roots(roots_raw)
+        roots: List[Path] = []
+        if roots_raw:
+            roots = self._normalise_roots(roots_raw)
+        else:
+            roots = self._infer_roots_from_policy(policy_engine) if policy_engine else []
         if not roots:
-            raise ValueError("유효한 사진 폴더 경로를 찾을 수 없습니다.")
+            raise ValueError(
+                "유효한 사진 폴더 경로를 찾을 수 없습니다. "
+                "(/photo <폴더경로> 또는 core/config/smart_folders.json 의 photos 스코프 확인)"
+            )
         output_dir = Path(context.get("output_dir") or self._default_output_root())
         output_dir.mkdir(parents=True, exist_ok=True)
+        query_text = (request.query or "").strip()
+        query_lower = query_text.lower()
+        wants_report_only = any(token in query_text for token in ("리포트", "report", "결과", "로그")) and not any(
+            token in query_text for token in ("정리", "이동", "organize", "move")
+        )
+        if wants_report_only:
+            latest = self._latest_report_path(output_dir)
+            if latest is None:
+                raise ValueError("사진 리포트를 찾지 못했습니다. 먼저 사진 정리를 실행하세요. (예: /photo)")
+            return AgentResult(
+                content=self._format_report(latest),
+                metadata={"agent": self.name, "report_path": str(latest)},
+            )
+        organize_mode = any(token in query_text for token in ("정리", "이동", "organize", "move")) or query_lower == "/photo"
+        apply_mode = any(token in query_text for token in ("적용", "실행", "apply"))
+        if apply_mode and os.getenv("PHOTO_ALLOW_APPLY", "0").strip() != "1":
+            raise ValueError("사진 이동(적용) 모드는 안전을 위해 비활성화되어 있습니다. `PHOTO_ALLOW_APPLY=1`을 설정한 뒤 다시 시도하세요.")
+        dest_root = context.get("dest_root")
+        dest_root_path = Path(dest_root).expanduser() if dest_root else (roots[0] / "organized")
         job = PhotoJobConfig(
             roots=roots,
             output_dir=output_dir,
             policy_tag=context.get("policy_tag") or self.config.policy_tag,
-            policy_engine=context.get("policy_engine") or self.config.policy_engine,
+            policy_engine=policy_engine,
             policy_agent=context.get("policy_agent") or self.config.policy_agent,
             prefer_gpu=bool(context.get("prefer_gpu", False)),
+            organize=organize_mode,
+            dry_run=not apply_mode,
+            dest_root=dest_root_path,
+            organize_strategy=str(context.get("strategy") or "month"),
+            dedupe=bool(context.get("dedupe", False)),
         )
         LOGGER.info("photo agent running job: %s", job)
         try:
@@ -73,8 +105,10 @@ class PhotoAgent(ConversationalAgent):
             raise ValueError("사진 정리가 취소되었습니다.") from exc
 
         events = self.pipeline.last_events()
+        report_path = recommendation.report_path
+        formatted = self._format_report(report_path) if report_path.exists() else self._format_recommendation(recommendation)
         return AgentResult(
-            content=self._format_recommendation(recommendation),
+            content=formatted,
             metadata={
                 "agent": self.name,
                 "report_path": str(recommendation.report_path),
@@ -95,6 +129,64 @@ class PhotoAgent(ConversationalAgent):
         if env_value:
             return Path(env_value).expanduser()
         return self.config.output_root
+
+    def _infer_roots_from_policy(self, policy_engine: object) -> List[Path]:
+        if not getattr(policy_engine, "has_policies", False):
+            return []
+        roots: List[Path] = []
+        try:
+            roots = list(policy_engine.roots_for_type(self.config.default_folder_type, include_manual=True))
+        except Exception:
+            roots = []
+        if roots:
+            return roots
+        try:
+            candidates = list(policy_engine.roots_for_agent(self.config.policy_agent, include_manual=True))
+        except Exception:
+            candidates = []
+        for root in candidates:
+            name = root.name.lower()
+            if "사진" in name or "photo" in name or name == "photos":
+                roots.append(root)
+        return roots
+
+    @staticmethod
+    def _latest_report_path(output_root: Path) -> Optional[Path]:
+        if not output_root.exists():
+            return None
+        candidates = list(output_root.rglob("photo_report.json"))
+        if not candidates:
+            return None
+        candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+        return candidates[0]
+
+    @staticmethod
+    def _format_report(report_path: Path) -> str:
+        try:
+            payload = json.loads(report_path.read_text(encoding="utf-8"))
+        except Exception:
+            return f"📷 사진 리포트: {report_path}"
+        lines = ["📷 사진 정리 리포트", f"- report: {report_path}"]
+        organize = payload.get("organize")
+        if isinstance(organize, dict):
+            dry_run = bool(organize.get("dry_run", True))
+            planned = organize.get("planned") or []
+            applied = organize.get("applied") or []
+            skipped = organize.get("skipped") or []
+            lines.append(f"- mode: {'DRY-RUN' if dry_run else 'APPLY'}")
+            lines.append(f"- planned: {len(planned)} | applied: {len(applied)} | skipped: {len(skipped)}")
+            for item in list(applied)[:5]:
+                if not isinstance(item, dict):
+                    continue
+                src = item.get("src")
+                dst = item.get("dst")
+                if src and dst:
+                    lines.append(f"  - {src} → {dst}")
+        else:
+            best = payload.get("best_shots") or []
+            dups = payload.get("duplicates") or []
+            lines.append(f"- best_shots: {len(best)} | duplicates: {len(dups)}")
+        return "\n".join(lines)
 
     @staticmethod
     def _normalise_roots(raw: Iterable[str | Path]) -> List[Path]:

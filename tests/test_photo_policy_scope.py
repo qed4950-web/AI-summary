@@ -2,7 +2,7 @@ from pathlib import Path
 
 from core.agents.photo import PhotoAgent
 from core.agents.photo.pipeline import PhotoJobConfig
-from core.data_pipeline.policies.engine import PolicyEngine
+from core.policy.engine import PolicyEngine
 
 
 def test_photo_policy_blocks_sensitive(tmp_path: Path):

@@ -117,6 +117,11 @@ def export_integrations(
 ) -> Dict[str, str]:
     attachments: Dict[str, str] = {}
 
+    summary_md_path = job.output_dir / "summary.md"
+    summary_md = _build_markdown_summary(job, transcription, summary)
+    summary_md_path.write_text(summary_md, encoding="utf-8")
+    attachments["summary_md"] = summary_md_path.name
+
     tasks_path = job.output_dir / "tasks.json"
     tasks_payload = [
         {
@@ -187,6 +192,76 @@ def export_integrations(
         )
 
     return attachments
+
+
+def _build_markdown_summary(
+    job: MeetingJobConfig,
+    transcription: MeetingTranscriptionResult,
+    summary: MeetingSummary,
+) -> str:
+    lines = [
+        f"# Meeting Summary — {job.audio_path.stem}",
+        "",
+        f"- Created: {job.created_at.isoformat()}",
+        f"- Source: `{job.audio_path}`",
+        f"- Language: `{transcription.language}`",
+        "",
+        "## Summary",
+        summary.raw_summary.strip(),
+        "",
+    ]
+
+    highlights = summary.structured_summary.get("highlights", []) if isinstance(summary.structured_summary, dict) else []
+    if highlights:
+        lines.extend(["## Highlights", ""])
+        for item in highlights:
+            if isinstance(item, dict):
+                text = (item.get("text") or "").strip()
+                ref = (item.get("ref") or "").strip()
+                if ref:
+                    lines.append(f"- {text} ({ref})".strip())
+                else:
+                    lines.append(f"- {text}".strip())
+            else:
+                lines.append(f"- {str(item).strip()}")
+        lines.append("")
+
+    actions = summary.structured_summary.get("action_items", []) if isinstance(summary.structured_summary, dict) else []
+    if actions:
+        lines.extend(["## Action Items", ""])
+        for item in actions:
+            if isinstance(item, dict):
+                text = (item.get("text") or "").strip()
+                ref = (item.get("ref") or "").strip()
+                if ref:
+                    lines.append(f"- {text} ({ref})".strip())
+                else:
+                    lines.append(f"- {text}".strip())
+            else:
+                lines.append(f"- {str(item).strip()}")
+        lines.append("")
+
+    decisions = summary.structured_summary.get("decisions", []) if isinstance(summary.structured_summary, dict) else []
+    if decisions:
+        lines.extend(["## Decisions", ""])
+        for item in decisions:
+            if isinstance(item, dict):
+                text = (item.get("text") or "").strip()
+                ref = (item.get("ref") or "").strip()
+                if ref:
+                    lines.append(f"- {text} ({ref})".strip())
+                else:
+                    lines.append(f"- {text}".strip())
+            else:
+                lines.append(f"- {str(item).strip()}")
+        lines.append("")
+
+    context_prompt = (summary.context or "").strip()
+    if context_prompt:
+        preview = context_prompt if len(context_prompt) <= 1500 else context_prompt[:1500] + "…"
+        lines.extend(["## Context (Preview)", "", preview, ""])
+
+    return "\n".join(lines).rstrip() + "\n"
 
 
 def sync_action_items_if_configured(job: MeetingJobConfig, summary: MeetingSummary, integration_config) -> None:

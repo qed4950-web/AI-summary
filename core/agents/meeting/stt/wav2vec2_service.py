@@ -14,6 +14,28 @@ from . import STTBackend, TranscriptionPayload
 
 LOGGER = logging.getLogger(__name__)
 
+_REMOTE_ALLOW_ENV = ("MEETING_ALLOW_REMOTE_MODELS", "INFOPILOT_ALLOW_REMOTE_MODELS")
+
+
+def _remote_models_allowed() -> bool:
+    for key in _REMOTE_ALLOW_ENV:
+        raw = os.getenv(key)
+        if raw is None:
+            continue
+        raw = raw.strip().lower()
+        if raw in {"1", "true", "yes", "on"}:
+            return True
+        if raw in {"0", "false", "no", "off"}:
+            return False
+    return False
+
+
+def _configure_transformers_offline() -> None:
+    os.environ.setdefault("HF_HUB_OFFLINE", "1")
+    os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+    os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
+
+
 try:  # Optional dependency; validated when the backend is used.
     import soundfile as sf  # type: ignore
 except Exception:  # pragma: no cover - optional import guard
@@ -112,13 +134,25 @@ class Wav2Vec2STTBackend:
             raise RuntimeError("wav2vec2 model identifier is not configured")
         if sf is None:
             raise RuntimeError("soundfile is required for wav2vec2 STT backend")
+        if not _remote_models_allowed():
+            _configure_transformers_offline()
         try:
             from transformers import AutoModelForCTC, AutoProcessor, pipeline as hf_pipeline  # type: ignore
         except Exception as exc:  # pragma: no cover - import guard
             raise RuntimeError("transformers is required for wav2vec2 STT backend") from exc
 
-        processor = AutoProcessor.from_pretrained(self.model_id)
-        model = AutoModelForCTC.from_pretrained(self.model_id)
+        try:
+            processor = AutoProcessor.from_pretrained(self.model_id)
+            model = AutoModelForCTC.from_pretrained(self.model_id)
+        except Exception as exc:  # pragma: no cover - offline cache guard
+            if not _remote_models_allowed():
+                raise RuntimeError(
+                    "wav2vec2 모델이 로컬 캐시에 없어 STT를 진행할 수 없습니다. "
+                    "해결: (1) transcript(.txt/.md)를 입력으로 사용하거나, "
+                    "(2) 모델을 로컬에 미리 캐시한 뒤 다시 실행하세요. "
+                    "(원격 다운로드를 허용하려면 MEETING_ALLOW_REMOTE_MODELS=1)"
+                ) from exc
+            raise
         tokenizer = getattr(processor, "tokenizer", None) or processor
         feature_extractor = getattr(processor, "feature_extractor", None) or processor
         feat_sr = getattr(feature_extractor, "sampling_rate", None)

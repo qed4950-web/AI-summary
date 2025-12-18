@@ -15,6 +15,11 @@ class PhotoJobConfig:
     policy_engine: Optional[object] = None
     policy_agent: str = "photo"
     prefer_gpu: bool = False
+    organize: bool = False
+    dry_run: bool = True
+    dest_root: Optional[Path] = None
+    organize_strategy: str = "month"
+    dedupe: bool = False
     created_at: datetime = field(default_factory=datetime.utcnow)
 
 

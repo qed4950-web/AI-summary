@@ -1,6 +1,7 @@
 """Pipeline orchestrator for photo tagging/deduplication."""
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
@@ -8,6 +9,7 @@ from core.agents.taskgraph import TaskCancelled, TaskContext, TaskGraph
 
 from core.utils import get_logger
 
+from .organize import apply_plan, build_plan
 from .models import PhotoAsset, PhotoJobConfig, PhotoRecommendation
 
 LOGGER = get_logger("photo.pipeline")
@@ -43,8 +45,12 @@ class PhotoPipeline:
         self._cancel_event = cancel_event
         graph = TaskGraph("photo_pipeline")
         graph.add_stage("scan", self._stage_scan)
-        graph.add_stage("analyse", self._stage_analyse, dependencies=("scan",))
-        graph.add_stage("persist", self._stage_persist, dependencies=("analyse",))
+        if getattr(job, "organize", False):
+            graph.add_stage("organize", self._stage_organize, dependencies=("scan",))
+            graph.add_stage("persist", self._stage_persist, dependencies=("organize",))
+        else:
+            graph.add_stage("analyse", self._stage_analyse, dependencies=("scan",))
+            graph.add_stage("persist", self._stage_persist, dependencies=("analyse",))
 
         try:
             graph.run(context)
@@ -97,7 +103,59 @@ class PhotoPipeline:
         recommendation: PhotoRecommendation = context.get("recommendation")
         if recommendation is None:
             raise RuntimeError("photo pipeline persistence stage requires recommendation")
-        self._persist(job, recommendation)
+        organize_info = context.get("organize")
+        self._persist(job, recommendation, organize=organize_info)
+
+    def _stage_organize(self, context: TaskContext) -> None:
+        self._ensure_not_cancelled()
+        job: PhotoJobConfig = context.job
+        photos: List[PhotoAsset] = context.get("photos") or []
+        dest_root = job.dest_root or job.roots[0]
+        plan = build_plan(
+            [asset.path for asset in photos],
+            dest_root=dest_root,
+            strategy=getattr(job, "organize_strategy", "month") or "month",
+            dedupe=bool(getattr(job, "dedupe", False)),
+        )
+        result = apply_plan(plan, dry_run=bool(getattr(job, "dry_run", True)))
+        report_path = job.output_dir / "photo_report.json"
+        recommendation = PhotoRecommendation(
+            best_shots=[],
+            duplicates=[],
+            similar_groups=[],
+            report_path=report_path,
+        )
+        context.set(
+            "organize",
+            {
+                "dry_run": bool(getattr(job, "dry_run", True)),
+                "dest_root": str(plan.dest_root),
+                "strategy": plan.strategy,
+                "dedupe": plan.dedupe,
+                "planned": [
+                    {
+                        "src": str(op.src),
+                        "dst": str(op.dst),
+                        "reason": op.reason,
+                        "capture_date": op.capture_date,
+                        "duplicate_of": str(op.duplicate_of) if op.duplicate_of else None,
+                    }
+                    for op in plan.operations
+                ],
+                "applied": [
+                    {
+                        "src": str(op.src),
+                        "dst": str(op.dst),
+                        "reason": op.reason,
+                        "capture_date": op.capture_date,
+                        "duplicate_of": str(op.duplicate_of) if op.duplicate_of else None,
+                    }
+                    for op in result.applied
+                ],
+                "skipped": list(result.skipped),
+            },
+        )
+        context.set("recommendation", recommendation)
 
     def _scan(self, job: PhotoJobConfig) -> List[PhotoAsset]:
         policy_engine = getattr(job, "policy_engine", None)
@@ -118,7 +176,12 @@ class PhotoPipeline:
                         allowed = False
                     if not allowed:
                         continue
-                assets.append(PhotoAsset(path=path, tags=[]))
+                asset = PhotoAsset(path=path, tags=[])
+                try:
+                    asset.metadata["mtime"] = path.stat().st_mtime
+                except OSError:
+                    pass
+                assets.append(asset)
         LOGGER.info("photos detected: %d", len(assets))
         return assets
 
@@ -146,16 +209,16 @@ class PhotoPipeline:
         sorted_photos = sorted(photos, key=lambda a: a.path.stat().st_mtime if a.path.exists() else 0, reverse=True)
         return sorted_photos[: min(20, len(sorted_photos))]
 
-    def _persist(self, job: PhotoJobConfig, recommendation: PhotoRecommendation) -> None:
-        import json
-
+    def _persist(self, job: PhotoJobConfig, recommendation: PhotoRecommendation, *, organize: object = None) -> None:
         job.output_dir.mkdir(parents=True, exist_ok=True)
-        payload = {
+        payload: Dict[str, object] = {
             "best_shots": [str(asset.path) for asset in recommendation.best_shots],
             "duplicates": [[str(a.path) for a in group] for group in recommendation.duplicates],
             "similar_groups": [[str(a.path) for a in group] for group in recommendation.similar_groups],
             "policy_tag": job.policy_tag,
         }
+        if organize is not None:
+            payload["organize"] = organize
         recommendation.report_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
     def _ensure_not_cancelled(self) -> None:

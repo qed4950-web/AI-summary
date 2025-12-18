@@ -10,6 +10,40 @@ from . import STTBackend, TranscriptionPayload
 
 LOGGER = logging.getLogger(__name__)
 
+_REMOTE_ALLOW_ENV = ("MEETING_ALLOW_REMOTE_MODELS", "INFOPILOT_ALLOW_REMOTE_MODELS")
+
+
+def _remote_models_allowed() -> bool:
+    for key in _REMOTE_ALLOW_ENV:
+        raw = os.getenv(key)
+        if raw is None:
+            continue
+        raw = raw.strip().lower()
+        if raw in {"1", "true", "yes", "on"}:
+            return True
+        if raw in {"0", "false", "no", "off"}:
+            return False
+    return False
+
+
+def _local_model_configured(model_size: str, download_root: Optional[str]) -> bool:
+    """Return True if Whisper weights appear to be available locally without downloads."""
+    if download_root:
+        try:
+            root = Path(download_root).expanduser()
+            if root.exists() and root.is_dir():
+                return True
+        except Exception:
+            pass
+    # faster-whisper accepts a local path instead of a size string.
+    try:
+        candidate = Path(model_size).expanduser()
+        if candidate.exists():
+            return True
+    except Exception:
+        pass
+    return False
+
 
 class WhisperSTTBackend:
     """Lazy-initialised faster-whisper transcription backend."""
@@ -41,6 +75,14 @@ class WhisperSTTBackend:
             return self._model
 
         from faster_whisper import WhisperModel  # type: ignore
+
+        if not _remote_models_allowed() and not _local_model_configured(self.model_size, self.download_root):
+            raise RuntimeError(
+                "faster-whisper 모델이 로컬에 없어 STT를 진행할 수 없습니다. "
+                "해결: (1) transcript(.txt/.md)를 입력으로 사용하거나, "
+                "(2) MEETING_STT_MODEL_DIR에 로컬 모델 경로를 지정하세요. "
+                "(원격 다운로드를 허용하려면 MEETING_ALLOW_REMOTE_MODELS=1)"
+            )
 
         kwargs = {}
         if self.device:

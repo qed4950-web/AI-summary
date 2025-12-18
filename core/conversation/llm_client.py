@@ -3,7 +3,10 @@ from __future__ import annotations
 import json
 import os
 import socket
+import subprocess
 from dataclasses import dataclass, field
+from pathlib import Path
+import sys
 from typing import Any, Dict, List, Optional
 from urllib import error, request
 
@@ -245,6 +248,7 @@ class LocalLlamaCppClient(LLMClient):
     model: str
     n_ctx: int = 4096
     n_threads: int = 0
+    n_gpu_layers: int = 0
     max_new_tokens: int = 512
     _llm: Any = field(init=False, default=None)
 
@@ -256,6 +260,7 @@ class LocalLlamaCppClient(LLMClient):
                 model_path=self.model,
                 n_ctx=max(256, int(self.n_ctx)),
                 n_threads=int(self.n_threads) if self.n_threads else None,
+                n_gpu_layers=int(self.n_gpu_layers),
                 logits_all=False,
             )
         except Exception as exc:
@@ -287,9 +292,178 @@ class LocalLlamaCppClient(LLMClient):
         return text.strip()
 
 
+@dataclass
+class LocalLlamaCliClient(LLMClient):
+    """Executes prompts using the bundled llama.cpp `llama-cli` binary."""
+
+    model: str
+    n_ctx: int = 4096
+    n_threads: int = 0
+    n_gpu_layers: int = 0
+    max_new_tokens: int = 512
+    cli_path: str = ""
+    no_mmap: Optional[bool] = None
+
+    def is_available(self) -> bool:
+        return bool(self._resolve_cli_path())
+
+    def _resolve_cli_path(self) -> str:
+        override = (self.cli_path or os.getenv("LNPCHAT_LLAMA_CLI_PATH") or "").strip()
+        if override:
+            return override
+
+        here = Path(__file__).resolve()
+        repo_root = here.parents[2]
+        metal = repo_root / "models" / "llama.cpp" / "build_metal" / "bin" / "llama-cli"
+        cpu = repo_root / "models" / "llama.cpp" / "build_cpu" / "bin" / "llama-cli"
+        if metal.exists():
+            return str(metal)
+        if cpu.exists():
+            return str(cpu)
+        return ""
+
+    def generate(self, prompt: str, *, system: Optional[str] = None, timeout: float = 30.0) -> str:
+        cli = self._resolve_cli_path()
+        if not cli:
+            raise LLMClientError("llama-cli not found (set LNPCHAT_LLAMA_CLI_PATH or build models/llama.cpp)")
+
+        full_prompt = prompt if not system else f"{system.strip()}\n\n{prompt.strip()}"
+        model_path = self.model
+        if not model_path:
+            raise LLMClientError("llama-cli backend requires a model path (GGUF)")
+
+        args = [
+            cli,
+            "--simple-io",
+            "--no-display-prompt",
+            "--no-perf",
+            "--log-disable",
+            "-m",
+            model_path,
+            "-c",
+            str(max(256, int(self.n_ctx))),
+            "-n",
+            str(max(1, int(self.max_new_tokens))),
+            "--temp",
+            "0",
+            "-ngl",
+            str(int(self.n_gpu_layers)),
+            "-p",
+            full_prompt,
+        ]
+        if self.n_threads:
+            args.extend(["-t", str(int(self.n_threads))])
+
+        resolved_no_mmap = self.no_mmap
+        if resolved_no_mmap is None:
+            raw = (os.getenv("LNPCHAT_LLAMA_CLI_NO_MMAP") or "").strip().lower()
+            if raw in {"1", "true", "yes"}:
+                resolved_no_mmap = True
+            elif raw in {"0", "false", "no"}:
+                resolved_no_mmap = False
+            else:
+                resolved_no_mmap = "build_metal" in cli
+        if resolved_no_mmap:
+            args.append("--no-mmap")
+
+        try:
+            proc = subprocess.run(
+                args,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=timeout,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise LLMClientError(f"llama-cli timed out after {timeout}s") from exc
+        except FileNotFoundError as exc:
+            raise LLMClientError(f"llama-cli executable not found: {cli}") from exc
+        except Exception as exc:
+            raise LLMClientError(f"llama-cli invocation failed: {exc}") from exc
+
+        if proc.returncode != 0:
+            stderr = proc.stderr.decode("utf-8", "ignore").strip()
+            raise LLMClientError(f"llama-cli failed ({proc.returncode}): {stderr[:300]}")
+
+        text = proc.stdout.decode("utf-8", "ignore").strip()
+        if not text:
+            return ""
+        cleaned = []
+        for line in text.splitlines():
+            trimmed = line.strip()
+            if "EOF by user" in trimmed:
+                continue
+            if trimmed.startswith(">") and "EOF" in trimmed:
+                continue
+            cleaned.append(line)
+        return "\n".join(cleaned).strip()
+
+
+@dataclass
+class LocalLlamaCppSubprocessClient(LLMClient):
+    """Runs llama-cpp-python inside a subprocess (crash-safe), with optional llama-cli fallback."""
+
+    model: str
+    n_ctx: int = 4096
+    n_threads: int = 0
+    n_gpu_layers: int = 0
+    max_new_tokens: int = 512
+    allow_cli_fallback: bool = True
+
+    def is_available(self) -> bool:
+        return True
+
+    def generate(self, prompt: str, *, system: Optional[str] = None, timeout: float = 30.0) -> str:
+        model_path = self.model
+        if not model_path:
+            raise LLMClientError("llama-cpp-python backend requires a model path (GGUF)")
+
+        # Use dedicated chat worker (not meeting summarization worker)
+        payload = {
+            "prompt": prompt,
+            "system": system or "",
+            "model_path": model_path,
+            "n_ctx": int(self.n_ctx),
+            "n_threads": int(self.n_threads),
+            "n_gpu_layers": int(self.n_gpu_layers),
+            "max_new_tokens": int(self.max_new_tokens),
+            "temperature": 0.7,
+        }
+
+        try:
+            proc = subprocess.run(
+                [sys.executable, "-m", "core.agents.meeting.llm.llama_cpp_chat_worker"],
+                input=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=timeout,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise LLMClientError(f"llama.cpp chat worker timed out after {timeout}s") from exc
+        except Exception as exc:
+            raise LLMClientError(f"llama.cpp chat worker launch failed: {exc}") from exc
+
+        if proc.returncode != 0:
+            err = (proc.stderr or b"").decode("utf-8", "ignore").strip()
+            raise LLMClientError(f"llama.cpp chat worker failed (code={proc.returncode}): {err[:300]}")
+
+        raw = (proc.stdout or b"").decode("utf-8", "ignore").strip()
+        try:
+            data = json.loads(raw) if raw else {}
+        except json.JSONDecodeError as exc:
+            raise LLMClientError("llama.cpp chat worker returned invalid JSON") from exc
+        
+        # Chat worker returns {"response": "..."} 
+        text = str(data.get("response") or "").strip()
+        return text
+
+
 def create_llm_client(backend: Optional[str], *, model: str, host: str = "", options: Optional[Dict[str, str]] = None) -> Optional[LLMClient]:
     backend = (backend or "").strip().lower()
     if not backend:
+        return None
+    if backend in {"none", "off", "disabled"}:
         return None
     if backend == "ollama":
         client = OllamaClient(model=model or "llama3", host=host or "", options=options or {})
@@ -309,10 +483,59 @@ def create_llm_client(backend: Optional[str], *, model: str, host: str = "", opt
         )
     if backend == "local_llamacpp":
         opts = options or {}
-        return LocalLlamaCppClient(
+        n_gpu_layers = opts.get("n_gpu_layers")
+        if n_gpu_layers is None:
+            n_gpu_layers = os.getenv("LNPCHAT_LLAMACPP_GPU_LAYERS", "0")
+        # Default to in-process (0) for faster response - subprocess available via env var
+        use_subprocess = os.getenv("LNPCHAT_LLAMACPP_SUBPROCESS", "0").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+        }
+        fallback = os.getenv("LNPCHAT_LLAMACPP_FALLBACK_CLI", "1").strip().lower() not in {
+            "",
+            "0",
+            "false",
+            "no",
+        }
+        if use_subprocess:
+            return LocalLlamaCppSubprocessClient(
+                model=model,
+                n_ctx=int(opts.get("n_ctx", 4096)),
+                n_threads=int(opts.get("n_threads", 0)),
+                n_gpu_layers=int(n_gpu_layers),
+                max_new_tokens=int(opts.get("max_new_tokens", opts.get("num_predict", 512))),
+                allow_cli_fallback=fallback,
+            )
+        try:
+            return LocalLlamaCppClient(
+                model=model,
+                n_ctx=int(opts.get("n_ctx", 4096)),
+                n_threads=int(opts.get("n_threads", 0)),
+                n_gpu_layers=int(n_gpu_layers),
+                max_new_tokens=int(opts.get("max_new_tokens", opts.get("num_predict", 512))),
+            )
+        except LLMClientError:
+            if not fallback:
+                raise
+            return LocalLlamaCliClient(
+                model=model,
+                n_ctx=int(opts.get("n_ctx", 4096)),
+                n_threads=int(opts.get("n_threads", 0)),
+                n_gpu_layers=int(n_gpu_layers),
+                max_new_tokens=int(opts.get("max_new_tokens", opts.get("num_predict", 512))),
+            )
+    if backend in {"local_llama_cli", "llama_cli", "llama-cli"}:
+        opts = options or {}
+        n_gpu_layers = opts.get("n_gpu_layers")
+        if n_gpu_layers is None:
+            n_gpu_layers = os.getenv("LNPCHAT_LLAMACPP_GPU_LAYERS", "0")
+        return LocalLlamaCliClient(
             model=model,
             n_ctx=int(opts.get("n_ctx", 4096)),
             n_threads=int(opts.get("n_threads", 0)),
+            n_gpu_layers=int(n_gpu_layers),
             max_new_tokens=int(opts.get("max_new_tokens", opts.get("num_predict", 512))),
+            cli_path=str(opts.get("cli_path", "")),
         )
     raise LLMClientError(f"unsupported LLM backend: {backend}")

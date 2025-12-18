@@ -46,6 +46,14 @@ class MemoryStore:
                 return turn.text
         return None
 
+    def build_prompt_history(self, limit: Optional[int] = None) -> str:
+        turns = self.recent(limit)
+        buf = []
+        for turn in turns:
+            role_label = "User" if turn.role == "user" else "Assistant"
+            buf.append(f"{role_label}: {turn.text}")
+        return "\n".join(buf)
+
 
 class PromptManager:
     def __init__(
@@ -154,9 +162,8 @@ class ToolRouter:
         lowered = trimmed.lower()
         has_command = lowered.startswith(("/search", "/doc", "/audio"))
         keywords_summary = {
-            "요약", "정리", "정리해줘", "설명", "설명해줘", "핵심", "한줄", "결론",
-            "말해줘", "알려줘", "소개해줘",
-            "summarize", "summary", "explain", "tell me", "tl;dr", "overview",
+            "요약", "정리", "정리해줘", "설명해줘", "핵심", "한줄", "결론",
+            "summarize", "summary", "explain", "tl;dr", "overview",
         }
         keywords_list = {"목록", "리스트", "파일", "문서", "보여줘", "검색"}
         doc_terms = {
@@ -176,10 +183,18 @@ class ToolRouter:
         doc_terms_hit = _contains_any(trimmed, doc_terms) or _contains_any(lowered, doc_terms)
         search_terms_hit = _contains_any(trimmed, search_triggers) or _contains_any(lowered, search_triggers)
 
-        # 검색/요약은 명시적 명령(/search, /doc)일 때만 트리거한다.
-        if not has_command:
-            return "dialogue" if llm_available else "search"
-
+        # has_command가 아니더라도 검색 의도가 있으면 search로 라우팅한다.
+        # 단, 의도가 불분명하면 대화(dialogue)로 보낸다.
         if ask_summary or ask_list or search_terms_hit or doc_terms_hit:
             return "search_and_summarize" if ask_summary else "search"
-        return "search"
+            
+        return "dialogue" if llm_available else "search"
+
+    def build_gemma_prompt(self, instruction: str, history_text: str, query: str) -> str:
+        return (
+            f"<start_of_turn>user\n"
+            f"{instruction}\n\n"
+            f"Context:\n{history_text}\n"
+            f"Current Query:\n{query}<end_of_turn>\n"
+            f"<start_of_turn>model\n"
+        )

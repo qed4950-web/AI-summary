@@ -70,6 +70,7 @@ def cmd_index(
         cache_dir=Path(args.cache),
         translate=getattr(args, "translate", False),
         rerank=False,
+        llm_backend="none",
         policy_engine=policy_engine,
         policy_scope=scope,
         policy_agent=agent,
@@ -94,4 +95,3 @@ def cmd_index(
 
 
 __all__ = ["cmd_index"]
-

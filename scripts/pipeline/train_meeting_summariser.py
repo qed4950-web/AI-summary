@@ -7,14 +7,22 @@ import os
 from pathlib import Path
 from typing import Iterable
 
-import torch
-from datasets import Dataset
-from transformers import (
-    AutoModelForSeq2SeqLM,
-    AutoTokenizer,
-    Seq2SeqTrainer,
-    Seq2SeqTrainingArguments,
-)
+try:
+    import torch
+    from datasets import Dataset
+    from transformers import (
+        AutoModelForSeq2SeqLM,
+        AutoTokenizer,
+        Seq2SeqTrainer,
+        Seq2SeqTrainingArguments,
+    )
+except ImportError:
+    torch = None
+    Dataset = None
+    AutoModelForSeq2SeqLM = None
+    AutoTokenizer = None
+    Seq2SeqTrainer = None
+    Seq2SeqTrainingArguments = None
 
 from core.agents.meeting.dataset_loader import load_transcript_summary_pairs
 

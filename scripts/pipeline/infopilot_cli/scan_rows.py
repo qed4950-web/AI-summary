@@ -5,7 +5,7 @@ import math
 from pathlib import Path
 from typing import Any, Dict, Iterator, Optional
 
-from core.data_pipeline.policies.engine import PolicyEngine
+from core.policy.engine import PolicyEngine
 
 
 NORMALIZED_ALIASES = {

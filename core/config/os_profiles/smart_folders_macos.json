@@ -1,5 +1,15 @@
 [
   {
+    "id": "documents-docs",
+    "label": "Documents",
+    "type": "documents",
+    "path": "~/Documents",
+    "scope": "policy",
+    "policy": "core/config/hybrid.yaml",
+    "sensitive_paths": ["~/Documents/민감"],
+    "cache": {"max_bytes": 2147483648, "purge_days": 30}
+  },
+  {
     "id": "documents-desktop",
     "label": "Desktop",
     "type": "documents",

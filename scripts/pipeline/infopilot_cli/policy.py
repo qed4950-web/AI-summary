@@ -5,7 +5,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Set
 
-from core.data_pipeline.policies.engine import PolicyEngine
+from core.policy.engine import PolicyEngine
 from core.errors import PolicyViolationError
 
 _POLICY_CACHE: Dict[Path, PolicyEngine] = {}

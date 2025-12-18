@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 import infopilot
-from core.data_pipeline.policies.engine import PolicyEngine, SmartFolderPolicy
+from core.policy.engine import PolicyEngine, SmartFolderPolicy
 from core.infra import JobScheduler, ScheduleSpec
 
 pytestmark = pytest.mark.smoke
@@ -31,6 +31,7 @@ def test_schedule_spec_from_policy_cron() -> None:
 def test_register_policy_jobs_executes(monkeypatch, tmp_path) -> None:
     policy_root = tmp_path / "docs"
     policy_root.mkdir()
+    (policy_root / "doc.txt").touch()
 
     policy = SmartFolderPolicy(
         path=policy_root,
@@ -43,7 +44,8 @@ def test_register_policy_jobs_executes(monkeypatch, tmp_path) -> None:
 
     calls = {}
 
-    def fake_run_scan(out, roots, *, policy_engine=None):
+    def fake_run_scan(out, roots, **kwargs):
+        print(f"DEBUG: fake_run_scan called with roots={roots}")
         calls["scan_out"] = out
         calls["roots"] = roots
         return [{"path": str(policy_root / "doc.txt")}]
@@ -55,8 +57,9 @@ def test_register_policy_jobs_executes(monkeypatch, tmp_path) -> None:
         calls["translate"] = translate
         return None, None
 
-    monkeypatch.setattr(infopilot, "_run_scan", fake_run_scan)
-    monkeypatch.setattr(infopilot, "run_step2", fake_run_step2)
+    import scripts.pipeline.infopilot_cli.schedule as schedule_module
+    monkeypatch.setattr(schedule_module, "run_scan", fake_run_scan)
+    monkeypatch.setattr(schedule_module, "run_step2", fake_run_step2)
 
     scheduler = JobScheduler()
     jobs = infopilot._register_policy_jobs(

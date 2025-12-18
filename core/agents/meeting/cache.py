@@ -136,6 +136,7 @@ def load_cached_summary(
     context_prompt = summary_payload.get("context_prompt")
 
     return MeetingSummary(
+        id=job.meeting_id or "cache_restored",
         highlights=highlights,
         action_items=action_items,
         decisions=decisions,

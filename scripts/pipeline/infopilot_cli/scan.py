@@ -5,8 +5,8 @@ import hashlib
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
-from core.data_pipeline.filefinder import FileFinder
-from core.data_pipeline.policies.engine import PolicyEngine
+from core.data_pipeline.scanner import run_scan as scanner_run_scan, ScanConfig, DEFAULT_EXTS, ScanResult
+from core.policy.engine import PolicyEngine
 from core.errors import PolicyViolationError
 
 from .policy import normalize_exts, parse_roots
@@ -52,18 +52,54 @@ def run_scan(
 
     normalized_exts = normalize_exts(exts)
 
-    finder = FileFinder(
-        exts=normalized_exts or FileFinder.DEFAULT_EXTS,
-        scan_all_drives=True,
-        start_from_current_drive_only=False,
-        follow_symlinks=False,
-        max_depth=None,
-        show_progress=True,
-        progress_update_secs=0.5,
-        estimate_total_dirs=False,
-        startup_banner=True,
+    normalized_exts = normalize_exts(exts) or DEFAULT_EXTS
+
+    # Use new scanner (replacing FileFinder)
+    cfg = ScanConfig(
+        roots=scan_roots,
+        exts=normalized_exts,
+        allow_hash=False # We handle hash manually below if needed, or scanner can do it
     )
-    files = finder.find(roots=scan_roots, run_async=False)
+    # scanner_run_scan returns List[ScanResult]
+    # We use it directly because it handles recursion.
+    # But wait, run_scan in scanner does policy checks too.
+    # The local logic below (lines 68+) tries to do "raw scan then policy check".
+    # So we should use scan_directory from scanner? 
+    # scanner.py has run_scan. Let's use it if it fits.
+    # Actually, let's use scanner_run_scan with policy_engine=None to get raw files first, matching existing logic.
+    
+    scan_results: List[ScanResult] = scanner_run_scan(cfg, policy_engine=None)
+    
+    # Convert back to dicts to match 'files' expectation
+    files = []
+    for res in scan_results:
+        files.append({
+            "path": str(res.path),
+            "size": res.size,
+            "mtime": res.mtime,
+            "ext": res.path.suffix.lower(), # mimicking FileFinder raw output
+            "drive": res.path.anchor,
+            "owner": "", # Scanner does NOT support owner in ScanResult dataclass but scan_directory DOES.
+                         # Wait, scan_directory returns dicts WITH owner. run_scan returns ScanResult WITHOUT owner!
+                         # If we need owner (which FileFinder found), we should use scan_directory manually.
+                         # FileFinder.find returned dicts.
+        })
+    
+    # Actually, let's look at scanner.py again.
+    # scan_directory returns dicts with owners.
+    # run_scan calls scan_directory then maps to ScanResult (dropping owner).
+    # Does 'files' usage downstream need owner?
+    # scan.py writes 'path', 'size', 'mtime', 'allowed', 'deny_reason', 'hash'.
+    # It does NOT write 'owner'.
+    # So ScanResult is fine.
+    
+    files = []
+    for res in scan_results:
+         files.append({
+            "path": str(res.path),
+            "size": res.size,
+            "mtime": res.mtime,
+         })
 
     if not (policy_engine and policy_engine.has_policies):
         rows: List[Dict[str, Any]] = []
@@ -74,10 +110,7 @@ def run_scan(
             payload["deny_reason"] = ""
             payload["hash"] = _hash_file(path) if include_hash and path.is_file() else ""
             rows.append(payload)
-        if include_denied:
-            write_scan_csv(rows, out)
-        else:
-            FileFinder.to_csv(files, out)
+        write_scan_csv(rows, out)
         print(f"📦 스캔 결과 저장: {out}")
         return rows if include_denied else files
 

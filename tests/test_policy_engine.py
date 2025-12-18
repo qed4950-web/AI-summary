@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from core.data_pipeline.policies.engine import PolicyEngine
+from core.policy.engine import PolicyEngine
 
 
 def test_policy_sensitive_paths_excluded(tmp_path: Path):
