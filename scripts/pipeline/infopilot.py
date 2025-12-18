@@ -39,8 +39,10 @@ DEFAULT_CHUNK_CACHE = ROOT_DIR / "data" / "cache" / "chunk_cache.json"
 DEFAULT_SCAN_STATE = ROOT_DIR / "data" / "cache" / "scan_state.json"
 
 @click.group()
-def cli():
+@click.option("--no-mlflow", is_flag=True, hidden=True, help="Disable MLflow tracking (deprecated, no-op)")
+def cli(no_mlflow):
     """InfoPilot CLI"""
+    # --no-mlflow is now a no-op for backward compatibility
     pass
 
 # --- SCAN ---
