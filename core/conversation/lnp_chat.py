@@ -44,17 +44,39 @@ LOGGER = get_logger("lnp.chat")
 CONFIRM_POSITIVES = {"응", "네", "예", "맞아", "좋아", "yes", "y", "sure", "ok", "그래", "ㅇㅋ", "넵"}
 CONFIRM_NEGATIVES = {"아니", "아니오", "no", "n", "싫어", "괜찮아", "아냐", "안돼", "안해", "노"}
 
+CHIT_CHAT_KEYWORDS = {
+    "안녕", "안녕하세요", "반가워", "반갑습니다", "하이", "하이루", "ㅎㅇ", 
+    "고마워", "감사", "감사합니다", "수고", "수고했어", "잘했어", "누구니", 
+    "너는 누구니", "도움말", "사용법", "hello", "hi", "thanks", "thank you",
+    "이름이", "뭐야", "뭐니"
+}
+
+SEARCH_INTENT_KEYWORDS = {"찾아", "검색", "보여", "요약", "어디", "문서", "파일", "정리", "알려줘", "구해", "무슨"}
+
+# Slash command routing
+SLASH_COMMANDS = {
+    "/document": "search",
+    "/doc": "search",
+    "/문서": "search",
+    "/audio": "search_audio",
+    "/회의": "search_audio",
+    "/photo": "search_photo",
+    "/사진": "search_photo",
+}
+
 PROMPT_INSTRUCTION_SMALL_TALK = (
-    "당신은 'InfoPilot'이라는 AI 비서입니다. 한국어로 친근하게 답하세요.\n"
-    "규칙:\n"
-    "1. 사용자가 '너의 이름'을 물으면 'InfoPilot'이라고 답하세요.\n"
-    "2. 사용자가 '오늘 할 일'을 물으면 '파일 검색이나 문서 요약을 도와드릴까요?'라고 되물으세요.\n"
-    "3. 그 외 일상 대화에는 짧고 친절하게 답하세요.\n"
-    "4. 만약 문서나 파일 관련 질문이라면 '[SEARCH_INTENT]'라고만 답하세요.\n"
-    "5. 정체성 방어:\n"
-    "- '당신은 누구인가요?' -> '저는 InfoPilot입니다. 문서 검색과 요약을 돕는 AI 비서예요.'\n"
-    "- 사용자가 당신(AI)의 이름을 지정하면, 그 이름으로 호칭을 변경하세요.\n"
-    "- 주체(User vs AI)를 명확히 구분하세요."
+    "당신은 'InfoPilot'이라는 AI 비서입니다. 한국어로 친근하고 자연스럽게 대화하세요.\n"
+    "\n"
+    "## 핵심 규칙\n"
+    "1. 사용자가 '너(AI)의 이름'을 물으면: 'InfoPilot입니다.'\n"
+    "2. 사용자가 '내(사용자) 이름'을 물으면: '죄송해요, 아직 이름을 알려주지 않으셨어요. 이름이 뭐예요?'\n"
+    "3. 사용자가 자신의 이름을 알려주면: 그 이름을 기억하고 사용하세요.\n"
+    "4. 문서 검색이나 파일 관련 질문은 '/document 질문' 형식으로 물어보라고 안내하세요.\n"
+    "\n"
+    "## 대화 스타일\n"
+    "- 짧고 친절하게 답변하세요.\n"
+    "- 반말/존댓말은 사용자에 맞춰주세요.\n"
+    "- 모르는 건 솔직히 모른다고 하세요.\n"
 )
 
 def _split_tokens(text: str) -> List[str]:
@@ -100,7 +122,7 @@ class LNPChat:
     policy_agent: str = "knowledge_search"
     
     # State
-    memory: MemoryStore = field(default_factory=MemoryStore)
+    memory: MemoryStore = field(default_factory=lambda: MemoryStore(capacity=30))
     llm_client: Optional[LLMClient] = None
     _translator: Optional[GoogleTranslator] = None
     _translation_cache: Optional[TranslationCache] = None
@@ -191,10 +213,10 @@ class LNPChat:
              force_action = confirm_res.get("action", force_action)
 
         # 3. Action Determination
-        action = self._determine_action(query, force_action)
+        action, query_to_use = self._determine_action(query, force_action)
         
         # 4. Execute
-        return self._execute_action(action, query, k)
+        return self._execute_action(action, query_to_use, k)
 
     def _handle_commands(self, query: str) -> Optional[Dict[str, Any]]:
         query_s = query.strip()
@@ -223,23 +245,56 @@ class LNPChat:
         pass 
         return None
 
-    def _determine_action(self, query: str, force_action: Optional[str]) -> str:
-        if force_action:
-            return force_action
+    def _parse_command(self, query: str) -> tuple[str | None, str]:
+        """Parse slash command from query. Returns (action, remaining_query)."""
+        query_s = query.strip()
+        if not query_s.startswith("/"):
+            return None, query
         
-        # Heuristics
+        parts = query_s.split(maxsplit=1)
+        cmd = parts[0].lower()
+        remaining = parts[1] if len(parts) > 1 else ""
+        
+        action = SLASH_COMMANDS.get(cmd)
+        return action, remaining
+
+    def _determine_action(self, query: str, force_action: Optional[str] = None) -> tuple[str, str]:
+        """Determine action and return (action, query_to_use)."""
+        if force_action:
+            return force_action, query
+        
+        # 1. Check for slash commands first
+        cmd_action, remaining_query = self._parse_command(query)
+        if cmd_action:
+            return cmd_action, remaining_query
+        
+        # 2. Auto-search mode (if enabled)
         if self.auto_search or self.strict_search:
-            return "search"
-            
-        # Tool Router (LLM or Regex)
-        # For MVP, explicit keywords or ToolRouter
-        # ... (Simplified logic)
-        return "search" # Default to search for now as this is a RAG agent
+            return "search", query
+
+        # 3. Default to chat (no search)
+        return "chat", query
 
     def _execute_action(self, action: str, query: str, k: int) -> Dict[str, Any]:
         if action == "search":
             return self._search_and_answer(query, k)
-        return self._search_and_answer(query, k) # Fallback
+        elif action == "search_audio":
+            return self._search_audio(query, k)
+        elif action == "search_photo":
+            return self._search_photo(query, k)
+        elif action == "chat":
+            return self._chat_only(query)
+        return self._chat_only(query)  # Default to chat
+
+    def _search_audio(self, query: str, k: int) -> Dict[str, Any]:
+        """Search audio/meeting transcripts."""
+        # TODO: Implement audio-specific search when audio index is available
+        return self._search_and_answer(f"회의 {query}", k)
+
+    def _search_photo(self, query: str, k: int) -> Dict[str, Any]:
+        """Search photos."""
+        # TODO: Implement photo-specific search when photo index is available
+        return self._search_and_answer(f"사진 {query}", k)
 
     def _search_and_answer(self, query: str, k: int) -> Dict[str, Any]:
         self.ready(wait_timeout=5.0)
@@ -277,19 +332,19 @@ class LNPChat:
         # Improved RAG prompt with structure and citation requirements
         full_prompt = (
             f"## 작업\n"
-            f"아래 검색 결과를 참고하여 사용자의 질문에 정확하고 유용하게 답변하세요.\n\n"
+            f"아래 검색 결과를 핵심 근거로 삼아 사용자의 질문에 답변하세요.\n\n"
             f"## 규칙\n"
-            f"1. 답변에는 반드시 출처(파일명)를 인용하세요.\n"
-            f"2. 검색 결과에 없는 내용은 추측하지 마세요.\n"
-            f"3. 핵심 내용을 먼저 말하고, 필요시 세부사항을 추가하세요.\n"
-            f"4. 한국어로 자연스럽게 답변하세요.\n\n"
+            f"1. 답변 내용의 모든 사실은 검색 결과에서 가져와야 합니다.\n"
+            f"2. 검색 결과에 없는 내용은 '검색 결과에 관련 정보가 없습니다'라고 답하세요.\n"
+            f"3. 답변 중간중간에 출처 파일명을 [파일명] 형태로 명시하세요.\n"
+            f"4. 한국어로 자연스럽고 명확하게 답변하세요.\n\n"
             f"## 사용자 질문\n{query}\n\n"
             f"## 검색 결과\n{context_str}"
         )
         
         system_prompt = (
             "당신은 InfoPilot입니다. 사용자의 로컬 문서를 검색하여 정확한 정보를 제공하는 AI 비서입니다. "
-            "항상 출처를 밝히고, 검색 결과에 기반한 사실만 답변합니다."
+            "검색 결과가 없거나 관련성이 낮으면 솔직하게 모른다고 대답합니다."
         )
         
         try:
@@ -298,3 +353,35 @@ class LNPChat:
         except Exception as e:
             LOGGER.warning("LLM summarization failed: %s", e)
             return None
+
+    def _chat_only(self, query: str) -> Dict[str, Any]:
+        """Multi-turn chat without retrieval for greetings/chit-chat."""
+        if not self.llm_client:
+             return {"answer": "LLM이 준비되지 않았습니다."}
+        
+        try:
+            # Build messages array from memory for multi-turn
+            messages = [{"role": "system", "content": PROMPT_INSTRUCTION_SMALL_TALK}]
+            
+            # Add conversation history (last N turns)
+            for turn in self.memory.recent(limit=10):
+                role = "user" if turn.role == "user" else "assistant"
+                messages.append({"role": role, "content": turn.text})
+            
+            # Add current user query
+            messages.append({"role": "user", "content": query})
+            
+            # Store user query in memory
+            self.memory.add_turn("user", query)
+            
+            # Generate response
+            with self.ui.spinner("생각 중..."):
+                response = self.llm_client.generate_chat(messages)
+            
+            # Store assistant response in memory
+            self.memory.add_turn("assistant", response)
+            
+            return {"answer": response, "hits": [], "suggestions": []}
+        except Exception as e:
+            LOGGER.warning("LLM chat failed: %s", e)
+            return {"answer": "죄송합니다, 대화 처리 중 문제가 발생했습니다.", "hits": [], "suggestions": []}

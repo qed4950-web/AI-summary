@@ -50,18 +50,8 @@ class EnhancedInput(QTextEdit):
             # Other keys -> Default behavior
             super().keyPressEvent(event)
 
-class QueryWorker(QThread):
-    result_ready = Signal(str)
-    stream_update = Signal(str)
 
-    def __init__(self, bridge, query):
-        super().__init__()
-        self.bridge = bridge
-        self.query = query
-
-    def run(self):
-        response = self.bridge.route(self.query, callback=self.stream_update.emit)
-        self.result_ready.emit(response)
+# QueryWorker removed (Using QThread Backend)
 
 class SmartFolderManagerDialog(QDialog):
     def __init__(self, registry, parent=None):
@@ -147,8 +137,22 @@ class SmartFolderManagerDialog(QDialog):
             self.refresh_list()
 
 class LauncherWindow(QWidget):
-    def __init__(self):
+    query_requested = Signal(str) # Signal to send query to backend
+
+    def __init__(self, backend=None):
         super().__init__()
+        
+        self.backend = backend
+        
+        # Connect Signals if backend provided
+        if self.backend:
+            # UI -> Backend
+            self.query_requested.connect(self.backend.handle_query)
+            
+            # Backend -> UI
+            self.backend.response_ready.connect(self.handle_response)
+            self.backend.status_msg.connect(self.update_status_msg)
+            self.backend.error_occurred.connect(self.handle_error)
         
         # 1. Window Setup
         self.setWindowFlags(
@@ -166,9 +170,7 @@ class LauncherWindow(QWidget):
         self.setup_ui()
         self.setup_styles()
         
-        # 3. Logic Bridge
-        from desktop_app.bridge import Bridge
-        self.bridge = Bridge()
+        # 3. Logic: Connected via Signals
         self.policy_registry = SmartFolderRegistry()
         
         # 4. Animation Timer
@@ -381,12 +383,8 @@ class LauncherWindow(QWidget):
         # Reset current streaming item
         self.streaming_item = None
         
-        # Create Worker
-        self.worker = QueryWorker(self.bridge, query)
-        self.worker.stream_update.connect(self.handle_stream_update)
-        self.worker.result_ready.connect(self.handle_response)
-        self.worker.finished.connect(self.worker.deleteLater)
-        self.worker.start()
+        # Send Query via Signal (Thread-safe)
+        self.query_requested.emit(query)
 
     def update_thinking_text(self):
         self.thinking_dots = (self.thinking_dots + 1) % 4
@@ -447,6 +445,20 @@ class LauncherWindow(QWidget):
             self.result_list.setVisible(True)
             self.resize(600, 500)
             
+    def update_status_msg(self, msg):
+        self.status_label.setText(msg)
+        if "Error" in msg:
+            self.status_label.setStyleSheet("color: red;")
+        elif "Thinking" in msg or "Loading" in msg:
+            self.status_label.setStyleSheet("color: #10a37f;")
+        else:
+            self.status_label.setStyleSheet("color: #6e6e73;")
+            
+    def handle_error(self, msg):
+        self.thinking_timer.stop()
+        self.status_label.setText("Error")
+        self.add_message("System", f"Error: {msg}")
+
     def add_message(self, sender, text):
         formatted_text = f"{sender}: {text}"
         item = QListWidgetItem(formatted_text)
@@ -454,10 +466,9 @@ class LauncherWindow(QWidget):
         self.result_list.scrollToBottom()
 
     def cleanup(self):
-        """Called when application is quitting to clean up subprocesses"""
-        print("[Launcher] Cleaning up...")
-        if hasattr(self, 'bridge') and self.bridge:
-            self.bridge.close()
+        """Called when application is quitting"""
+        # Backend thread is cleaned up in main.py
+        pass
 
     def keyPressEvent(self, event):
         if event.key() == Qt.Key_Escape:

@@ -4,6 +4,7 @@ import json
 import os
 import socket
 import subprocess
+import shlex
 from dataclasses import dataclass, field
 from pathlib import Path
 import sys
@@ -39,6 +40,14 @@ class LLMClient:
         raise NotImplementedError
 
     def generate(self, prompt: str, *, system: Optional[str] = None, timeout: float = 30.0) -> str:
+        raise NotImplementedError
+
+    def generate_chat(self, messages: List[Dict[str, str]], *, timeout: float = 30.0) -> str:
+        """Generate response from a list of messages for multi-turn conversation.
+        
+        messages: List of dicts with 'role' and 'content' keys.
+                  role can be 'system', 'user', or 'assistant'
+        """
         raise NotImplementedError
 
 
@@ -248,7 +257,7 @@ class LocalLlamaCppClient(LLMClient):
     model: str
     n_ctx: int = 4096
     n_threads: int = 0
-    n_gpu_layers: int = 0
+    n_gpu_layers: int = -1
     max_new_tokens: int = 512
     _llm: Any = field(init=False, default=None)
 
@@ -272,21 +281,52 @@ class LocalLlamaCppClient(LLMClient):
     def generate(self, prompt: str, *, system: Optional[str] = None, timeout: float = 30.0) -> str:
         if self._llm is None:
             raise LLMClientError("llama.cpp 모델이 초기화되지 않았습니다.")
-        full_prompt = prompt if not system else f"{system.strip()}\n\n{prompt.strip()}"
+        
+        # Use chat completion API for proper template handling
+        messages = []
+        if system:
+            messages.append({"role": "system", "content": system.strip()})
+        messages.append({"role": "user", "content": prompt.strip()})
+        
         try:
-            out = self._llm(
-                prompt=full_prompt,
+            out = self._llm.create_chat_completion(
+                messages=messages,
                 max_tokens=max(1, int(self.max_new_tokens)),
                 temperature=0.0,
-                stop=["</s>"],
             )
         except Exception as exc:
             raise LLMClientError(f"llama.cpp 호출에 실패했습니다: {exc}") from exc
+        
         text = ""
         if isinstance(out, dict):
             choices = out.get("choices") or []
             if choices and isinstance(choices[0], dict):
-                text = choices[0].get("text", "") or ""
+                message = choices[0].get("message", {})
+                text = message.get("content", "") or ""
+        if not text:
+            text = str(out)
+        return text.strip()
+
+    def generate_chat(self, messages: List[Dict[str, str]], *, timeout: float = 30.0) -> str:
+        """Generate response from a list of messages for multi-turn conversation."""
+        if self._llm is None:
+            raise LLMClientError("llama.cpp 모델이 초기화되지 않았습니다.")
+        
+        try:
+            out = self._llm.create_chat_completion(
+                messages=messages,
+                max_tokens=max(1, int(self.max_new_tokens)),
+                temperature=0.0,
+            )
+        except Exception as exc:
+            raise LLMClientError(f"llama.cpp 호출에 실패했습니다: {exc}") from exc
+        
+        text = ""
+        if isinstance(out, dict):
+            choices = out.get("choices") or []
+            if choices and isinstance(choices[0], dict):
+                message = choices[0].get("message", {})
+                text = message.get("content", "") or ""
         if not text:
             text = str(out)
         return text.strip()
@@ -310,16 +350,28 @@ class LocalLlamaCliClient(LLMClient):
     def _resolve_cli_path(self) -> str:
         override = (self.cli_path or os.getenv("LNPCHAT_LLAMA_CLI_PATH") or "").strip()
         if override:
+            print(f"[DEBUG] Using Override Llama-CLI: {override}", file=sys.stderr)
             return override
 
         here = Path(__file__).resolve()
-        repo_root = here.parents[2]
+        repo_root = here.parents[2] # expected: AI-summary
+        m4_build = repo_root / "models" / "llama.cpp" / "build_m4" / "bin" / "llama-cli"
         metal = repo_root / "models" / "llama.cpp" / "build_metal" / "bin" / "llama-cli"
         cpu = repo_root / "models" / "llama.cpp" / "build_cpu" / "bin" / "llama-cli"
+        
+        print(f"[DEBUG] Checking M4 Build at: {m4_build} (Exists: {m4_build.exists()})", file=sys.stderr)
+        
+        if m4_build.exists():
+            print(f"[DEBUG] Using M4-optimized Llama-CLI: {m4_build}", file=sys.stderr)
+            return str(m4_build)
         if metal.exists():
+            print(f"[DEBUG] Using Standard Metal Llama-CLI: {metal}", file=sys.stderr)
             return str(metal)
         if cpu.exists():
+            print(f"[DEBUG] Using CPU Llama-CLI: {cpu}", file=sys.stderr)
             return str(cpu)
+        
+        print("[DEBUG] No Llama-CLI found!", file=sys.stderr)
         return ""
 
     def generate(self, prompt: str, *, system: Optional[str] = None, timeout: float = 30.0) -> str:
@@ -337,7 +389,8 @@ class LocalLlamaCliClient(LLMClient):
             "--simple-io",
             "--no-display-prompt",
             "--no-perf",
-            "--log-disable",
+            # "--log-disable", # Enable logs for debugging and stability
+            "-no-cnv",
             "-m",
             model_path,
             "-c",
@@ -366,6 +419,8 @@ class LocalLlamaCliClient(LLMClient):
         if resolved_no_mmap:
             args.append("--no-mmap")
 
+        print(f"[DEBUG] Executing Command: {shlex.join(args)}", file=sys.stderr)
+        
         try:
             proc = subprocess.run(
                 args,
@@ -383,9 +438,49 @@ class LocalLlamaCliClient(LLMClient):
 
         if proc.returncode != 0:
             stderr = proc.stderr.decode("utf-8", "ignore").strip()
+            # Special handling for Metal compatibility issues (e.g., M4 / pre-M5 checks)
+            # We check for generic Metal errors or the specific tensor API warning which seems to imply failure here
+            if ("ggml_metal" in stderr or "tensor API disabled" in stderr) and int(self.n_gpu_layers) != 0:
+                # Fallback to CPU
+                print("⚠️ Metal backend failed (M4/compatibility issue). Falling back to CPU mode...", file=sys.stderr)
+
+                # Parse args to find -ngl and replace its value safely
+                new_args = list(args)
+                try:
+                    ngl_idx = new_args.index("-ngl")
+                    if ngl_idx + 1 < len(new_args):
+                        new_args[ngl_idx + 1] = "0"
+                except ValueError:
+                    new_args.extend(["-ngl", "0"])
+                
+                args = new_args
+                
+                # Force disable Metal in environment for fallback
+                env = os.environ.copy()
+                env["GGML_METAL_DISABLE"] = "1"
+
+                try:
+                    proc = subprocess.run(
+                        args,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        timeout=timeout,
+                        env=env,
+                        check=False,
+                    )
+                    if proc.returncode == 0:
+                         text = proc.stdout.decode("utf-8", "ignore").strip()
+                         return self._clean_output(text)
+                    stderr = proc.stderr.decode("utf-8", "ignore").strip()
+                except Exception:
+                    pass
+
             raise LLMClientError(f"llama-cli failed ({proc.returncode}): {stderr[:300]}")
 
         text = proc.stdout.decode("utf-8", "ignore").strip()
+        return self._clean_output(text)
+
+    def _clean_output(self, text: str) -> str:
         if not text:
             return ""
         cleaned = []
@@ -485,7 +580,7 @@ def create_llm_client(backend: Optional[str], *, model: str, host: str = "", opt
         opts = options or {}
         n_gpu_layers = opts.get("n_gpu_layers")
         if n_gpu_layers is None:
-            n_gpu_layers = os.getenv("LNPCHAT_LLAMACPP_GPU_LAYERS", "0")
+            n_gpu_layers = os.getenv("LNPCHAT_LLAMACPP_GPU_LAYERS", "-1")
         # Default to in-process (0) for faster response - subprocess available via env var
         use_subprocess = os.getenv("LNPCHAT_LLAMACPP_SUBPROCESS", "0").strip().lower() in {
             "1",
@@ -529,7 +624,7 @@ def create_llm_client(backend: Optional[str], *, model: str, host: str = "", opt
         opts = options or {}
         n_gpu_layers = opts.get("n_gpu_layers")
         if n_gpu_layers is None:
-            n_gpu_layers = os.getenv("LNPCHAT_LLAMACPP_GPU_LAYERS", "0")
+            n_gpu_layers = os.getenv("LNPCHAT_LLAMACPP_GPU_LAYERS", "-1")
         return LocalLlamaCliClient(
             model=model,
             n_ctx=int(opts.get("n_ctx", 4096)),
