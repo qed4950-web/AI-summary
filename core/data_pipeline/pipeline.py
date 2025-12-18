@@ -18,6 +18,7 @@ from pathlib import Path
 from dataclasses import dataclass, replace
 from typing import Optional, Dict, Any, List, Tuple, Union, Set
 
+from core.config.paths import MODELS_DIR
 from core.data_pipeline.custom_metadata import get_metadata_for_path
 from core.data_pipeline.cache_manager import ChunkCache, SQLiteChunkCache
 from core.data_pipeline.incremental import (
@@ -27,9 +28,30 @@ from core.data_pipeline.incremental import (
     save_scan_state,
 )
 from core.data_pipeline.embedder import AsyncSentenceEmbedder
+from core.data_pipeline.chunking_v2 import SemanticChunker
+
+# Backward compatibility: extractors extracted to extractors.py
+from core.data_pipeline.extractors import (
+    BaseExtractor,
+    HwpExtractor,
+    DocDocxExtractor,
+    ExcelLikeExtractor,
+    PdfExtractor,
+    PptExtractor,
+    PlainTextExtractor,
+    CodeExtractor,
+    EXTRACTORS,
+    EXT_MAP,
+)
 from core.data_pipeline.evaluate import evaluate_embeddings
 
 import numpy as np
+
+# New Utils
+from core.utils.cli_ui import Spinner, ProgressLine
+from core.utils.nlp import TextCleaner, split_tokens as _split_tokens_util
+from core.utils.stopwords import STOPWORDS as _STOPWORDS
+
 
 # ---- 선택 의존성(있으면 사용) ----
 try:
@@ -86,9 +108,10 @@ try:
     from sklearn.decomposition import TruncatedSVD
     from sklearn.cluster import MiniBatchKMeans
     from sklearn.pipeline import Pipeline
+    from sklearn.preprocessing import FunctionTransformer
     from sklearn import __version__ as sklearn_version
 except Exception:
-    TfidfVectorizer = TruncatedSVD = MiniBatchKMeans = Pipeline = None
+    TfidfVectorizer = TruncatedSVD = MiniBatchKMeans = Pipeline = FunctionTransformer = None
     sklearn_version = "0"
 
 try:
@@ -113,89 +136,8 @@ except Exception:
 # =========================
 # 콘솔 진행도 유틸
 # =========================
-class Spinner:
-    FRAMES = ["|", "/", "-", "\\"]
-    def __init__(self, prefix="", interval=0.12):
-        self.prefix = prefix
-        self.interval = interval
-        self._stop = threading.Event()
-        self._t = None
-        self._i = 0
-    def start(self) -> None:
-        if self._t:
-            return
+# [Refactor] UI classes and TextCleaner moved to core.utils
 
-        def _run() -> None:
-            while not self._stop.wait(self.interval):
-                frame = self.FRAMES[self._i % len(self.FRAMES)]
-                self._i += 1
-                sys.stdout.write(f"\r{self.prefix} {frame} ")
-                sys.stdout.flush()
-
-        self._t = threading.Thread(target=_run, daemon=True)
-        self._t.start()
-
-    def stop(self, clear=True) -> None:
-        if not self._t:
-            return
-        self._stop.set()
-        self._t.join()
-        if clear:
-            sys.stdout.write("\r" + " " * 80 + "\r")
-            sys.stdout.flush()
-
-class ProgressLine:
-    def __init__(self, total: int, label: str, update_every: int = 10):
-        self.total = max(1, total)
-        self.label = label
-        self.update_every = max(1, update_every)
-        self.start = time.time()
-        self.n = 0
-
-    def update(self, k: int = 1):
-        self.n += k
-        if (self.n % self.update_every) != 0 and self.n < self.total:
-            return
-        pct = min(100.0, self.n / self.total * 100.0)
-        elapsed = time.time() - self.start
-        rate = self.n/elapsed if elapsed>0 else 0
-        remain = (self.total - self.n)/rate if rate>0 else 0
-        sys.stdout.write(
-            f"\r[{pct:5.1f}%] {self.label}  {self.n:,}/{self.total:,}  "
-            f"{rate:,.1f}/s  elapsed={self._fmt(elapsed)}  ETA={self._fmt(remain)}   "
-        )
-        sys.stdout.flush()
-
-    def close(self) -> None:
-        self.n = self.total
-        self.update(0)
-        sys.stdout.write("\n")
-        sys.stdout.flush()
-
-    @staticmethod
-    def _fmt(s: float) -> str:
-        if s == float("inf"):
-            return "∞"
-        m, sec = divmod(int(s), 60)
-        h, m = divmod(m, 60)
-        if h:
-            return f"{h:d}:{m:02d}:{sec:02d}"
-        return f"{m:02d}:{sec:02d}"
-
-
-# =========================
-# 텍스트 클린
-# =========================
-class TextCleaner:
-    _multi = re.compile(r"\s+")
-
-    @classmethod
-    def clean(cls, s: str) -> str:
-        if not s:
-            return ""
-        s = "".join(ch if ch.isprintable() or ch in "\t\n\r" else " " for ch in s)
-        s = s.replace("\x00", " ")
-        return cls._multi.sub(" ", s).strip()
 
 TOKEN_PATTERN = r'(?u)(?:[가-힣]{1,}|[A-Za-z0-9]{2,})'
 
@@ -215,6 +157,71 @@ def _default_embed_model() -> str:
 
 DEFAULT_EMBED_MODEL = _default_embed_model()
 MODEL_TYPE_SENTENCE_TRANSFORMER = "sentence-transformer"
+
+def _normalize_hf_model_id(value: str) -> str:
+    """Convert cache-style ids like `models--org--repo` into `org/repo`."""
+    raw = (value or "").strip()
+    if not raw:
+        return raw
+    if raw.startswith("models--") and "/" not in raw:
+        parts = raw.split("--")
+        if len(parts) >= 3:
+            org = parts[1].strip()
+            repo = "--".join(parts[2:]).strip()
+            if org and repo:
+                return f"{org}/{repo}"
+    return raw
+
+
+def _resolve_sentence_transformer_location(model_name: str) -> str:
+    """Prefer local model snapshots under `models/sentence_transformers/` when available."""
+    base_dir = MODELS_DIR / "sentence_transformers"
+    if not base_dir.exists():
+        return model_name
+
+    direct = base_dir / model_name
+    if direct.exists():
+        snapshots = direct / "snapshots"
+        if snapshots.exists():
+            candidates = sorted(
+                snapshots.iterdir(),
+                key=lambda item: item.stat().st_mtime,
+                reverse=True,
+            )
+            for candidate in candidates:
+                if any(
+                    (candidate / marker).exists()
+                    for marker in ("config.json", "modules.json", "config_sentence_transformers.json")
+                ):
+                    return str(candidate)
+        if any(
+            (direct / marker).exists()
+            for marker in ("config.json", "modules.json", "config_sentence_transformers.json")
+        ):
+            return str(direct)
+
+    cache_root = base_dir / f"models--{model_name.replace('/', '--')}"
+    if cache_root.exists():
+        snapshots = cache_root / "snapshots"
+        if snapshots.exists():
+            candidates = sorted(
+                snapshots.iterdir(),
+                key=lambda item: item.stat().st_mtime,
+                reverse=True,
+            )
+            for candidate in candidates:
+                if any(
+                    (candidate / marker).exists()
+                    for marker in ("config.json", "modules.json", "config_sentence_transformers.json")
+                ):
+                    return str(candidate)
+        if any(
+            (cache_root / marker).exists()
+            for marker in ("config.json", "modules.json", "config_sentence_transformers.json")
+        ):
+            return str(cache_root)
+
+    return model_name
 
 DEFAULT_CHUNK_MIN_TOKENS = 200
 DEFAULT_CHUNK_MAX_TOKENS = 500
@@ -262,59 +269,15 @@ def _hash_text(text: str) -> str:
         return ""
     return hashlib.sha1(text.encode("utf-8", "ignore")).hexdigest()
 
-_EN_STOPWORDS: Set[str] = {
-    "the", "and", "for", "that", "with", "from", "this", "have", "been", "were",
-    "into", "about", "after", "before", "while", "shall", "could", "would", "there",
-    "their", "which", "should", "among", "within", "between", "through", "without",
-    "because", "against", "during", "under", "over", "where", "when", "whose", "them",
-    "they", "these", "those", "ours", "your", "yours", "ourselves", "yourself",
-    "yourselves", "myself", "been", "being", "also", "very", "much", "many", "such",
-    "than", "ever", "here", "there", "once", "often", "again", "every", "across",
-    "of", "in", "on", "at", "by", "is", "are", "be", "am", "was", "were", "it",
-    "its", "as", "to", "or", "an", "a", "so", "if", "not", "no", "do", "does",
-    "did", "each", "per", "via", "both", "same", "own", "due", "per", "via",
-}
+# [Refactor] Stopwords moved to core.utils
 
-_KO_STOPWORDS: Set[str] = {
-    "그리고", "그러나", "하지만", "그러면서", "그러므로", "또한", "그러니까", "따라서", "그리고나서",
-    "그러면", "그리고도", "그러곤", "그러했지만", "그러할", "그러하다", "그러한", "그런", "이는",
-    "이는", "이를", "있는", "있으며", "있습니다", "합니다", "하였다", "하는", "하게", "하고",
-    "하여", "하여금", "해서", "하지만", "혹은", "또는", "부터", "까지", "위해", "대한", "다른",
-    "모든", "각각", "관련", "경우", "때문", "때문에", "여러", "어떤", "일부", "특히", "다만",
-    "즉", "따위", "예를", "예를들어", "수", "등", "및", "것", "그리고", "또", "또한",
-    "우리", "너희", "그것", "이것", "저것", "그", "이", "저", "에게", "에서", "으로",
-    "로", "에는", "에는", "였다", "이며", "면서", "이라", "이라서",
-}
-
-_DOMAIN_STOPWORDS: Set[str] = {
-    "document",
-    "documents",
-    "report",
-    "reports",
-    "file",
-    "files",
-    "data",
-    "자료",
-    "파일",
-    "문서",
-    "보고서",
-    "첨부",
-    "자료들",
-    "내용",
-    "프로젝트",
-    "관련자료",
-}
-
-_STOPWORDS: Set[str] = {
-    word.lower() for word in (*_EN_STOPWORDS, *_KO_STOPWORDS, *_DOMAIN_STOPWORDS)
-}
 
 
 
 def _split_tokens(source: str) -> List[str]:
     if not source:
         return []
-    return [tok for tok in _META_SPLIT_RE.split(source) if tok]
+    return _split_tokens_util(source)
 
 
 def _remove_stopwords(text: str) -> str:
@@ -520,72 +483,67 @@ def _apply_uniform_chunks(
 
     records = df.to_dict(orient="records")
     chunked: List[Dict[str, Any]] = []
+    chunker = SemanticChunker(
+        max_tokens=max_tokens, 
+        overlap_tokens=overlap_tokens,
+        min_tokens=min_tokens
+    )
 
     for record in records:
         base_text = str(record.get("text") or "")
-        adaptive_min, adaptive_max = _adaptive_chunk_window(base_text, min_tokens, max_tokens)
         original_text = record.get("text_original") or ""
-        base_len = len(base_text)
-
-        spans: List[Tuple[int, int, int]] = []
-        headings: List[str] = []
-        if _is_markdown_record(record):
-            overlap = max(0, int(overlap_tokens or 30))
-            for section_start, section_end, heading in _iter_markdown_sections(base_text):
-                section_text = base_text[section_start:section_end]
-                for start_char, end_char, token_count in _token_chunk_spans_with_overlap(
-                    section_text,
-                    min_tokens=adaptive_min,
-                    max_tokens=adaptive_max,
-                    overlap_tokens=overlap,
-                ):
-                    spans.append((section_start + start_char, section_start + end_char, token_count))
-                    headings.append(heading)
-        else:
-            spans = _token_chunk_spans(base_text, min_tokens=adaptive_min, max_tokens=adaptive_max)
-            headings = ["" for _ in spans]
-        if not spans:
+        doc_hash = record.get("doc_hash", "")
+        
+        # Use Semantic Chunker
+        chunks = chunker.chunk_text(base_text)
+        
+        if not chunks:
+            # Handle empty case
             new_rec = dict(record)
             new_rec["chunk_id"] = 1
             new_rec["chunk_count"] = 1
             new_rec["chunk_tokens"] = 0
-            preview_source = record.get("text_original") or record.get("text") or ""
             new_rec["text"] = _remove_stopwords(base_text)
-            new_rec["text_original"] = preview_source
-            new_rec["preview"] = str(preview_source).strip()[:360]
-            new_rec["doc_hash"] = record.get("doc_hash", "")
             new_rec["content_hash"] = _hash_text(new_rec["text"])
             chunked.append(new_rec)
             continue
-
-        chunk_count = max(1, len(spans))
-
-        for idx, (start_char, end_char, token_count) in enumerate(spans, start=1):
-            chunk_slice = base_text[start_char:end_char].strip()
-            filtered_chunk = _remove_stopwords(chunk_slice)
-            if not filtered_chunk:
-                filtered_chunk = chunk_slice
-
+            
+        chunk_count = len(chunks)
+        for i, ch in enumerate(chunks, start=1):
             new_rec = dict(record)
-            new_rec["chunk_id"] = idx
+            new_rec["chunk_id"] = i
             new_rec["chunk_count"] = chunk_count
-            new_rec["chunk_tokens"] = token_count
-            new_rec["text"] = filtered_chunk
-            if headings and idx - 1 < len(headings) and headings[idx - 1]:
-                new_rec["heading"] = headings[idx - 1]
+            new_rec["chunk_tokens"] = ch.token_count
+            
+            # Text cleaning for model
+            cleaned_text = ch.text.strip()
+            # Restore heading if present
+            if "heading" in ch.metadata:
+                new_rec["heading"] = ch.metadata["heading"]
+                # Optional: prepend heading to text for better embedding context
+                # cleaned_text = f"{ch.metadata['heading']}: {cleaned_text}"
+            
+            new_rec["text"] = cleaned_text
+            
+            # Map back to original text slice if possible
+            # Simplified: Use chunk text as original since we don't have exact char mapping easily
+            # logic in SemanticChunker does track char offsets but legacy logic used _slice_text_by_ratio
+            if ch.start_char is not None and ch.end_char is not None and original_text:
+                # Naive slice mapping if lengths match, else just use chunk text
+                # Ideally SemanticChunker should handle original text mapping too
+                pass
 
-            if isinstance(original_text, str) and original_text:
-                orig_chunk = _slice_text_by_ratio(original_text, start_char, end_char, base_len)
-            else:
-                orig_chunk = chunk_slice
-            new_rec["text_original"] = orig_chunk
-            new_rec["preview"] = (orig_chunk or chunk_slice).strip()[:360]
-            new_rec["doc_hash"] = record.get("doc_hash", "")
-            new_rec["content_hash"] = _hash_text(filtered_chunk or chunk_slice)
-
+            new_rec["text_original"] = ch.text 
+            new_rec["preview"] = ch.text[:360]
+            new_rec["doc_hash"] = doc_hash
+            new_rec["content_hash"] = _hash_text(cleaned_text)
+            
             chunked.append(new_rec)
 
-    return pd.DataFrame(chunked)
+    chunks_df = pd.DataFrame(chunked)
+    if "target_embed_dtype" in df.attrs:
+        chunks_df.attrs["target_embed_dtype"] = df.attrs["target_embed_dtype"]
+    return chunks_df
 
 
 def _time_tokens(epoch: Optional[float]) -> List[str]:
@@ -1094,19 +1052,50 @@ class ExcelLikeExtractor(BaseExtractor):
         if pd is None:
             return {"ok":False,"text":"","meta":{"error":"pandas required"}}
         try:
+            max_bytes_env = os.getenv("INFOPILOT_EXCEL_MAX_BYTES", "").strip()
+            max_bytes = int(max_bytes_env) if max_bytes_env else 25 * 1024 * 1024
+            try:
+                size = p.stat().st_size
+            except Exception:
+                size = None
+            if size is not None and size > max_bytes:
+                return {
+                    "ok": False,
+                    "text": "",
+                    "meta": {"error": "excel/csv file too large", "size": size, "max_bytes": max_bytes},
+                }
+
             if p.suffix.lower()==".csv":
                 df=pd.read_csv(p, nrows=200, encoding="utf-8", engine="python")
                 txt=self._df_to_text(df)
                 return {"ok":True,"text":txt,"meta":{"engine":"pandas","columns":df.columns.tolist(), "rows_preview":min(200,len(df))}}
             eng = "openpyxl" if p.suffix.lower() in (".xlsx",".xlsm",".xltx") else ("xlrd" if p.suffix.lower()==".xls" else "pyxlsb")
-            sheets = pd.read_excel(p, sheet_name=None, nrows=200, engine=eng)
+
+            max_sheets_env = os.getenv("INFOPILOT_EXCEL_MAX_SHEETS", "").strip()
+            max_sheets = int(max_sheets_env) if max_sheets_env else 3
+            nrows_env = os.getenv("INFOPILOT_EXCEL_NROWS", "").strip()
+            nrows = int(nrows_env) if nrows_env else 200
+
             parts=[]
-            for s,df_sheet in sheets.items():
-                parts.append(f"[Sheet:{s}]")
-                parts.append(" | ".join(map(str, df_sheet.columns.tolist())))
-                for _,row in df_sheet.head(50).iterrows():
-                    parts.append(" • "+" | ".join(map(lambda x: str(x), row.tolist())))
-            return {"ok":True,"text":TextCleaner.clean("\n".join(parts)),"meta":{"engine":"pandas","sheets":list(sheets.keys())}}
+            sheet_names: List[str] = []
+            with pd.ExcelFile(p, engine=eng) as xf:
+                sheet_names = list(getattr(xf, "sheet_names", []) or [])
+                if not sheet_names:
+                    sheet_names = [0]  # type: ignore[list-item]
+                for sheet in sheet_names[: max(1, max_sheets)]:
+                    df_sheet = xf.parse(sheet, nrows=nrows)
+                    sheet_label = sheet if isinstance(sheet, str) else str(sheet)
+                    parts.append(f"[Sheet:{sheet_label}]")
+                    parts.append(" | ".join(map(str, df_sheet.columns.tolist())))
+                    for _,row in df_sheet.head(50).iterrows():
+                        parts.append(" • "+" | ".join(map(lambda x: str(x), row.tolist())))
+
+            meta = {"engine":"pandas","sheets":sheet_names}
+            if len(sheet_names) > max(1, max_sheets):
+                meta["sheets_truncated"] = True
+                meta["sheets_kept"] = sheet_names[: max(1, max_sheets)]
+            meta["rows_preview"] = nrows
+            return {"ok":True,"text":TextCleaner.clean("\n".join(parts)),"meta":meta}
         except Exception as e:
             detail = str(e)
             if "openpyxl" in detail.lower():
@@ -1124,29 +1113,71 @@ class PdfExtractor(BaseExtractor):
     exts = (".pdf",)
 
     def extract(self, p: Path) -> Dict[str, Any]:
+        max_pages_env = os.getenv("INFOPILOT_PDF_MAX_PAGES", "").strip()
+        max_pages = int(max_pages_env) if max_pages_env else 200
+        max_chars_env = os.getenv("INFOPILOT_PDF_MAX_CHARS", "").strip()
+        max_chars = int(max_chars_env) if max_chars_env else 200_000
+
         if fitz:
             try:
                 with fitz.open(str(p)) as doc:
                     page_count = doc.page_count
-                    text = "\n".join(page.get_text("text") for page in doc)
+                    parts: List[str] = []
+                    truncated_pages = False
+                    char_count = 0
+                    for idx, page in enumerate(doc):
+                        if idx >= max_pages:
+                            truncated_pages = True
+                            break
+                        page_text = page.get_text("text") or ""
+                        parts.append(page_text)
+                        char_count += len(page_text)
+                        if char_count >= max_chars:
+                            truncated_pages = True
+                            break
+                    text = "\n".join(parts)
                 return {
                     "ok": True,
                     "text": TextCleaner.clean(text),
-                    "meta": {"engine": "pymupdf", "pages": page_count},
+                    "meta": {
+                        "engine": "pymupdf",
+                        "pages": page_count,
+                        "max_pages": max_pages,
+                        "max_chars": max_chars,
+                        "truncated": bool(truncated_pages),
+                    },
                 }
             except Exception:
                 pass
         if pdfplumber:
             try:
                 with pdfplumber.open(str(p)) as doc:
-                    pages = [page.extract_text() or "" for page in doc.pages]
+                    pages: List[str] = []
+                    truncated_pages = False
+                    char_count = 0
+                    for idx, page in enumerate(doc.pages):
+                        if idx >= max_pages:
+                            truncated_pages = True
+                            break
+                        page_text = page.extract_text() or ""
+                        pages.append(page_text)
+                        char_count += len(page_text)
+                        if char_count >= max_chars:
+                            truncated_pages = True
+                            break
                 text = "\n".join(pages)
                 cleaned = TextCleaner.clean(text)
                 if cleaned:
                     return {
                         "ok": True,
                         "text": cleaned,
-                        "meta": {"engine": "pdfplumber", "pages": len(pages)},
+                        "meta": {
+                            "engine": "pdfplumber",
+                            "pages": len(pages),
+                            "max_pages": max_pages,
+                            "max_chars": max_chars,
+                            "truncated": bool(truncated_pages),
+                        },
                     }
             except Exception as exc:
                 return {"ok": False, "text": "", "meta": {"error": f"PDF pdfplumber 실패: {exc}"}}
@@ -1661,6 +1692,10 @@ class TrainConfig:
     embedding_subprocess_fallback: bool = True
 
 
+def default_train_config() -> TrainConfig:
+    return TrainConfig()
+
+
 def _resolve_embed_dtype(cfg: TrainConfig) -> str:
     env_raw = os.getenv(EMBED_DTYPE_ENV)
     env_value = _sanitize_embed_dtype(env_raw)
@@ -1683,26 +1718,92 @@ class TopicModel:
     def fit(self, df, text_col="text"):
         texts=(df[text_col].fillna("").astype(str)).tolist()
         print("🧠 학습 준비: TF-IDF → SVD → KMeans", flush=True)
+        n_docs = len(texts)
+        if n_docs <= 0:
+            raise ValueError("학습할 문서가 없습니다.")
+
+        effective_min_df = max(1, int(self.cfg.min_df))
+        if n_docs < effective_min_df:
+            effective_min_df = 1
+
+        effective_max_df: float | int = self.cfg.max_df
+        if isinstance(effective_max_df, float) and 0.0 < effective_max_df <= 1.0:
+            if int(effective_max_df * n_docs) < effective_min_df:
+                effective_max_df = 1.0
+            if n_docs < 10 and float(effective_max_df) < 1.0:
+                effective_max_df = 1.0
+        elif isinstance(effective_max_df, int):
+            effective_max_df = max(effective_min_df, effective_max_df)
+
         spin=Spinner(prefix="  학습 중")
         spin.start()
         try:
-            self.pipeline = Pipeline(steps=[
-                ("tfidf", TfidfVectorizer(
-                    token_pattern=TOKEN_PATTERN,
-                    ngram_range=self.cfg.ngram_range,
-                    max_features=self.cfg.max_features,
-                    min_df=self.cfg.min_df,
-                    max_df=self.cfg.max_df,
-                )),
-                ("svd", TruncatedSVD(n_components=self.cfg.n_components, random_state=42)),
-                ("kmeans", MiniBatchKMeans(n_clusters=self.cfg.n_clusters, random_state=42, batch_size=2048, n_init=self._kmeans_n_init)),
-            ])
             t0=time.time()
-            self.pipeline.fit(texts)
+            tfidf = TfidfVectorizer(
+                token_pattern=TOKEN_PATTERN,
+                ngram_range=self.cfg.ngram_range,
+                max_features=self.cfg.max_features,
+                min_df=effective_min_df,
+                max_df=effective_max_df,
+            )
+            try:
+                X = tfidf.fit_transform(texts)
+            except ValueError as exc:
+                if "After pruning, no terms remain" in str(exc):
+                    tfidf = TfidfVectorizer(
+                        token_pattern=TOKEN_PATTERN,
+                        ngram_range=self.cfg.ngram_range,
+                        max_features=self.cfg.max_features,
+                        min_df=1,
+                        max_df=1.0,
+                    )
+                    X = tfidf.fit_transform(texts)
+                else:
+                    raise
+            n_features = int(getattr(X, "shape", (0, 0))[1])
+            if n_features <= 0:
+                raise ValueError("TF-IDF 피처가 0개라 토픽 모델을 학습할 수 없습니다.")
+
+            def _dense(matrix):
+                return matrix.toarray() if hasattr(matrix, "toarray") else matrix
+
+            # SVD는 n_components < n_features 조건을 만족해야 한다.
+            # 단, 극소 코퍼스에서는 SVD가 실패할 수 있으므로 TF-IDF(dense)로 fallback한다.
+            svd_components = min(int(self.cfg.n_components), max(1, n_features - 1))
+            if TruncatedSVD is None or FunctionTransformer is None:
+                raise RuntimeError("scikit-learn 필요. pip install scikit-learn joblib")
+            if n_features <= 1:
+                svd = FunctionTransformer(_dense, validate=False)
+                Z = svd.fit_transform(X)
+            else:
+                svd = TruncatedSVD(n_components=svd_components, random_state=42)
+                try:
+                    Z = svd.fit_transform(X)
+                except ValueError:
+                    svd = FunctionTransformer(_dense, validate=False)
+                    Z = svd.fit_transform(X)
+
+            # KMeans는 n_clusters <= n_samples 조건을 만족해야 한다.
+            n_samples = int(getattr(Z, "shape", (0, 0))[0])
+            clusters = max(1, min(int(self.cfg.n_clusters), n_samples))
+            kmeans = MiniBatchKMeans(
+                n_clusters=clusters,
+                random_state=42,
+                batch_size=2048,
+                n_init=self._kmeans_n_init,
+            )
+            kmeans.fit(Z)
+
+            # Build a pipeline object for downstream predict/transform; steps are already fitted.
+            self.pipeline = Pipeline(steps=[
+                ("tfidf", tfidf),
+                ("svd", svd),
+                ("kmeans", kmeans),
+            ])
             t1=time.time()
         finally:
             spin.stop()
-        print(f"✅ 학습 완료 (docs={len(texts):,}, {t1-t0:.1f}s)", flush=True)
+        print(f"✅ 학습 완료 (docs={n_docs:,}, {t1-t0:.1f}s)", flush=True)
         return self
 
     def predict(self, df, text_col="text")->List[int]:
@@ -1729,16 +1830,22 @@ class SentenceBertModel:
             )
         self.cfg = cfg
         self.model_name = cfg.embedding_model or DEFAULT_EMBED_MODEL
-        print(f"🧠 Sentence-BERT 준비: {self.model_name}", flush=True)
+        resolved = _resolve_sentence_transformer_location(self.model_name)
+        if resolved == self.model_name:
+            resolved = _normalize_hf_model_id(self.model_name)
+        if resolved != self.model_name:
+            print(f"🧠 Sentence-BERT 준비: {self.model_name} -> {resolved}", flush=True)
+        else:
+            print(f"🧠 Sentence-BERT 준비: {self.model_name}", flush=True)
         try:
-            self._encoder = SentenceTransformer(self.model_name)
+            self._encoder = SentenceTransformer(resolved)
         except (RuntimeError, NotImplementedError) as exc:
             message = str(exc).lower()
             meta_issue = "meta tensor" in message or "to_empty" in message
             if meta_issue:
                 print("⚠️ SentenceTransformer 로드 실패 → CPU 강제 시도", flush=True)
                 try:
-                    self._encoder = SentenceTransformer(self.model_name, device="cpu")
+                    self._encoder = SentenceTransformer(resolved, device="cpu")
                 except Exception as inner_exc:
                     raise RuntimeError(
                         "SentenceTransformer 초기화에 실패했습니다.\n"
@@ -2067,6 +2174,7 @@ def run_step2(
                 forced_rows, cached_rows = filter_incremental_rows(file_rows, scan_state)
                 force_paths = {str(row.get("path") or "") for row in forced_rows if row.get("path")}
                 cached_by_state = len(cached_rows)
+                cached_paths = {str(row.get("path") or "") for row in cached_rows if row.get("path")}
                 if force_paths:
                     print(
                         f"⚙️ 증분 상태: {len(force_paths):,}건 재처리, 캐시 일치 {cached_by_state:,}건",
@@ -2076,6 +2184,14 @@ def run_step2(
                     print("⚙️ 증분 상태: 신규 변경 없음", flush=True)
 
             to_process, reused_df = _split_cache(file_rows, existing_df, force_paths=force_paths)
+            if scan_state_path and scan_state is not None:
+                # If scan-state marks a path as cached, never re-extract it even if the corpus
+                # no longer contains that path (e.g. chunk-level deduplication kept only one copy).
+                to_process = [
+                    row
+                    for row in to_process
+                    if str(row.get("path") or "") and str(row.get("path") or "") not in cached_paths
+                ]
             process_paths = {str(row.get("path") or "") for row in to_process if row.get("path")}
             process_count = len(process_paths)
             print(
