@@ -76,11 +76,11 @@ class LNPChat:
     translate: bool = False
     rerank: bool = True
     rerank_model: str = "BAAI/bge-reranker-large"
-    rerank_depth: int = 80
+    rerank_depth: int = 40  # Reduced from 80 for speed
     rerank_batch_size: int = 16
     rerank_device: Optional[str] = None
     rerank_min_score: Optional[float] = 0.35
-    lexical_weight: float = 0.2
+    lexical_weight: float = 0.4  # Increased for better keyword matching
     show_translation: bool = False
     translation_lang: str = "en"
     auto_search: bool = False
