@@ -45,6 +45,20 @@ from core.data_pipeline.extractors import (
 )
 from core.data_pipeline.evaluate import evaluate_embeddings
 
+# Backward compatibility: models extracted to models.py
+from core.data_pipeline.models import (
+    TrainConfig,
+    TopicModel,
+    SentenceBertModel,
+    default_train_config,
+    _fit_sentence_transformer_chunked,
+    _chunked_sentence_embeddings,
+    _run_embed_chunk_subprocess,
+    DEFAULT_EMBED_MODEL,
+    DEFAULT_N_COMPONENTS,
+    MODEL_TYPE_SENTENCE_TRANSFORMER,
+)
+
 import numpy as np
 
 # New Utils
