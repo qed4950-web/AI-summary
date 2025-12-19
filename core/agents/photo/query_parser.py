@@ -19,6 +19,7 @@ class PhotoSearchCriteria:
     location: Optional[str] = None
     face_count: Optional[int] = None  # None = any, 0 = no people, 1 = alone, etc.
     face_count_op: str = "eq"  # eq, gte, lte
+    self_filter: Optional[str] = None  # None, "with_me", or "me_alone"
     scene_tags: List[str] = field(default_factory=list)
     raw_query: str = ""
 
@@ -52,6 +53,16 @@ FACE_KEYWORDS = {
     "셋이": 3,
     "단체": -1,  # -1 means 5+ people
     "가족": -2,  # -2 means unknown, but multiple
+}
+
+# Self-identification keywords (requires face registration)
+SELF_KEYWORDS = {
+    "내가 나온": "with_me",
+    "나 나온": "with_me",
+    "내 사진": "with_me",
+    "내가 혼자": "me_alone",
+    "나만 나온": "me_alone",
+    "나 혼자": "me_alone",
 }
 
 # Scene keywords (Korean to English for CLIP)
@@ -214,17 +225,24 @@ def parse_photo_query(query: str) -> PhotoSearchCriteria:
     # Parse face count
     criteria.face_count, criteria.face_count_op = _parse_face_count(query)
     
+    # Parse self-identification filter (requires face registration)
+    for keyword, filter_type in SELF_KEYWORDS.items():
+        if keyword in query:
+            criteria.self_filter = filter_type
+            break
+    
     # Parse scene tags
     criteria.scene_tags = _parse_scene_tags(query)
     
     LOGGER.info(
-        "Parsed query '%s' → date: %s~%s, location: %s, faces: %s (%s), tags: %s",
+        "Parsed query '%s' → date: %s~%s, location: %s, faces: %s (%s), self: %s, tags: %s",
         query,
         criteria.date_start.strftime("%Y-%m-%d") if criteria.date_start else None,
         criteria.date_end.strftime("%Y-%m-%d") if criteria.date_end else None,
         criteria.location,
         criteria.face_count,
         criteria.face_count_op,
+        criteria.self_filter,
         criteria.scene_tags
     )
     
