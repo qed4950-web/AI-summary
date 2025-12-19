@@ -106,6 +106,33 @@ def _bucket_for_date(dt: datetime, *, strategy: str) -> Path:
     return Path(f"{dt.year:04d}") / f"{dt.month:02d}"
 
 
+def _sanitize_folder_name(name: str) -> str:
+    """Sanitize folder name by removing/replacing invalid characters."""
+    # Replace problematic characters
+    for char in ['/', '\\', ':', '*', '?', '"', '<', '>', '|']:
+        name = name.replace(char, '_')
+    return name.strip()[:50]  # Limit length
+
+
+def _bucket_for_smart(
+    dt: datetime,
+    *,
+    location: str = "Unknown",
+    tag: str = "기타",
+) -> Path:
+    """Create smart folder name: YYYY-MM-DD_Location_Tag.
+    
+    Example: 2024-03-22_Tokyo_여행
+    """
+    date_str = dt.strftime("%Y-%m-%d")
+    location_clean = _sanitize_folder_name(location)
+    tag_clean = _sanitize_folder_name(tag)
+    
+    folder_name = f"{date_str}_{location_clean}_{tag_clean}"
+    return Path(folder_name)
+
+
+
 def _unique_destination(dst: Path, *, reserved: Optional[set[str]] = None) -> Path:
     reserved_set = reserved or set()
     dst_key = dst.as_posix()
@@ -277,3 +304,84 @@ def apply_plan(plan: OrganizePlan, *, dry_run: bool = True) -> ApplyResult:
         applied.append(op)
 
     return ApplyResult(applied=tuple(applied), skipped=tuple(skipped))
+
+
+def build_plan_from_assets(
+    assets: List,  # List[PhotoAsset]
+    *,
+    dest_root: Path,
+    strategy: str = "smart",
+    dedupe: bool = False,
+) -> OrganizePlan:
+    """Build organize plan from PhotoAssets with metadata.
+    
+    Uses YYYY-MM-DD_Location_Tag folder format when strategy='smart'.
+    """
+    from .models import PhotoAsset
+    
+    resolved_root = dest_root.expanduser().resolve()
+    skipped: List[str] = []
+    operations: List[MoveOperation] = []
+    reserved: set[str] = set()
+    
+    # Detect duplicates if requested
+    duplicate_map: Dict[Path, Path] = {}
+    if dedupe:
+        paths = [a.path for a in assets if a.path.exists()]
+        duplicate_map = _detect_duplicates(paths)
+    
+    for asset in assets:
+        src = asset.path
+        if not src.exists():
+            skipped.append(f"missing: {src}")
+            continue
+        if str(src).startswith(str(resolved_root)):
+            skipped.append(f"already_in_dest: {src}")
+            continue
+        
+        # Determine capture date
+        capture_dt = asset.capture_date or _safe_stat_mtime(src)
+        if capture_dt is None:
+            skipped.append(f"no_timestamp: {src}")
+            continue
+        
+        capture_date = capture_dt.date().isoformat()
+        
+        # Determine bucket based on strategy
+        if strategy == "smart":
+            location = getattr(asset, 'location', 'Unknown') or 'Unknown'
+            tags = getattr(asset, 'tags', []) or []
+            tag = tags[0] if tags else '기타'
+            bucket = _bucket_for_smart(capture_dt, location=location, tag=tag)
+        else:
+            bucket = _bucket_for_date(capture_dt, strategy=strategy)
+        
+        filename = src.name
+        
+        duplicate_of = duplicate_map.get(src)
+        if duplicate_of is not None:
+            target_dir = resolved_root / "_duplicates" / bucket
+            reason = "duplicate"
+        else:
+            target_dir = resolved_root / bucket
+            reason = "smart_bucket" if strategy == "smart" else "date_bucket"
+        
+        dst = _unique_destination(target_dir / filename, reserved=reserved)
+        operations.append(
+            MoveOperation(
+                src=src,
+                dst=dst,
+                reason=reason,
+                capture_date=capture_date,
+                duplicate_of=duplicate_of,
+            )
+        )
+    
+    operations.sort(key=lambda op: (op.dst.as_posix(), op.src.as_posix()))
+    return OrganizePlan(
+        dest_root=resolved_root,
+        operations=tuple(operations),
+        skipped=tuple(skipped),
+        strategy=strategy,
+        dedupe=dedupe,
+    )

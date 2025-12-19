@@ -9,8 +9,10 @@ from core.agents.taskgraph import TaskCancelled, TaskContext, TaskGraph
 
 from core.utils import get_logger
 
-from .organize import apply_plan, build_plan
+from .organize import apply_plan, build_plan, build_plan_from_assets
 from .models import PhotoAsset, PhotoJobConfig, PhotoRecommendation
+from .exif_utils import get_photo_metadata
+from .clip_tagger import tag_photo, HAS_CLIP
 
 LOGGER = get_logger("photo.pipeline")
 
@@ -111,10 +113,13 @@ class PhotoPipeline:
         job: PhotoJobConfig = context.job
         photos: List[PhotoAsset] = context.get("photos") or []
         dest_root = job.dest_root or job.roots[0]
-        plan = build_plan(
-            [asset.path for asset in photos],
+        
+        # Use smart organization with metadata when available
+        strategy = getattr(job, "organize_strategy", "smart") or "smart"
+        plan = build_plan_from_assets(
+            photos,
             dest_root=dest_root,
-            strategy=getattr(job, "organize_strategy", "month") or "month",
+            strategy=strategy,
             dedupe=bool(getattr(job, "dedupe", False)),
         )
         result = apply_plan(plan, dry_run=bool(getattr(job, "dry_run", True)))
@@ -176,7 +181,16 @@ class PhotoPipeline:
                         allowed = False
                     if not allowed:
                         continue
-                asset = PhotoAsset(path=path, tags=[])
+                
+                # Extract EXIF metadata
+                meta = get_photo_metadata(path)
+                asset = PhotoAsset(
+                    path=path,
+                    tags=[],
+                    capture_date=meta.get("capture_date"),
+                    location=meta.get("location", "Unknown"),
+                    gps=meta.get("gps"),
+                )
                 try:
                     asset.metadata["mtime"] = path.stat().st_mtime
                 except OSError:
@@ -186,14 +200,46 @@ class PhotoPipeline:
         return assets
 
     def _tag(self, photos: List[PhotoAsset]) -> List[PhotoAsset]:
+        """Tag photos with scene categories using CLIP."""
         for asset in photos:
-            asset.tags = ["tag-placeholder", asset.path.stem]
-            asset.embedding = [0.0, 0.0, 0.0]
+            self._ensure_not_cancelled()
+            tags, embedding = tag_photo(asset.path)
+            asset.tags = tags
+            asset.embedding = embedding
+        LOGGER.info("photos tagged: %d (CLIP enabled: %s)", len(photos), HAS_CLIP)
         return photos
 
     def _deduplicate(self, photos: List[PhotoAsset]) -> List[List[PhotoAsset]]:
+        """Find duplicate photos using perceptual hash."""
         duplicates: List[List[PhotoAsset]] = []
-        seen = {}
+        
+        # Try to use imagehash if available
+        try:
+            import imagehash
+            from PIL import Image
+            
+            hash_map: Dict[str, List[PhotoAsset]] = {}
+            for asset in photos:
+                self._ensure_not_cancelled()
+                try:
+                    img = Image.open(asset.path)
+                    phash = str(imagehash.phash(img))
+                    bucket = hash_map.setdefault(phash, [])
+                    bucket.append(asset)
+                except Exception:
+                    continue
+            
+            for bucket in hash_map.values():
+                if len(bucket) > 1:
+                    duplicates.append(bucket)
+            
+            LOGGER.info("duplicates found: %d groups (using imagehash)", len(duplicates))
+            return duplicates
+        except ImportError:
+            LOGGER.warning("imagehash not available, falling back to file size comparison")
+        
+        # Fallback: file size based dedup
+        seen: Dict[int, List[PhotoAsset]] = {}
         for asset in photos:
             key = asset.path.stat().st_size if asset.path.exists() else None
             if key is None:

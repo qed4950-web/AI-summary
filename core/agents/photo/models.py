@@ -29,6 +29,9 @@ class PhotoAsset:
     tags: List[str]
     embedding: Optional[List[float]] = None
     score: Optional[float] = None
+    capture_date: Optional[datetime] = None
+    location: str = "Unknown"
+    gps: Optional[tuple] = None
     metadata: Dict[str, object] = field(default_factory=dict)
 
 
