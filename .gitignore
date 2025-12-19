@@ -52,3 +52,19 @@ webapp/src-tauri/target/
 .cache/
 found_files.csv
 miniconda.sh
+
+# MLflow runs
+.mlruns/
+mlruns/
+
+# Build/compile artifacts
+llama_build/
+*.log
+
+# Backups
+backups/
+
+# Personal documents (should not be in repo)
+Park David*/
+park david*/
+verify_output.json
