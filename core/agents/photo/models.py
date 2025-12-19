@@ -32,6 +32,7 @@ class PhotoAsset:
     capture_date: Optional[datetime] = None
     location: str = "Unknown"
     gps: Optional[tuple] = None
+    face_count: int = -1  # -1 = not detected, 0+ = number of faces
     metadata: Dict[str, object] = field(default_factory=dict)
 
 

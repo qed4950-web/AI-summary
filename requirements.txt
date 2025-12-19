@@ -22,6 +22,7 @@ python-dotenv>=1.0.1,<1.1
 Pillow>=10.4,<12   # photo 에이전트(EXIF 날짜 정리)
 geopy>=2.4,<3   # photo 에이전트(GPS → 지명 변환)
 imagehash>=4.3,<5   # photo 에이전트(중복 이미지 탐지)
+mediapipe>=0.10,<1   # photo 에이전트(얼굴 감지)
 
 # === 번역/텍스트 유틸 ===
 deep-translator>=1.11.4,<2

@@ -9,7 +9,7 @@ from typing import List, Optional, Set
 from PySide6.QtCore import Qt, QSize, Signal
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QGridLayout, QPushButton, 
-    QLabel, QScrollArea, QWidget, QFileDialog, QFrame
+    QLabel, QScrollArea, QWidget, QFileDialog, QFrame, QLineEdit
 )
 from PySide6.QtGui import QPixmap, QFont, QCursor
 
@@ -170,6 +170,46 @@ class PhotoGalleryDialog(QDialog):
         
         layout.addLayout(header)
         
+        # Search bar
+        search_layout = QHBoxLayout()
+        
+        self.search_input = QLineEdit()
+        self.search_input.setPlaceholderText("🔍 검색: 작년 겨울 후쿠오카 혼자 사진...")
+        self.search_input.setStyleSheet("""
+            QLineEdit {
+                background-color: #2a2a2a;
+                border: 1px solid #444;
+                border-radius: 8px;
+                padding: 10px 16px;
+                font-size: 14px;
+                color: #fff;
+            }
+            QLineEdit:focus {
+                border-color: #10a37f;
+            }
+        """)
+        self.search_input.returnPressed.connect(self.run_search)
+        search_layout.addWidget(self.search_input)
+        
+        btn_search = QPushButton("🔍 검색")
+        btn_search.setStyleSheet("""
+            QPushButton {
+                background-color: #3b82f6;
+                color: white;
+                border: none;
+                border-radius: 8px;
+                padding: 10px 20px;
+                font-size: 14px;
+            }
+            QPushButton:hover {
+                background-color: #2563eb;
+            }
+        """)
+        btn_search.clicked.connect(self.run_search)
+        search_layout.addWidget(btn_search)
+        
+        layout.addLayout(search_layout)
+        
         # Scroll area for grid
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
@@ -262,6 +302,59 @@ class PhotoGalleryDialog(QDialog):
         
         if self.folder_path:
             self.load_photos(self.folder_path)
+    
+    def run_search(self):
+        """Run natural language photo search."""
+        query = self.search_input.text().strip()
+        if not query:
+            return
+        
+        if not self.folder_path:
+            self.status_label.setText("❌ 먼저 폴더를 선택하세요")
+            return
+        
+        self.status_label.setText(f"🔍 검색 중: {query}...")
+        
+        try:
+            from core.agents.photo.photo_search import search_photos_in_folder
+            
+            # Run search
+            results = search_photos_in_folder(
+                self.folder_path,
+                query,
+                run_detection=True
+            )
+            
+            # Display results
+            self.display_search_results(results)
+            
+        except Exception as e:
+            self.status_label.setText(f"❌ 검색 오류: {e}")
+    
+    def display_search_results(self, results):
+        """Display search results in grid."""
+        # Clear existing grid
+        while self.grid_layout.count():
+            item = self.grid_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        
+        # Populate grid with results
+        for idx, asset in enumerate(results):
+            row = idx // self.COLUMNS
+            col = idx % self.COLUMNS
+            
+            is_best = asset.path in self.best_shots
+            is_dup = asset.path in self.duplicates
+            
+            thumb = PhotoThumbnail(asset.path, is_best=is_best, is_duplicate=is_dup)
+            thumb.clicked.connect(self.open_photo)
+            self.grid_layout.addWidget(thumb, row, col)
+        
+        # Update status
+        self.status_label.setText(
+            f"🔍 검색 결과: {len(results)}장 ('{self.search_input.text()}')"
+        )
 
 
 def show_gallery(
