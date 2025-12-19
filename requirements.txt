@@ -33,6 +33,7 @@ scikit-learn>=1.6.0,<1.7
 sentence-transformers>=3.0.1,<4
 faiss-cpu>=1.9,<2   # (Windows 3.13 → 실제 설치는 faiss-cpu==1.9.0.post1 권장)
 faster-whisper>=1.0,<1.1   # 회의 비서 STT 백엔드(대체); 기본은 transformers 기반 wav2vec2
+pyannote-audio>=3.1,<4   # 화자 분리 (Speaker Diarization)
 transformers>=4.44,<5   # KoBART summarisation
 llama-cpp-python>=0.3.16,<0.4   # 로컬 GGUF LLM (MPS/Metal 지원)
 # pykospacing는 macOS/arm64 wheel 미제공 -> 필요시 수동설치
