@@ -22,10 +22,10 @@ except Exception:  # pragma: no cover - optional dependency
 LOGGER = logging.getLogger(__name__)
 
 SENTENCE_SPLIT = re.compile(r"(?<=[.!?\n])\s+")
-DEFAULT_OLLAMA_PROMPT = textwrap.dedent(
+DEFAULT_OLLAMA_PROMPT_EN = textwrap.dedent(
     """
     You are a helpful meeting assistant.
-    Summarise the following meeting transcript in the user's language.
+    Summarise the following meeting transcript.
     
     Structure your response exactly as follows:
     ## Highlights
@@ -47,6 +47,37 @@ DEFAULT_OLLAMA_PROMPT = textwrap.dedent(
     {transcript}
     """
 )
+
+DEFAULT_OLLAMA_PROMPT_KO = textwrap.dedent(
+    """
+    당신은 유능한 회의 비서입니다.
+    다음 회의 스크립트를 한국어로 요약해 주세요.
+    
+    반드시 다음 형식을 정확히 지켜주세요:
+    ## Highlights
+    - 핵심 내용 1
+    - 핵심 내용 2
+
+    ## Decisions
+    - 결정 사항 1
+    - 결정 사항 2
+
+    ## Action Items
+    - [담당자] 할 일 내용 (기한: YYYY-MM-DD 또는 미정)
+    - [담당자] 할 일 내용 (기한: YYYY-MM-DD 또는 미정)
+
+    ## Summary
+    (전체 내용을 명확하고 간결하게 요약한 문단)
+
+    스크립트:
+    {transcript}
+    """
+)
+
+PROMPTS = {
+    "en": DEFAULT_OLLAMA_PROMPT_EN,
+    "ko": DEFAULT_OLLAMA_PROMPT_KO,
+}
 
 
 def _int_env(name: str, default: int) -> int:
@@ -75,7 +106,7 @@ class SummariserConfig:
 
     ollama_model: str = os.getenv("MEETING_SUMMARY_OLLAMA_MODEL", "llama3")
     ollama_host: str = os.getenv("MEETING_SUMMARY_OLLAMA_HOST", "")
-    ollama_prompt: str = os.getenv("MEETING_SUMMARY_OLLAMA_PROMPT", DEFAULT_OLLAMA_PROMPT)
+    ollama_prompt: str = os.getenv("MEETING_SUMMARY_OLLAMA_PROMPT", DEFAULT_OLLAMA_PROMPT_EN)
 
     bitnet_model: str = os.getenv("MEETING_SUMMARY_BITNET_MODEL", "bitnet/b1.58-instruct")
     bitnet_max_length: int = _int_env("MEETING_SUMMARY_BITNET_MAXLEN", 220)
@@ -270,7 +301,15 @@ class OllamaSummariser:
         if not self._ollama_cmd:
             raise RuntimeError("ollama executable not detected")
 
-        prompt_template = self.config.ollama_prompt or DEFAULT_OLLAMA_PROMPT
+        # Determine prompt based on content or config
+        prompt_template = self.config.ollama_prompt
+        # If default is used, try to auto-detect
+        if prompt_template == DEFAULT_OLLAMA_PROMPT_EN:
+             if any("\uac00" <= char <= "\ud7a3" for char in text[:500]):
+                 prompt_template = PROMPTS["ko"]
+             else:
+                 prompt_template = PROMPTS["en"]
+
         prompt = prompt_template.format(transcript=text)
         env = os.environ.copy()
         if self.config.ollama_host:
@@ -371,7 +410,13 @@ class LlamaCppSummariser:
         return final or combined
 
     def _summarise_chunk(self, chunk: str) -> str:
-        prompt_template = self.config.ollama_prompt or DEFAULT_OLLAMA_PROMPT
+        prompt_template = self.config.ollama_prompt
+        if prompt_template == DEFAULT_OLLAMA_PROMPT_EN:
+             if any("\uac00" <= char <= "\ud7a3" for char in chunk[:500]):
+                 prompt_template = PROMPTS["ko"]
+             else:
+                 prompt_template = PROMPTS["en"]
+
         prompt = prompt_template.format(transcript=chunk)
         try:
             out = self._llm(

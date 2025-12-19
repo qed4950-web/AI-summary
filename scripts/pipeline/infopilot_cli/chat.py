@@ -194,7 +194,7 @@ def cmd_chat(
     # but keep heavy agent dependencies (llama.cpp / transformers) out of the default path.
     agents.extend(
         [
-            MeetingAgent(),
+            MeetingAgent(policy_engine=policy_engine),
             PhotoAgent(PhotoAgentConfig(policy_engine=policy_engine, policy_tag=str(getattr(args, "policy", "") or ""))),
         ]
     )

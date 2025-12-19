@@ -777,6 +777,7 @@ def run_step2(
     chunk_cache_path: Optional[Path] = None,
     skip_extract: bool = False,
     train_embeddings: bool = True,
+    policy_engine: Optional[Any] = None,
 ):
     global tqdm
     original_tqdm = tqdm
@@ -793,6 +794,28 @@ def run_step2(
 
     chunk_cache = _create_chunk_cache(chunk_cache_path) if chunk_cache_path else None
     scan_state = load_scan_state(scan_state_path) if scan_state_path else None
+
+    # --- Policy Enforcement ---
+    # Even if scan_csv is dirty, we filter rows here effectively acting as a firewall.
+    valid_rows = []
+    if policy_engine and hasattr(policy_engine, "allows"):
+        print("🛡️ 정책 엔진을 통해 파일 유효성을 검증합니다...", flush=True)
+        denied_count = 0
+        for row in file_rows:
+            path_str = row.get("path")
+            if not path_str:
+                continue
+            path_obj = Path(str(path_str))
+            # agent="knowledge_search" is the default for general indexing
+            if policy_engine.allows(path_obj, agent="knowledge_search", include_manual=True):
+                valid_rows.append(row)
+            else:
+                denied_count += 1
+        
+        if denied_count > 0:
+            print(f"⚠️ 정책에 위반되는 {denied_count}개 파일을 파이프라인에서 제외했습니다.", flush=True)
+        file_rows = valid_rows
+    # --------------------------
 
     try:
         print("=== Step 2 시작: 내용 추출 & 학습 === (번역: " + ("활성" if translate else "비활성") + ")", flush=True)
@@ -900,30 +923,30 @@ def run_step2(
                     restored_df = _collect_existing_rows(existing_df, unchanged_paths)
                 df_new = df_new[~df_new["path"].isin(list(unchanged_paths))]
 
-            df_new_chunks = (
-                _apply_uniform_chunks(
-                    df_new,
-                    min_tokens=DEFAULT_CHUNK_MIN_TOKENS,
-                    max_tokens=DEFAULT_CHUNK_MAX_TOKENS,
-                )
-                if df_new is not None and not df_new.empty
-                else pd.DataFrame(columns=list(df_new.columns) if df_new is not None else list(ExtractRecord.__annotations__.keys()))
+        df_new_chunks = (
+            _apply_uniform_chunks(
+                df_new,
+                min_tokens=DEFAULT_CHUNK_MIN_TOKENS,
+                max_tokens=DEFAULT_CHUNK_MAX_TOKENS,
             )
-            if hasattr(df_new_chunks, "attrs"):
-                df_new_chunks.attrs["target_embed_dtype"] = target_embed_dtype
+            if df_new is not None and not df_new.empty
+            else pd.DataFrame(columns=list(df_new.columns) if df_new is not None else list(ExtractRecord.__annotations__.keys()))
+        )
+        if hasattr(df_new_chunks, "attrs"):
+            df_new_chunks.attrs["target_embed_dtype"] = target_embed_dtype
 
-            frames: List["pd.DataFrame"] = []
-            if reused_df is not None and not reused_df.empty:
-                frames.append(reused_df)
-            if restored_df is not None and not restored_df.empty:
-                frames.append(restored_df)
-            if df_new_chunks is not None and not df_new_chunks.empty:
-                frames.append(df_new_chunks)
+        frames: List["pd.DataFrame"] = []
+        if reused_df is not None and not reused_df.empty:
+            frames.append(reused_df)
+        if restored_df is not None and not restored_df.empty:
+            frames.append(restored_df)
+        if df_new_chunks is not None and not df_new_chunks.empty:
+            frames.append(df_new_chunks)
 
-            if frames:
-                df = pd.concat(frames, ignore_index=True)
-            else:
-                df = pd.DataFrame(columns=list(ExtractRecord.__annotations__.keys()))
+        if frames:
+            df = pd.concat(frames, ignore_index=True)
+        else:
+            df = pd.DataFrame(columns=list(ExtractRecord.__annotations__.keys()))
 
             _prepare_text_frame(df)
 

@@ -36,10 +36,14 @@ class MeetingAgent(ConversationalAgent):
     name = "meeting_summary"
     description = "회의 오디오를 전사하고 요약합니다. audio_path가 필요합니다."
 
-    def __init__(self, config: Optional[MeetingAgentConfig] = None) -> None:
+    def __init__(
+        self,
+        config: Optional[MeetingAgentConfig] = None,
+        policy_engine: Optional[PolicyEngine] = None,
+    ) -> None:
         self.config = config or MeetingAgentConfig()
         self.pipeline: Optional[MeetingPipeline] = None
-        self._policy_engine: Optional[PolicyEngine] = None
+        self._policy_engine: Optional[PolicyEngine] = policy_engine
 
     def prepare(self) -> None:
         self.config.output_root.mkdir(parents=True, exist_ok=True)

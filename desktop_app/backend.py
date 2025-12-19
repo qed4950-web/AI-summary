@@ -94,6 +94,18 @@ class LNPBackend(QObject):
             # Extract text answer
             answer = response_dict.get("answer", "")
             
+            # Extract document hits for clickable links
+            hits = response_dict.get("hits", [])
+            if hits:
+                answer += "\n\n📎 참조 문서:"
+                for hit in hits[:5]:  # Limit to top 5
+                    path = hit.get("path", hit.get("file_path", ""))
+                    title = hit.get("title", hit.get("filename", path.split("/")[-1] if path else "Unknown"))
+                    if path:
+                        answer += f"\n• {title}"
+                        # Format: [FILE_LINK:path] for UI to parse
+                        answer += f" [FILE_LINK:{path}]"
+            
             # Handle suggestions if present
             suggestions = response_dict.get("suggestions", [])
             if suggestions:

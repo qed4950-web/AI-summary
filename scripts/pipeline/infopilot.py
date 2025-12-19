@@ -71,13 +71,13 @@ cmd_train = noop_train
 @click.option("--scan_csv", default="data/found_files.csv")
 @click.option("--cache", default="data/cache")
 @click.option("--json", "json_mode", is_flag=True, help="JSON output mode")
-@click.option("--topk", default=5)
+@click.option("--topk", default=10)
 def chat(model, corpus, scan_csv, cache, json_mode, topk):
     args = SimpleNamespace(
         model=model, corpus=corpus, scan_csv=scan_csv, cache=cache,
         json=json_mode, topk=topk, translate=False, auto_train=False,
         rerank=True, rerank_model="BAAI/bge-reranker-large",
-        rerank_depth=40, rerank_batch_size=16, rerank_device=None,
+        rerank_depth=50, rerank_batch_size=16, rerank_device=None,
         rerank_min_score=0.35, lexical_weight=0.4,
         show_translation=False, translation_lang="en",
         min_similarity=0.35, strict=False, policy=str(DEFAULT_POLICY_PATH),

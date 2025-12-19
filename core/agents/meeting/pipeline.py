@@ -812,13 +812,14 @@ class MeetingPipeline:
 
         # Attachments logic: done in stage_finalise but we prep here
         return MeetingSummary(
-            id=job.meeting_id or "summary",  # Fallback
+            id=job.meeting_id or "summary",
             raw_summary=raw_summary,
             structured_summary=structured_summary,
-            transcript_path=job.output_dir / "transcript.txt",  # Placeholder
+            transcript_path=job.output_dir / "transcript.txt",
             highlights=[e.get("text", "") for e in highlight_entries],
             action_items=[e.get("text", "") for e in action_entries],
             decisions=[e.get("text", "") for e in decision_entries],
+            action_items_structured=action_entries,
         )
 
     def _build_summary_text(

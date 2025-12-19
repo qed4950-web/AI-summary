@@ -67,7 +67,7 @@ class Spinner:
         self._stop = threading.Event()
         self._t = None
         self._i = 0
-        self._enabled = sys.stdout.isatty()
+        self._enabled = False # Force disable to prevent BlockingIO in GUI Bridge pipeline
 
     def __enter__(self):
         self.start()
