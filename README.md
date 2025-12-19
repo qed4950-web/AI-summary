@@ -62,7 +62,50 @@ cp .env.example .env   # scripts/setup_env.sh 실행 시 자동 생성되기도 
 
 필요한 값만 유지하고 나머지는 공란으로 두어도 됩니다.
 
-### 3.4 파이프라인 실행
+### 3.4 첫 실행 설정 (신규 사용자)
+
+처음 프로젝트를 받은 경우, 아래 단계를 순서대로 실행하세요.
+
+#### Step 1: SentenceTransformer 모델 다운로드
+```bash
+python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('BAAI/bge-m3')"
+```
+
+#### Step 2: LLM 모델 다운로드 (GGUF)
+```bash
+# models/gguf 디렉터리 생성
+mkdir -p models/gguf
+
+# Gemma 3 4B 모델 다운로드 (약 3GB)
+# https://huggingface.co/google/gemma-3-4b-it-qat-q4_0-gguf 에서 다운로드
+# 또는 Hugging Face CLI 사용:
+# huggingface-cli download google/gemma-3-4b-it-qat-q4_0-gguf --local-dir models/gguf
+```
+
+#### Step 3: llama.cpp 빌드 (macOS Metal)
+```bash
+# llama.cpp 클론 및 빌드
+git clone https://github.com/ggerganov/llama.cpp.git models/llama.cpp
+cd models/llama.cpp
+mkdir build_metal && cd build_metal
+cmake .. -DGGML_METAL=ON
+cmake --build . --config Release -j
+cd ../../..
+```
+
+#### Step 4: 문서 인덱싱
+```bash
+# 스캔할 문서 폴더 설정 후 인덱싱 실행
+python infopilot.py run index
+```
+
+#### Step 5: Desktop App 실행
+```bash
+cd desktop_app
+python main.py
+```
+
+### 3.5 파이프라인 실행
 
 ```bash
 # 0) 전체 파이프라인 한 번에 (스캔→추출/임베딩→필요 시 chat)
