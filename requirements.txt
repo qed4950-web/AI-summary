@@ -25,6 +25,7 @@ imagehash>=4.3,<5   # photo 에이전트(중복 이미지 탐지)
 mediapipe>=0.10,<1   # photo 에이전트(얼굴 감지)
 insightface>=0.7,<1   # photo 에이전트(얼굴 인식/본인 구분)
 onnxruntime>=1.16,<2   # insightface 의존성
+ultralytics>=8.0,<9   # photo 에이전트(YOLO 객체 탐지)
 
 # === 번역/텍스트 유틸 ===
 deep-translator>=1.11.4,<2

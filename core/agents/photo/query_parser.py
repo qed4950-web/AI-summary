@@ -21,6 +21,7 @@ class PhotoSearchCriteria:
     face_count_op: str = "eq"  # eq, gte, lte
     self_filter: Optional[str] = None  # None, "with_me", or "me_alone"
     scene_tags: List[str] = field(default_factory=list)
+    object_tags: List[str] = field(default_factory=list)  # YOLO detected objects
     raw_query: str = ""
 
 
@@ -86,6 +87,27 @@ SCENE_KEYWORDS = {
     "비": "rain",
     "셀카": "selfie",
     "풍경": "landscape",
+}
+
+# Object keywords (Korean to COCO class names for YOLO)
+OBJECT_KEYWORDS = {
+    "강아지": "dog",
+    "개": "dog",
+    "고양이": "cat",
+    "자동차": "car",
+    "차": "car",
+    "자전거": "bicycle",
+    "새": "bird",
+    "말": "horse",
+    "핸드폰": "cell phone",
+    "노트북": "laptop",
+    "책": "book",
+    "피자": "pizza",
+    "케이크": "cake",
+    "소파": "couch",
+    "의자": "chair",
+    "TV": "tv",
+    "인형": "teddy bear",
 }
 
 
@@ -234,8 +256,13 @@ def parse_photo_query(query: str) -> PhotoSearchCriteria:
     # Parse scene tags
     criteria.scene_tags = _parse_scene_tags(query)
     
+    # Parse object tags (YOLO classes)
+    for ko_word, en_class in OBJECT_KEYWORDS.items():
+        if ko_word in query:
+            criteria.object_tags.append(en_class)
+    
     LOGGER.info(
-        "Parsed query '%s' → date: %s~%s, location: %s, faces: %s (%s), self: %s, tags: %s",
+        "Parsed query '%s' → date: %s~%s, location: %s, faces: %s (%s), self: %s, scenes: %s, objects: %s",
         query,
         criteria.date_start.strftime("%Y-%m-%d") if criteria.date_start else None,
         criteria.date_end.strftime("%Y-%m-%d") if criteria.date_end else None,
@@ -243,7 +270,8 @@ def parse_photo_query(query: str) -> PhotoSearchCriteria:
         criteria.face_count,
         criteria.face_count_op,
         criteria.self_filter,
-        criteria.scene_tags
+        criteria.scene_tags,
+        criteria.object_tags
     )
     
     return criteria
