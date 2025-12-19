@@ -256,3 +256,73 @@ python3 scripts/api_server.py
    git commit -m "설명"
    git push origin <branch>
    ```
+
+## 6. Photo Agent (사진 분석)
+
+### 6.1 기능 개요
+
+| 기능 | 설명 | 필수 의존성 |
+|------|------|-------------|
+| 자연어 검색 | "작년 겨울 후쿠오카 혼자 사진" | - |
+| 얼굴 감지 | 얼굴 수 카운팅 | `mediapipe` |
+| 얼굴 인식 | 본인 구분 ("내가 나온 사진") | `insightface`, `onnxruntime` |
+| 객체 탐지 | "강아지 나온 사진" | `ultralytics` |
+| 스마트 분류 | EXIF 날짜/GPS + CLIP 태깅 | `geopy`, `transformers` |
+| 갤러리 UI | 썸네일 그리드 뷰어 | - |
+
+### 6.2 설치
+
+```bash
+# 기본 기능 (자연어 검색 + 스마트 분류)
+pip install -r requirements.txt
+
+# 선택: 얼굴 감지/인식
+pip install mediapipe insightface onnxruntime
+
+# 선택: 객체 탐지
+pip install ultralytics
+```
+
+### 6.3 사용법
+
+```bash
+# Desktop App에서 📸 버튼 클릭 → 갤러리 열기
+# 검색창에 자연어 입력:
+
+"작년 겨울 후쿠오카 혼자 사진"   # 날짜 + 장소 + 얼굴 수
+"강아지 나온 사진"               # 객체 탐지 (YOLO)
+"바다 사진"                     # 장면 태그 (CLIP)
+"내가 나온 사진"                 # 본인 인식 (얼굴 등록 필요)
+```
+
+### 6.4 얼굴 등록 ("이게 나야")
+
+```python
+from core.agents.photo.face_recognition import register_my_face
+register_my_face("/path/to/my_photo.jpg")
+```
+
+## 7. Meeting Agent (회의 비서)
+
+### 7.1 기능 개요
+
+| 기능 | 설명 | 필수 의존성 |
+|------|------|-------------|
+| 음성 전사 | Whisper STT | `faster-whisper` |
+| 화자 분리 | 누가 말했는지 구분 | `pyannote-audio` |
+| 요약 생성 | LLM 기반 요약 | `transformers` |
+
+### 7.2 사용법
+
+```bash
+# Desktop App에서 🎙️ 버튼 클릭 → 오디오 파일 선택
+# 또는 CLI:
+python -c "from core.agents.meeting import MeetingAgent; a = MeetingAgent(); print(a.transcribe('/path/to/audio.mp3'))"
+```
+
+### 7.3 화자 분리 (선택)
+
+```bash
+pip install pyannote-audio
+export HF_TOKEN=your_huggingface_token
+```
