@@ -13,6 +13,7 @@ from pathlib import Path
 # Import Policy Registry
 from core.policy.registry import SmartFolderRegistry
 from desktop_app.tasks_ui import TaskManagerWindow
+from desktop_app.gallery_ui import PhotoGalleryDialog
 
 class EnhancedInput(QTextEdit):
     submit = Signal()
@@ -571,13 +572,6 @@ class LauncherWindow(QWidget):
             self.on_submit()
 
     def open_photo_dialog(self):
-        """Open folder dialog to select photo folder for analysis."""
-        folder_path = QFileDialog.getExistingDirectory(
-            self,
-            "사진 폴더 선택",
-            str(Path.home()),
-            QFileDialog.ShowDirsOnly
-        )
-        if folder_path:
-            self.input_field.setPlainText(f'/photo "{folder_path}"')
-            self.on_submit()
+        """Open photo gallery dialog."""
+        dialog = PhotoGalleryDialog(parent=self)
+        dialog.exec()
