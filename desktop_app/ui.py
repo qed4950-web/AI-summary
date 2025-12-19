@@ -2,11 +2,12 @@ from PySide6.QtCore import Qt, QSize, Signal, QThread, QTimer, QEvent, QUrl
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QTextEdit, QListWidget, 
     QListWidgetItem, QLabel, QFrame, QGraphicsDropShadowEffect, QSizePolicy,
-    QDialog, QScrollArea, QMessageBox
+    QDialog, QScrollArea, QMessageBox, QFileDialog
 )
-from PySide6.QtGui import QFont, QColor, QDragEnterEvent, QDropEvent
+from PySide6.QtGui import QFont, QColor, QDragEnterEvent, QDropEvent, QDesktopServices
 import qdarktheme
 import os
+import subprocess
 from pathlib import Path
 
 # Import Policy Registry
@@ -218,6 +219,11 @@ class LauncherWindow(QWidget):
         self.result_list.setVisible(False)
         # Let list grow, but minimum size
         self.result_list.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        # Enable word wrap for long messages
+        self.result_list.setWordWrap(True)
+        self.result_list.setTextElideMode(Qt.ElideNone)
+        # Enable clicking on items to open documents
+        self.result_list.itemClicked.connect(self.on_result_item_clicked)
         
         # Input Field (EnhancedTextEdit)
         self.input_field = EnhancedInput()
@@ -242,8 +248,8 @@ class LauncherWindow(QWidget):
         # Define actions with slightly different icons to match reference closer
         self.btn_add = create_tool_btn("➕", "첨부", lambda: self.input_field.setPlainText(self.input_field.toPlainText() + " [첨부] "))
         self.btn_web = create_tool_btn("🌐", "웹 검색", lambda: self.input_field.setPlainText("@검색 "))
-        self.btn_photo = create_tool_btn("📸", "사진 검색", lambda: self.input_field.setPlainText("@사진 "))
-        self.btn_mic = create_tool_btn("🎙️", "음성", lambda: self.input_field.setPlainText("@회의 "))
+        self.btn_photo = create_tool_btn("📸", "사진 폴더 분석", self.open_photo_dialog)
+        self.btn_mic = create_tool_btn("🎙️", "회의 전사", self.open_meeting_dialog)
         self.btn_settings = create_tool_btn("⚙️", "설정 (스마트 폴더)", self.open_settings)
         self.btn_tasks = create_tool_btn("📋", "Task Center", self.open_tasks)
         
@@ -410,16 +416,27 @@ class LauncherWindow(QWidget):
         self.status_label.setText("Ready")
         self.status_label.setStyleSheet("color: #6e6e73;")
         
+        # Parse file links from response
+        import re
+        file_link_pattern = r'\[FILE_LINK:([^\]]+)\]'
+        file_links = re.findall(file_link_pattern, response)
+        # Remove file link markers from display text
+        clean_response = re.sub(file_link_pattern, '', response)
+        
         # If we were streaming, the item already exists and has content.
         # Just ensure the final text is correct and we are done.
         if self.streaming_item:
-            self.streaming_item.setText(f"AI: {response}")
+            self.streaming_item.setText(f"AI: {clean_response}")
             self.result_list.scrollToBottom()
             self.streaming_item = None # Reset
+            # Add clickable file links
+            for file_path in file_links:
+                self.add_message("📄", os.path.basename(file_path), file_path=file_path)
             return
 
         # Start Typewriter Effect (Fallback for non-streaming responses)
-        self.typewriter_text = response
+        self.typewriter_text = clean_response
+        self.typewriter_file_links = file_links  # Store for after typewriter
         self.typewriter_index = 0
         self.typewriter_item = QListWidgetItem("AI: ") # Placeholder
         self.result_list.addItem(self.typewriter_item)
@@ -439,6 +456,11 @@ class LauncherWindow(QWidget):
             self.result_list.scrollToBottom()
         else:
             self.typewriter_timer.stop()
+            # Add clickable file links after typewriter finishes
+            if hasattr(self, 'typewriter_file_links'):
+                for file_path in self.typewriter_file_links:
+                    self.add_message("📄", os.path.basename(file_path), file_path=file_path)
+                self.typewriter_file_links = []
         
     def expand_window(self):
         if not self.result_list.isVisible():
@@ -459,11 +481,25 @@ class LauncherWindow(QWidget):
         self.status_label.setText("Error")
         self.add_message("System", f"Error: {msg}")
 
-    def add_message(self, sender, text):
+    def add_message(self, sender, text, file_path=None):
+        """Add a message to the result list. If file_path is provided, item is clickable."""
         formatted_text = f"{sender}: {text}"
         item = QListWidgetItem(formatted_text)
+        if file_path:
+            item.setData(Qt.UserRole, file_path)  # Store path for click handler
+            item.setToolTip(f"Click to open: {file_path}")
         self.result_list.addItem(item)
         self.result_list.scrollToBottom()
+
+    def on_result_item_clicked(self, item):
+        """Handle click on result items to open documents."""
+        file_path = item.data(Qt.UserRole)
+        if file_path and os.path.exists(file_path):
+            # Open file with default application
+            if os.name == 'nt':  # Windows
+                os.startfile(file_path)
+            elif os.name == 'posix':  # macOS/Linux
+                subprocess.run(["open", file_path], check=False)
 
     def cleanup(self):
         """Called when application is quitting"""
@@ -521,3 +557,27 @@ class LauncherWindow(QWidget):
     def open_tasks(self):
         dlg = TaskManagerWindow(self)
         dlg.exec()
+
+    def open_meeting_dialog(self):
+        """Open file dialog to select audio file for meeting transcription."""
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "오디오 파일 선택",
+            str(Path.home()),
+            "Audio Files (*.mp3 *.wav *.m4a *.ogg *.flac *.webm);;All Files (*)"
+        )
+        if file_path:
+            self.input_field.setPlainText(f'/meeting "{file_path}"')
+            self.on_submit()
+
+    def open_photo_dialog(self):
+        """Open folder dialog to select photo folder for analysis."""
+        folder_path = QFileDialog.getExistingDirectory(
+            self,
+            "사진 폴더 선택",
+            str(Path.home()),
+            QFileDialog.ShowDirsOnly
+        )
+        if folder_path:
+            self.input_field.setPlainText(f'/photo "{folder_path}"')
+            self.on_submit()

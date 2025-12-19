@@ -58,10 +58,11 @@ SLASH_COMMANDS = {
     "/document": "search",
     "/doc": "search",
     "/문서": "search",
-    "/audio": "search_audio",
-    "/회의": "search_audio",
-    "/photo": "search_photo",
-    "/사진": "search_photo",
+    "/meeting": "meeting",
+    "/audio": "meeting",
+    "/회의": "meeting",
+    "/photo": "photo",
+    "/사진": "photo",
 }
 
 PROMPT_INSTRUCTION_SMALL_TALK = (
@@ -278,23 +279,84 @@ class LNPChat:
     def _execute_action(self, action: str, query: str, k: int) -> Dict[str, Any]:
         if action == "search":
             return self._search_and_answer(query, k)
-        elif action == "search_audio":
-            return self._search_audio(query, k)
-        elif action == "search_photo":
-            return self._search_photo(query, k)
+        elif action == "meeting":
+            return self._handle_meeting(query)
+        elif action == "photo":
+            return self._handle_photo(query)
         elif action == "chat":
             return self._chat_only(query)
         return self._chat_only(query)  # Default to chat
 
-    def _search_audio(self, query: str, k: int) -> Dict[str, Any]:
-        """Search audio/meeting transcripts."""
-        # TODO: Implement audio-specific search when audio index is available
-        return self._search_and_answer(f"회의 {query}", k)
+    def _handle_meeting(self, query: str) -> Dict[str, Any]:
+        """Handle meeting/audio transcription and summarization."""
+        # Query should be a file path
+        audio_path = query.strip().strip('"').strip("'")
+        
+        if not audio_path:
+            return {"answer": "오디오 파일 경로를 입력해주세요.\n예: /meeting /path/to/audio.mp3", "hits": []}
+        
+        from pathlib import Path
+        path = Path(audio_path)
+        
+        if not path.exists():
+            return {"answer": f"파일을 찾을 수 없습니다: {audio_path}", "hits": []}
+        
+        try:
+            from core.agents.meeting.agent import MeetingAgent, MeetingAgentConfig
+            from core.agents import AgentRequest
+            
+            with self.ui.spinner("회의 전사 및 요약 중..."):
+                config = MeetingAgentConfig()
+                agent = MeetingAgent(config=config)
+                agent.prepare()
+                
+                request = AgentRequest(
+                    query=f"회의 요약",
+                    context={"audio_path": str(path)}
+                )
+                result = agent.run(request)
+                
+            return {"answer": result.content, "hits": []}
+        except ImportError as e:
+            return {"answer": f"MeetingAgent를 로드할 수 없습니다: {e}", "hits": []}
+        except Exception as e:
+            LOGGER.error("Meeting agent failed: %s", e)
+            return {"answer": f"회의 처리 중 오류가 발생했습니다: {e}", "hits": []}
 
-    def _search_photo(self, query: str, k: int) -> Dict[str, Any]:
-        """Search photos."""
-        # TODO: Implement photo-specific search when photo index is available
-        return self._search_and_answer(f"사진 {query}", k)
+    def _handle_photo(self, query: str) -> Dict[str, Any]:
+        """Handle photo folder analysis."""
+        folder_path = query.strip().strip('"').strip("'")
+        
+        if not folder_path:
+            return {"answer": "사진 폴더 경로를 입력해주세요.\n예: /photo /path/to/photos", "hits": []}
+        
+        from pathlib import Path
+        path = Path(folder_path)
+        
+        if not path.exists() or not path.is_dir():
+            return {"answer": f"폴더를 찾을 수 없습니다: {folder_path}", "hits": []}
+        
+        try:
+            from core.agents.photo.agent import PhotoAgent, PhotoAgentConfig
+            from core.agents import AgentRequest
+            
+            with self.ui.spinner("사진 폴더 분석 중..."):
+                config = PhotoAgentConfig()
+                agent = PhotoAgent(config=config)
+                agent.prepare()
+                
+                request = AgentRequest(
+                    query=f"사진 정리",
+                    context={"roots": [str(path)]}
+                )
+                result = agent.run(request)
+            
+            return {"answer": result.content, "hits": []}
+        except ImportError as e:
+            return {"answer": f"PhotoAgent를 로드할 수 없습니다: {e}", "hits": []}
+        except Exception as e:
+            LOGGER.error("Photo agent failed: %s", e)
+            return {"answer": f"사진 처리 중 오류가 발생했습니다: {e}", "hits": []}
 
     def _search_and_answer(self, query: str, k: int) -> Dict[str, Any]:
         self.ready(wait_timeout=5.0)
