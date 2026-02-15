@@ -1,55 +1,51 @@
+from __future__ import annotations
 
+import importlib
+import shutil
 import sys
+import tempfile
 import unittest
 from pathlib import Path
-import tempfile
-import shutil
-import os
 
-# Add project root
-project_root = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(project_root))
+# Add project root.
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(PROJECT_ROOT))
+
 
 class TestScannerRefactor(unittest.TestCase):
-    def setUp(self):
+    def setUp(self) -> None:
         self.test_dir = Path(tempfile.mkdtemp())
-        (self.test_dir / "file1.txt").write_text("content")
-        (self.test_dir / "file2.md").write_text("# Markdown")
-        (self.test_dir / "ignore_me.pyc").write_text("")
-        (self.test_dir / ".hidden").write_text("")
+        (self.test_dir / "file1.txt").write_text("content", encoding="utf-8")
+        (self.test_dir / "file2.md").write_text("# Markdown", encoding="utf-8")
+        (self.test_dir / "ignore_me.pyc").write_text("", encoding="utf-8")
+        (self.test_dir / ".hidden").write_text("", encoding="utf-8")
 
-    def tearDown(self):
+    def tearDown(self) -> None:
         shutil.rmtree(self.test_dir)
 
-    def test_scanner_import(self):
-        """Verify we can import the new scanner module."""
-        import core.data_pipeline.scanner as scanner
+    def test_scanner_import(self) -> None:
+        scanner = importlib.import_module("core.data_pipeline.scanner")
         self.assertTrue(hasattr(scanner, "run_scan"))
         self.assertTrue(hasattr(scanner, "ScanConfig"))
 
-    def test_scanner_functionality(self):
-        """Verify the new scanner actually finds files."""
-        import core.data_pipeline.scanner as scanner
-        cfg = scanner.ScanConfig(
-            roots=[self.test_dir],
-            exts=[".txt", ".md"],
-            allow_hash=False
-        )
+    def test_scanner_functionality(self) -> None:
+        scanner = importlib.import_module("core.data_pipeline.scanner")
+        cfg = scanner.ScanConfig(roots=[self.test_dir], exts=[".txt", ".md"], allow_hash=False)
         results = scanner.run_scan(cfg)
-        paths = [r.path.name for r in results]
+        paths = [row.path.name for row in results]
         self.assertIn("file1.txt", paths)
         self.assertIn("file2.md", paths)
         self.assertNotIn("ignore_me.pyc", paths)
         self.assertNotIn(".hidden", paths)
 
-    def test_cli_scan_import(self):
-        """Verify scripts/pipeline/infopilot_cli/scan.py imports correctly."""
+    def test_cli_scan_import(self) -> None:
         try:
-            import scripts.pipeline.infopilot_cli.scan as cli_scan
-        except ImportError as e:
-            self.fail(f"Failed to import infopilot_cli.scan: {e}")
-        except ModuleNotFoundError as e:
-             self.fail(f"Module not found: {e}")
+            importlib.import_module("scripts.pipeline.infopilot_cli.scan")
+        except ImportError as exc:
+            self.fail(f"Failed to import infopilot_cli.scan: {exc}")
+        except ModuleNotFoundError as exc:
+            self.fail(f"Module not found: {exc}")
+
 
 if __name__ == "__main__":
     unittest.main()

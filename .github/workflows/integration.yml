@@ -1,0 +1,60 @@
+name: Integration
+
+on:
+  push:
+    branches: [ "*" ]
+    paths:
+      - "core/**"
+      - "scripts/**"
+      - "desktop_app/**"
+      - "tests/**"
+      - "requirements.txt"
+      - "pytest.ini"
+      - "Makefile"
+      - ".github/workflows/integration.yml"
+  pull_request:
+    branches: [ "*" ]
+    paths:
+      - "core/**"
+      - "scripts/**"
+      - "desktop_app/**"
+      - "tests/**"
+      - "requirements.txt"
+      - "pytest.ini"
+      - "Makefile"
+      - ".github/workflows/integration.yml"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install ruff
+      - name: Integration static guard
+        run: |
+          python scripts/dev/verify/verify_release_integration_contract.py
+      - name: Integration contract tests
+        id: integration_contract
+        run: |
+          make test-integration INTEGRATION_PYTEST_ARGS="--maxfail=1"
+      - name: Publish integration summary
+        if: always()
+        run: |
+          {
+            echo "## Integration Workflow Summary"
+            echo ""
+            echo "- Integration contract tests: \`${{ steps.integration_contract.outcome }}\`"
+          } >> "${GITHUB_STEP_SUMMARY}"

@@ -3,8 +3,32 @@ name: Smoke
 on:
   push:
     branches: [ "*" ]
+    paths:
+      - "core/**"
+      - "scripts/**"
+      - "desktop_app/**"
+      - "tests/**"
+      - "infopilot.py"
+      - "requirements.txt"
+      - "pytest.ini"
+      - "ruff.toml"
+      - ".github/workflows/smoke.yml"
   pull_request:
     branches: [ "*" ]
+    paths:
+      - "core/**"
+      - "scripts/**"
+      - "desktop_app/**"
+      - "tests/**"
+      - "infopilot.py"
+      - "requirements.txt"
+      - "pytest.ini"
+      - "ruff.toml"
+      - ".github/workflows/smoke.yml"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   smoke:
@@ -15,11 +39,28 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: "pip"
       - name: Install deps (core)
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-      - name: Run smoke tests
+      - name: Static smoke guards
         run: |
-          python -m compileall scripts/pipeline/infopilot.py core/data_pipeline/policies/engine.py
-          pytest -q tests/test_policy_engine.py tests/test_pipeline_sensitive_paths.py tests/test_meeting_policy_scope.py tests/test_photo_policy_scope.py
+          python -m compileall scripts/pipeline/infopilot.py scripts/pipeline/infopilot_cli/watch.py core/data_pipeline/policies/engine.py
+      - name: Baseline smoke tests
+        id: baseline_smoke
+        run: |
+          pytest -q tests/test_infopilot_cli_contract.py tests/test_policy_engine.py tests/test_pipeline_sensitive_paths.py tests/test_meeting_policy_scope.py tests/test_photo_policy_scope.py
+      - name: Engine resilience contract tests
+        id: engine_resilience
+        run: |
+          pytest -q tests/test_watch_cli_dependencies.py tests/test_watch_event_handler_contract.py tests/test_pipeline_policy_provider_contract.py tests/test_pipeline_runner_watch_loop.py tests/test_desktop_backend_mode_contract.py tests/test_llm_client_option_contract.py tests/test_mode_profiles_config_contract.py tests/test_release_metadata_lint_domain_contract.py tests/test_lint_domain_budget_refresh_contract.py
+      - name: Publish smoke summary
+        if: always()
+        run: |
+          {
+            echo "## Smoke Workflow Summary"
+            echo ""
+            echo "- Baseline smoke tests: \`${{ steps.baseline_smoke.outcome }}\`"
+            echo "- Engine resilience contracts: \`${{ steps.engine_resilience.outcome }}\`"
+          } >> "${GITHUB_STEP_SUMMARY}"

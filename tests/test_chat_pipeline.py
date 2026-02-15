@@ -39,6 +39,8 @@ def test_chat_command_returns_json_payload():
     if proc.returncode != 0:
         pytest.skip(f"chat command unavailable: {proc.stderr.strip()}")
 
+    assert "ℹ️ 로컬 LLM 연결" not in (proc.stdout or "")
+    assert "🔄 인덱스 최신성 확인 완료." not in (proc.stdout or "")
     payload = json.loads(proc.stdout.strip() or "{}")
     assert "answer" in payload
     assert payload.get("query") == "테스트 인사"

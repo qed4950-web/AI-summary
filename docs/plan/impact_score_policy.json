@@ -1,0 +1,25 @@
+{
+  "version": "2026-02-14",
+  "base_score": 55,
+  "weights": {
+    "engine_per_file": 2,
+    "ui_ux_per_file": 3,
+    "platform_per_file": 1
+  },
+  "caps": {
+    "engine": 16,
+    "ui_ux": 12,
+    "platform": 8,
+    "lint_penalty": 20
+  },
+  "integration_bonus": {
+    "threshold": 10,
+    "met": 7,
+    "not_met": 3
+  },
+  "lint_penalty_divisor": 80,
+  "tiers": {
+    "medium_at": 60,
+    "high_at": 75
+  }
+}

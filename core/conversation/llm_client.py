@@ -2,12 +2,12 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import socket
 import subprocess
-import shlex
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-import sys
 from typing import Any, Dict, List, Optional
 from urllib import error, request
 
@@ -32,6 +32,13 @@ class LLMClientError(RuntimeError):
     """Raised when the local LLM backend fails."""
 
 
+def _safe_float(value: Any, default: float) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
 @dataclass
 class LLMClient:
     """Abstract base for lightweight local LLM clients."""
@@ -44,7 +51,7 @@ class LLMClient:
 
     def generate_chat(self, messages: List[Dict[str, str]], *, timeout: float = 30.0) -> str:
         """Generate response from a list of messages for multi-turn conversation.
-        
+
         messages: List of dicts with 'role' and 'content' keys.
                   role can be 'system', 'user', or 'assistant'
         """
@@ -185,6 +192,7 @@ class LocalGemmaClient(LLMClient):
     device: str = "auto"
     torch_dtype: str = "auto"
     max_new_tokens: int = 512
+    temperature: float = 0.0
     _pipe: Any = field(init=False, default=None)
 
     def __post_init__(self) -> None:
@@ -213,12 +221,19 @@ class LocalGemmaClient(LLMClient):
         if self._pipe is None:
             raise LLMClientError("로컬 모델이 초기화되지 않았습니다.")
         full_prompt = prompt if not system else f"{system.strip()}\n\n{prompt.strip()}"
+        sampling_temp = max(0.0, _safe_float(self.temperature, 0.0))
+        do_sample = sampling_temp > 0.0
         try:
+            payload: Dict[str, Any] = {
+                "max_new_tokens": max(1, int(self.max_new_tokens)),
+                "do_sample": do_sample,
+                "num_return_sequences": 1,
+            }
+            if do_sample:
+                payload["temperature"] = sampling_temp
             outputs = self._pipe(
                 full_prompt,
-                max_new_tokens=max(1, int(self.max_new_tokens)),
-                do_sample=False,
-                num_return_sequences=1,
+                **payload,
             )
         except Exception as exc:
             raise LLMClientError(f"로컬 모델 호출에 실패했습니다: {exc}") from exc
@@ -259,6 +274,7 @@ class LocalLlamaCppClient(LLMClient):
     n_threads: int = 0
     n_gpu_layers: int = -1
     max_new_tokens: int = 512
+    temperature: float = 0.0
     _llm: Any = field(init=False, default=None)
 
     def __post_init__(self) -> None:
@@ -281,22 +297,22 @@ class LocalLlamaCppClient(LLMClient):
     def generate(self, prompt: str, *, system: Optional[str] = None, timeout: float = 30.0) -> str:
         if self._llm is None:
             raise LLMClientError("llama.cpp 모델이 초기화되지 않았습니다.")
-        
+
         # Use chat completion API for proper template handling
         messages = []
         if system:
             messages.append({"role": "system", "content": system.strip()})
         messages.append({"role": "user", "content": prompt.strip()})
-        
+
         try:
             out = self._llm.create_chat_completion(
                 messages=messages,
                 max_tokens=max(1, int(self.max_new_tokens)),
-                temperature=0.0,
+                temperature=max(0.0, _safe_float(self.temperature, 0.0)),
             )
         except Exception as exc:
             raise LLMClientError(f"llama.cpp 호출에 실패했습니다: {exc}") from exc
-        
+
         text = ""
         if isinstance(out, dict):
             choices = out.get("choices") or []
@@ -311,16 +327,16 @@ class LocalLlamaCppClient(LLMClient):
         """Generate response from a list of messages for multi-turn conversation."""
         if self._llm is None:
             raise LLMClientError("llama.cpp 모델이 초기화되지 않았습니다.")
-        
+
         try:
             out = self._llm.create_chat_completion(
                 messages=messages,
                 max_tokens=max(1, int(self.max_new_tokens)),
-                temperature=0.0,
+                temperature=max(0.0, _safe_float(self.temperature, 0.0)),
             )
         except Exception as exc:
             raise LLMClientError(f"llama.cpp 호출에 실패했습니다: {exc}") from exc
-        
+
         text = ""
         if isinstance(out, dict):
             choices = out.get("choices") or []
@@ -341,6 +357,7 @@ class LocalLlamaCliClient(LLMClient):
     n_threads: int = 0
     n_gpu_layers: int = 0
     max_new_tokens: int = 512
+    temperature: float = 0.0
     cli_path: str = ""
     no_mmap: Optional[bool] = None
 
@@ -358,9 +375,9 @@ class LocalLlamaCliClient(LLMClient):
         m4_build = repo_root / "models" / "llama.cpp" / "build_m4" / "bin" / "llama-cli"
         metal = repo_root / "models" / "llama.cpp" / "build_metal" / "bin" / "llama-cli"
         cpu = repo_root / "models" / "llama.cpp" / "build_cpu" / "bin" / "llama-cli"
-        
+
         print(f"[DEBUG] Checking M4 Build at: {m4_build} (Exists: {m4_build.exists()})", file=sys.stderr)
-        
+
         if m4_build.exists():
             print(f"[DEBUG] Using M4-optimized Llama-CLI: {m4_build}", file=sys.stderr)
             return str(m4_build)
@@ -370,7 +387,7 @@ class LocalLlamaCliClient(LLMClient):
         if cpu.exists():
             print(f"[DEBUG] Using CPU Llama-CLI: {cpu}", file=sys.stderr)
             return str(cpu)
-        
+
         print("[DEBUG] No Llama-CLI found!", file=sys.stderr)
         return ""
 
@@ -398,7 +415,7 @@ class LocalLlamaCliClient(LLMClient):
             "-n",
             str(max(1, int(self.max_new_tokens))),
             "--temp",
-            "0",
+            str(max(0.0, _safe_float(self.temperature, 0.0))),
             "-ngl",
             str(int(self.n_gpu_layers)),
             "-p",
@@ -420,7 +437,7 @@ class LocalLlamaCliClient(LLMClient):
             args.append("--no-mmap")
 
         print(f"[DEBUG] Executing Command: {shlex.join(args)}", file=sys.stderr)
-        
+
         try:
             proc = subprocess.run(
                 args,
@@ -452,9 +469,9 @@ class LocalLlamaCliClient(LLMClient):
                         new_args[ngl_idx + 1] = "0"
                 except ValueError:
                     new_args.extend(["-ngl", "0"])
-                
+
                 args = new_args
-                
+
                 # Force disable Metal in environment for fallback
                 env = os.environ.copy()
                 env["GGML_METAL_DISABLE"] = "1"
@@ -503,6 +520,7 @@ class LocalLlamaCppSubprocessClient(LLMClient):
     n_threads: int = 0
     n_gpu_layers: int = 0
     max_new_tokens: int = 512
+    temperature: float = 0.7
     allow_cli_fallback: bool = True
 
     def is_available(self) -> bool:
@@ -522,7 +540,7 @@ class LocalLlamaCppSubprocessClient(LLMClient):
             "n_threads": int(self.n_threads),
             "n_gpu_layers": int(self.n_gpu_layers),
             "max_new_tokens": int(self.max_new_tokens),
-            "temperature": 0.7,
+            "temperature": max(0.0, _safe_float(self.temperature, 0.7)),
         }
 
         try:
@@ -548,8 +566,8 @@ class LocalLlamaCppSubprocessClient(LLMClient):
             data = json.loads(raw) if raw else {}
         except json.JSONDecodeError as exc:
             raise LLMClientError("llama.cpp chat worker returned invalid JSON") from exc
-        
-        # Chat worker returns {"response": "..."} 
+
+        # Chat worker returns {"response": "..."}
         text = str(data.get("response") or "").strip()
         return text
 
@@ -570,11 +588,13 @@ def create_llm_client(backend: Optional[str], *, model: str, host: str = "", opt
         device = opts.get("device") or host or "auto"
         torch_dtype = opts.get("torch_dtype") or "auto"
         max_new_tokens = opts.get("max_new_tokens") or opts.get("num_predict") or 512
+        temperature = _safe_float(opts.get("temperature"), 0.0)
         return LocalGemmaClient(
             model=model,
             device=str(device),
             torch_dtype=str(torch_dtype),
             max_new_tokens=int(max_new_tokens),
+            temperature=temperature,
         )
     if backend == "local_llamacpp":
         opts = options or {}
@@ -600,6 +620,7 @@ def create_llm_client(backend: Optional[str], *, model: str, host: str = "", opt
                 n_threads=int(opts.get("n_threads", 0)),
                 n_gpu_layers=int(n_gpu_layers),
                 max_new_tokens=int(opts.get("max_new_tokens", opts.get("num_predict", 512))),
+                temperature=_safe_float(opts.get("temperature"), 0.7),
                 allow_cli_fallback=fallback,
             )
         try:
@@ -609,6 +630,7 @@ def create_llm_client(backend: Optional[str], *, model: str, host: str = "", opt
                 n_threads=int(opts.get("n_threads", 0)),
                 n_gpu_layers=int(n_gpu_layers),
                 max_new_tokens=int(opts.get("max_new_tokens", opts.get("num_predict", 512))),
+                temperature=_safe_float(opts.get("temperature"), 0.0),
             )
         except LLMClientError:
             if not fallback:
@@ -619,6 +641,7 @@ def create_llm_client(backend: Optional[str], *, model: str, host: str = "", opt
                 n_threads=int(opts.get("n_threads", 0)),
                 n_gpu_layers=int(n_gpu_layers),
                 max_new_tokens=int(opts.get("max_new_tokens", opts.get("num_predict", 512))),
+                temperature=_safe_float(opts.get("temperature"), 0.0),
             )
     if backend in {"local_llama_cli", "llama_cli", "llama-cli"}:
         opts = options or {}
@@ -631,6 +654,7 @@ def create_llm_client(backend: Optional[str], *, model: str, host: str = "", opt
             n_threads=int(opts.get("n_threads", 0)),
             n_gpu_layers=int(n_gpu_layers),
             max_new_tokens=int(opts.get("max_new_tokens", opts.get("num_predict", 512))),
+            temperature=_safe_float(opts.get("temperature"), 0.0),
             cli_path=str(opts.get("cli_path", "")),
         )
     raise LLMClientError(f"unsupported LLM backend: {backend}")

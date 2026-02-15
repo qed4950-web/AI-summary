@@ -1,0 +1,117 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Release tag (vX.Y.Z)"
+        required: false
+        type: string
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  release-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install ruff
+      - name: Resolve release tag
+        run: |
+          TAG="${{ github.ref_name }}"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ inputs.release_tag }}" ]; then
+            TAG="${{ inputs.release_tag }}"
+          fi
+          echo "RELEASE_TAG=$TAG" >> "${GITHUB_ENV}"
+      - name: Release static checks
+        run: |
+          make static-check
+          python scripts/dev/verify/verify_release_integration_contract.py --release-tag "${RELEASE_TAG}"
+      - name: Release smoke checks
+        id: release_smoke
+        run: |
+          make smoke-check SMOKE_PYTEST_ARGS="--maxfail=1"
+      - name: Release lint debt budget check
+        run: |
+          make lint-debt-snapshot
+          make lint-debt-check
+      - name: Build release metadata artifact
+        run: |
+          python scripts/dev/release/generate_release_metadata.py --release-tag "${RELEASE_TAG}"
+      - name: Upload release artifact bundle
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-bundle-${{ github.run_id }}
+          path: |
+            artifacts/release/release_metadata.json
+            artifacts/release/RELEASE_NOTES.auto.md
+            artifacts/lint/ruff_statistics.txt
+          if-no-files-found: error
+      - name: Release governance summary
+        if: always()
+        run: |
+          {
+            echo "## Release Gate Summary"
+            echo ""
+            echo "- Release tag: \`${RELEASE_TAG:-n/a}\`"
+            echo "- Smoke gate: \`${{ steps.release_smoke.outcome }}\`"
+          } >> "${GITHUB_STEP_SUMMARY}"
+          python - <<'PY' >> "${GITHUB_STEP_SUMMARY}"
+          import json
+          from pathlib import Path
+
+          metadata_path = Path("artifacts/release/release_metadata.json")
+          print("")
+          print("### Lint Domain Delta")
+          if not metadata_path.exists():
+              print("- release metadata artifact not found")
+              raise SystemExit(0)
+          try:
+              payload = json.loads(metadata_path.read_text(encoding="utf-8"))
+          except (OSError, ValueError, json.JSONDecodeError):
+              print("- release metadata parse failed")
+              raise SystemExit(0)
+
+          domain_summary = payload.get("lint_domain_summary", {})
+          domains = domain_summary.get("domains", {}) if isinstance(domain_summary, dict) else {}
+          if not isinstance(domains, dict) or not domains:
+              print("- lint domain summary unavailable")
+              raise SystemExit(0)
+
+          for key in ("engine", "ui_ux", "tests"):
+              item = domains.get(key, {})
+              if not isinstance(item, dict):
+                  continue
+              label = str(item.get("label", key))
+              current = int(item.get("current_total", 0))
+              budget = int(item.get("budget_total", 0))
+              delta = int(item.get("delta", 0))
+              trend = str(item.get("trend", "flat"))
+              print(f"- {label}: `{current}` / `{budget}` / `{delta:+d}` ({trend})")
+              top_codes = item.get("top_codes", [])
+              if isinstance(top_codes, list) and top_codes:
+                  preview: list[str] = []
+                  for entry in top_codes[:2]:
+                      if not isinstance(entry, dict):
+                          continue
+                      code = str(entry.get("code", "n/a"))
+                      count = int(entry.get("count", 0))
+                      preview.append(f"{code}:{count}")
+                  if preview:
+                      print(f"  - top codes: `{', '.join(preview)}`")
+          PY

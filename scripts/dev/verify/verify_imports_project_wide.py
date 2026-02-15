@@ -1,22 +1,22 @@
 import importlib
-import pkgutil
-import sys
 import os
+import sys
 from pathlib import Path
+
 
 def check_imports(start_dir):
     root = Path(start_dir)
     sys.path.insert(0, str(root))
-    
+
     errors = []
     checked = 0
-    
+
     # Walk core/ and scripts/
     for base in ["core", "scripts"]:
         path = root / base
         if not path.exists():
             continue
-            
+
         for root_dir, dirs, files in os.walk(path):
             for file in files:
                 if file.endswith(".py") and not file.startswith("test_"):
@@ -28,15 +28,15 @@ def check_imports(start_dir):
                         module_parts = list(rel_to_root.parts)
                         if module_parts[-1].endswith(".py"):
                             module_parts[-1] = module_parts[-1][:-3]
-                        
+
                         module_name = ".".join(module_parts)
-                        
+
                         # Skip special cases
                         if "scripts.runners" in module_name: continue
-                        
+
                         # Debug print
                         print(f"Checking: {rel_path} -> {module_name}")
-                        
+
                         importlib.import_module(module_name)
                         checked += 1
                         print(f"[OK] {module_name}")

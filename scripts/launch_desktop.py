@@ -14,30 +14,20 @@ streamlit_process = None
 
 
 def run_tkinter_app() -> None:
-    """Launch the CustomTkinter desktop app directly (main-thread safe)."""
+    """Launch the PySide6 desktop app directly (main-thread safe)."""
     scripts_dir = os.path.dirname(os.path.abspath(__file__))
     project_root = os.path.dirname(scripts_dir)
     sys.path.insert(0, project_root)
 
     try:
-        import customtkinter as ctk  # type: ignore
-        ctk.set_appearance_mode("System")
-        ctk.set_default_color_theme("dark-blue")
-    except ModuleNotFoundError:
-        print("customtkinter 패키지를 찾을 수 없습니다. `bash scripts/setup_env.sh` 실행 후 다시 시도하세요.")
+        from desktop_app.main import main
+        main()
+    except ImportError:
+        print("desktop_app 모듈을 찾을 수 없습니다. 경로를 확인하세요.")
         raise
-    except Exception:
-        pass
-
-    try:
-        from ui.app import App  # pylint: disable=import-error
-    except ModuleNotFoundError as exc:
-        if exc.name == "customtkinter":
-            print("customtkinter 패키지를 찾을 수 없습니다. `bash scripts/setup_env.sh` 실행 후 다시 시도하세요.")
+    except Exception as e:
+        print(f"애플리케이션 실행 중 오류 발생: {e}")
         raise
-
-    app = App()
-    app.mainloop()
 
 
 def run_streamlit() -> None:

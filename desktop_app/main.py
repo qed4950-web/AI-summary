@@ -1,9 +1,10 @@
 
-import sys
 import os
 import signal
-from PySide6.QtWidgets import QApplication
+import sys
+
 from PySide6.QtCore import QThread
+from PySide6.QtWidgets import QApplication
 
 # Ensure project root is in sys.path
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -11,8 +12,9 @@ project_root = os.path.dirname(current_dir)
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
-from desktop_app.ui import LauncherWindow
 from desktop_app.backend import LNPBackend
+from desktop_app.ui import LauncherWindow
+
 
 def exception_hook(exctype, value, traceback):
     print(f"[CRITICAL_ERROR] {exctype.__name__}: {value}")
@@ -25,7 +27,7 @@ def main():
 
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
-    
+
     # Theme Setup
     try:
         import qdarktheme
@@ -40,10 +42,10 @@ def main():
     backend_thread = QThread()
     backend_worker = LNPBackend()
     backend_worker.moveToThread(backend_thread)
-    
+
     # Connect signals
     backend_thread.started.connect(backend_worker.initialize)
-    
+
     # Start thread
     backend_thread.start()
 
@@ -53,9 +55,9 @@ def main():
     window.show()
 
     # System Tray
-    from PySide6.QtWidgets import QSystemTrayIcon, QMenu
     from PySide6.QtGui import QIcon
-    
+    from PySide6.QtWidgets import QMenu, QSystemTrayIcon
+
     tray_icon = QSystemTrayIcon(app)
     icon_path = os.path.join(current_dir, "assets", "logo.png")
     if os.path.exists(icon_path):
@@ -63,17 +65,17 @@ def main():
     else:
         from PySide6.QtWidgets import QStyle
         tray_icon.setIcon(app.style().standardIcon(QStyle.SP_ComputerIcon))
-    
+
     tray_menu = QMenu()
     action_show = tray_menu.addAction("열기")
     action_quit = tray_menu.addAction("종료")
-    
+
     action_show.triggered.connect(window.show_and_activate)
     action_quit.triggered.connect(app.quit)
-    
+
     tray_icon.setContextMenu(tray_menu)
     tray_icon.show()
-    
+
     tray_icon.activated.connect(lambda reason: window.show_and_activate() if reason == QSystemTrayIcon.Trigger else None)
 
     # Cleanup on exit
@@ -81,7 +83,7 @@ def main():
         print("[App] Shutting down backend thread...")
         backend_thread.quit()
         backend_thread.wait()
-        
+
     app.aboutToQuit.connect(cleanup)
 
     sys.exit(app.exec())

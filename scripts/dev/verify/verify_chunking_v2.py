@@ -7,7 +7,8 @@ from pathlib import Path
 project_root = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(project_root))
 
-from core.data_pipeline.chunking_v2 import SemanticChunker, Chunk
+from core.data_pipeline.chunking_v2 import Chunk, SemanticChunker
+
 
 class TestSemanticChunker(unittest.TestCase):
     def setUp(self):

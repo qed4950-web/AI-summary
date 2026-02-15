@@ -4,24 +4,21 @@ import json
 import os
 import sys
 from pathlib import Path
-from types import SimpleNamespace
-from typing import Any, Callable, Dict, Iterator, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from core.agents.document import DocumentAgent, DocumentAgentConfig
 from core.agents.meeting import MeetingAgent
 from core.agents.photo import PhotoAgent, PhotoAgentConfig
+from core.config.llm_defaults import DEFAULT_LLM_MODEL
+from core.conversation.llm_client import create_llm_client
+from core.conversation.orchestrator import AssistantOrchestrator
 from core.data_pipeline.pipeline import run_step2
 from core.policy.engine import PolicyEngine
-from core.errors import PolicyViolationError
-
-from core.conversation.orchestrator import AssistantOrchestrator
-from core.conversation.llm_client import create_llm_client
 
 from .history import load_agent_history, remember_agent_history
 from .policy import enforce_cache_limit, load_policy_engine
 from .scan_rows import load_scan_rows, resolve_scan_csv
 from .train_config import default_train_config
-from core.config.llm_defaults import DEFAULT_LLM_MODEL
 
 
 def ensure_chat_artifacts(
@@ -33,8 +30,14 @@ def ensure_chat_artifacts(
     auto_train: bool,
     policy_engine: Optional[PolicyEngine],
     policy_agent: str,
+    log_stream: Any = None,
 ) -> bool:
     """Ensure chat artifacts exist and are up to date. Returns True if training ran."""
+    if log_stream is None:
+        log_stream = sys.stdout
+
+    def _log(message: str) -> None:
+        print(message, file=log_stream)
 
     def mtime(path: Path) -> float:
         try:
@@ -59,7 +62,7 @@ def ensure_chat_artifacts(
             needs_train = True
 
     if not needs_train:
-        print("🔄 인덱스 최신성 확인 완료.")
+        _log("🔄 인덱스 최신성 확인 완료.")
         return False
 
     if resolved_scan is None:
@@ -75,7 +78,7 @@ def ensure_chat_artifacts(
             f"{resolved_scan}'를 실행한 뒤 다시 시도해주세요."
         )
 
-    print("⚠️ 스캔 결과가 모델보다 최신입니다. 자동으로 train 단계를 실행합니다.")
+    _log("⚠️ 스캔 결과가 모델보다 최신입니다. 자동으로 train 단계를 실행합니다.")
     rows = list(
         load_scan_rows(
             resolved_scan,
@@ -96,7 +99,7 @@ def ensure_chat_artifacts(
         use_tqdm=True,
         translate=translate,
     )
-    print("✅ 자동 학습 완료")
+    _log("✅ 자동 학습 완료")
     return True
 
 
@@ -131,6 +134,7 @@ def cmd_chat(
 
     single_query = getattr(args, "query", None)
     json_mode = bool(getattr(args, "json", False))
+    status_stream = sys.stderr if json_mode else sys.stdout
     # if json_mode and not single_query:
     #     raise SystemExit("--json 옵션은 --query와 함께 사용해야 합니다.")
 
@@ -147,9 +151,9 @@ def cmd_chat(
                 host=llm_host,
                 options={},
             )
-            print(f"ℹ️ 로컬 LLM 연결: {llm_backend}/{llm_model}")
+            print(f"ℹ️ 로컬 LLM 연결: {llm_backend}/{llm_model}", file=status_stream)
         except Exception as e:
-            print(f"⚠️ 로컬 LLM 초기화 실패: {e}")
+            print(f"⚠️ 로컬 LLM 초기화 실패: {e}", file=status_stream)
 
     auto_trained = ensure_chat_artifacts(
         scan_csv=Path(args.scan_csv),
@@ -159,6 +163,7 @@ def cmd_chat(
         auto_train=args.auto_train,
         policy_engine=policy_engine,
         policy_agent=policy_agent,
+        log_stream=status_stream,
     )
 
     document_agent = DocumentAgent(
@@ -207,7 +212,6 @@ def cmd_chat(
     # -------------------------------------------------------------------------
     def _warmup_models(agent_list: List[Any]) -> None:
         """Background thread to pre-load heavy models (Embedding, Whisper, etc)."""
-        import threading
         # print("🔥 Warming up models in background...", file=sys.stderr)
         for agent in agent_list:
             if hasattr(agent, "prepare"):
@@ -215,7 +219,7 @@ def cmd_chat(
                     # DocumentAgent: loads embedding model
                     # MeetingAgent: ensures policy engine / STT backend check
                     agent.prepare()
-                except Exception as e:
+                except Exception:
                     # Ignore warmup errors to avoid crashing main thread
                     pass
         # print("✅ Model warmup completed.", file=sys.stderr)
@@ -238,7 +242,7 @@ def cmd_chat(
         def _handler(event: Dict[str, Any]) -> None:
             stage = event.get("stage")
             status = event.get("status")
-            
+
             # Special case for real-time STT streaming
             if status == "streaming":
                 chunk = event.get("chunk")
@@ -380,7 +384,7 @@ def cmd_chat(
             break
 
         response = orchestrator.handle(query, base_context)
-        
+
         # Follow-up resolution
         if getattr(response, "agent", None) == "follow_up" and not json_mode:
             response = _resolve_follow_up(query, response, json_mode=json_mode)

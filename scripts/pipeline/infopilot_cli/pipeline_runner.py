@@ -11,19 +11,19 @@ from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 try:
     import numpy as np
-except Exception:  # pragma: no cover
+except ImportError:  # pragma: no cover
     np = None  # type: ignore
 
 try:
     import pandas as pd
-except Exception:  # pragma: no cover
+except ImportError:  # pragma: no cover
     pd = None  # type: ignore
 
 # Core Imports
-from core.data_pipeline.scanner import collect_file_metadata, scan_directory, DEFAULT_EXTS
-from core.data_pipeline.pipeline import CorpusBuilder, update_corpus_file, remove_from_corpus
+from core.data_pipeline.pipeline import CorpusBuilder, remove_from_corpus, update_corpus_file
+from core.data_pipeline.scanner import DEFAULT_EXTS, collect_file_metadata, scan_directory
 from core.policy.engine import PolicyEngine
-from core.search.retriever import VectorIndex, MODEL_TEXT_COLUMN, _split_tokens
+from core.search.retriever import MODEL_TEXT_COLUMN, VectorIndex, _split_tokens
 
 logger = logging.getLogger(__name__)
 
@@ -43,7 +43,7 @@ def load_vector_index(cache_dir: Path) -> VectorIndex:
                 faiss_path=faiss_path if faiss_path.exists() else None,
                 use_mmap=False,
             )
-        except Exception as exc:
+        except (OSError, ValueError, RuntimeError) as exc:
             print(f"⚠️ 인덱스 로드 실패 → 새 인덱스를 생성합니다: {exc}")
             index = VectorIndex()
     return index
@@ -65,7 +65,7 @@ def sync_scan_csv(
                 reader = csv.DictReader(handle)
                 for row in reader:
                     existing_rows.append(dict(row))
-        except Exception:
+        except (OSError, csv.Error):
             existing_rows = []
 
     additions_by_path: Dict[str, Dict[str, Any]] = {}
@@ -130,6 +130,7 @@ class IncrementalPipeline:
         policy_path: Optional[Path] = None,
         roots: Optional[List[Path]] = None,
         agent: str = "knowledge_search",
+        require_policy_engine: bool = False,
     ) -> None:
         self.encoder = encoder
         self.batch_size = max(1, int(batch_size))
@@ -145,13 +146,18 @@ class IncrementalPipeline:
         self.policy_path = policy_path
         self.roots = list(roots) if roots else []
         self.policy_agent = agent
+        self.require_policy_engine = require_policy_engine
+        self._policy_gate_block_notified = False
 
     def _current_policy_engine(self) -> Optional[PolicyEngine]:
         if self._policy_engine_provider is None:
             return self.policy_engine
         try:
-            return self._policy_engine_provider()
-        except Exception:
+            provided = self._policy_engine_provider()
+            if provided is None:
+                return self.policy_engine
+            return provided
+        except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
             return self.policy_engine
 
     def process(self, add_paths: Set[str], remove_paths: Set[str]) -> None:
@@ -163,6 +169,7 @@ class IncrementalPipeline:
         add_paths = {p for p in add_paths if Path(p).suffix.lower() in self.allowed_exts and p != ignore_policy}
         remove_paths = {p for p in remove_paths if Path(p).suffix.lower() in self.allowed_exts}
         policy_engine = self._current_policy_engine()
+        add_paths = self._filter_add_paths_for_policy_gate(add_paths, policy_engine)
         if policy_engine and policy_engine.has_policies and add_paths:
             add_paths = {
                 p
@@ -260,12 +267,27 @@ class IncrementalPipeline:
             flush=True,
         )
 
+    def _filter_add_paths_for_policy_gate(
+        self,
+        add_paths: Set[str],
+        policy_engine: Optional[PolicyEngine],
+    ) -> Set[str]:
+        if not add_paths:
+            return add_paths
+        if not self.require_policy_engine or policy_engine is not None:
+            self._policy_gate_block_notified = False
+            return add_paths
+        if not self._policy_gate_block_notified:
+            print("🔒 정책 엔진이 준비되지 않아 add 이벤트를 fail-closed로 차단합니다.", flush=True)
+            self._policy_gate_block_notified = True
+        return set()
+
     def handle_policy_change(self) -> None:
         if not self.policy_path:
             return
         try:
             updated = PolicyEngine.from_file(self.policy_path)
-        except Exception as exc:
+        except (OSError, ValueError, RuntimeError) as exc:
             print(f"⚠️ 정책 리로드 실패({self.policy_path}): {exc}")
             return
 
@@ -273,8 +295,8 @@ class IncrementalPipeline:
         if self._policy_reload_callback is not None:
             try:
                 self._policy_reload_callback(updated)
-            except Exception:
-                pass
+            except (AttributeError, OSError, RuntimeError, TypeError, ValueError) as exc:
+                logger.warning("Policy reload callback failed: %s", exc)
 
         if not self.roots:
             return
@@ -312,7 +334,7 @@ class IncrementalPipeline:
                         raw = str(record.get("path", "") or "").strip()
                         if raw:
                             existing_paths.add(raw)
-            except Exception:
+            except (OSError, csv.Error):
                 existing_paths = set()
 
         removed_paths = existing_paths - allowed_paths
@@ -360,12 +382,8 @@ def watch_loop(
             elif event_type == "deleted":
                 pending_remove.add(path)
                 pending_add.discard(path)
-            # Normalize event types from watchers.py (add/remove) vs original (created/modified mapped to add)
-            # watchers.py emits: 'add', 'remove', 'policy_reload'
-            # Original watch.py/event handler emitted: 'created', 'modified', 'deleted', 'policy_changed'
-            # We need to align them.
-            # watchers.py emits 'add' for created/modified. 'remove' for deleted. 'policy_reload'.
-            # Adapting loop to watchers.py events:
+                last_event = time.time()
+            # Normalized event types from watchers.py.
             elif event_type == "add":
                 pending_add.add(path)
                 pending_remove.discard(path)
@@ -382,7 +400,7 @@ def watch_loop(
                 pending_add.add(path)
                 pending_remove.discard(path)
                 last_event = time.time()
-            
+
         except queue.Empty:
             pass
 
@@ -394,7 +412,7 @@ def watch_loop(
                 pending_remove.clear()
                 try:
                     pipeline_ctx.handle_policy_change()
-                except Exception as exc:
+                except (AttributeError, OSError, RuntimeError, TypeError, ValueError) as exc:
                     print(f"⚠️ 정책 변경 처리 중 오류: {exc}")
                 continue
             to_add = set(pending_add)
@@ -405,7 +423,7 @@ def watch_loop(
                 t0 = time.time()
                 pipeline_ctx.process(to_add, to_remove)
                 _log_throughput(len(to_add), len(to_remove), time.time() - t0)
-            except Exception as exc:
+            except (AttributeError, OSError, RuntimeError, TypeError, ValueError) as exc:
                 print(f"⚠️ 증분 파이프라인 처리 중 오류: {exc}")
 
     if pending_add or pending_remove:
@@ -415,5 +433,5 @@ def watch_loop(
             t0 = time.time()
             pipeline_ctx.process(to_add, to_remove)
             _log_throughput(len(to_add), len(to_remove), time.time() - t0)
-        except Exception as exc:
+        except (AttributeError, OSError, RuntimeError, TypeError, ValueError) as exc:
             print(f"⚠️ 증분 파이프라인 종료 처리 중 오류: {exc}")

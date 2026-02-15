@@ -1,0 +1,29 @@
+{
+  "version": "2026-02-14",
+  "domains": {
+    "engine": {
+      "label": "engine",
+      "paths": [
+        "core",
+        "scripts/pipeline",
+        "scripts/dev/verify"
+      ],
+      "budget_total": 900
+    },
+    "ui_ux": {
+      "label": "ui/ux",
+      "paths": [
+        "desktop_app"
+      ],
+      "budget_total": 500
+    },
+    "tests": {
+      "label": "tests",
+      "paths": [
+        "tests",
+        "scripts/dev/tests"
+      ],
+      "budget_total": 900
+    }
+  }
+}

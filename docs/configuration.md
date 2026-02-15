@@ -49,3 +49,17 @@ This document lists all environment variables used by the AI-Summary / InfoPilot
 |----------|---------|-------------|
 | `SUMMARY_SUPERVISOR_BACKEND` | | distinct backend for supervisor (if different). |
 | `SUMMARY_SUPERVISOR_MODEL` | | distinct model for supervisor. |
+
+## Desktop Runtime Policy
+Desktop launcher/runtime now persists policy values in `data/desktop_runtime_policy.json`.
+Environment variables below are used as fallback only when the policy file is missing.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `DESKTOP_RUNTIME_POLICY_PATH` | `data/desktop_runtime_policy.json` | Override path for desktop runtime policy JSON. |
+| `DESKTOP_RUNTIME_POLICY_HISTORY_PATH` | `data/desktop_runtime_policy_history.jsonl` | Override path for runtime policy change history JSONL. |
+| `DESKTOP_MASK_PII` | 1 | Fallback toggle for PII masking (`0/false/no/off` disables). |
+| `DESKTOP_MAX_FILE_LINKS` | 8 | Fallback max file-link items shown in desktop UI. |
+| `DESKTOP_MAX_REFERENCE_LINKS` | 5 | Fallback max reference links emitted by backend. |
+| `DESKTOP_MAX_RESPONSE_CHARS` | 24000 | Fallback max response length emitted by backend. |
+| `DESKTOP_MAX_SUGGESTION_CHARS` | 120 | Fallback max suggestion item length emitted by backend. |

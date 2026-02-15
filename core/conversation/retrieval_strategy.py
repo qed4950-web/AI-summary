@@ -66,10 +66,21 @@ def init_retriever(
             lexical_weight=lexical_weight,
         )
         if rebuild:
-            LOGGER.info("Rebuild requested; retriever might not be ready immediately.")
-            # Trigger build logic if async - but HybridRetriever usually loads sync?
-            # Assuming standard Init loads state. Rebuild is usually a method call.
-            pass
+            LOGGER.info("Rebuild requested; scheduling retriever refresh.")
+            try:
+                ready = getattr(retr, "ready", None)
+                if callable(ready):
+                    try:
+                        ready(rebuild=True, wait=False)
+                    except TypeError:
+                        ready(rebuild=True)
+                else:
+                    index_manager = getattr(retr, "index_manager", None)
+                    schedule = getattr(index_manager, "schedule_rebuild", None)
+                    if callable(schedule):
+                        schedule(priority=True)
+            except Exception as exc:
+                LOGGER.warning("Retriever rebuild scheduling failed: %s", exc)
         return retr
     except Exception as e:
         LOGGER.error("Failed to initialize retriever: %s", e)

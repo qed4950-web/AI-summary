@@ -1,7 +1,8 @@
 # infopilot.py
+# ruff: noqa: E402
 from __future__ import annotations
+
 import sys
-import os
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -16,17 +17,13 @@ except Exception:
     pass
 
 import click
-from scripts.pipeline.infopilot_cli.scan import cmd_scan as _cmd_scan_impl
-from scripts.pipeline.infopilot_cli.chat import cmd_chat as _cmd_chat_impl
-from scripts.pipeline.infopilot_cli.schedule import cmd_schedule as _cmd_schedule_impl
-from scripts.pipeline.infopilot_cli.watch import cmd_watch as _cmd_watch_impl
 
-from scripts.pipeline.infopilot_cli.scan import cmd_scan as run_scan_cmd
 from scripts.pipeline.infopilot_cli.chat import cmd_chat as run_chat_cmd
+from scripts.pipeline.infopilot_cli.scan import cmd_scan as run_scan_cmd
 from scripts.pipeline.infopilot_cli.scan_rows import load_scan_rows
-
-from core.data_pipeline.pipeline import run_step2
+from scripts.pipeline.infopilot_cli.schedule import cmd_schedule as _cmd_schedule_impl
 from scripts.pipeline.infopilot_cli.schedule import register_policy_jobs
+from scripts.pipeline.infopilot_cli.watch import cmd_watch as _cmd_watch_impl
 
 _load_scan_rows = load_scan_rows
 _run_scan = run_scan_cmd
@@ -70,12 +67,14 @@ cmd_train = noop_train
 @click.option("--corpus", default="data/corpus.parquet")
 @click.option("--scan_csv", default="data/found_files.csv")
 @click.option("--cache", default="data/cache")
+@click.option("--query", default=None, help="Single query for non-interactive chat")
 @click.option("--json", "json_mode", is_flag=True, help="JSON output mode")
 @click.option("--topk", default=10)
-def chat(model, corpus, scan_csv, cache, json_mode, topk):
+@click.option("--no-auto-train", is_flag=True, help="Disable automatic training when artifacts are stale")
+def chat(model, corpus, scan_csv, cache, query, json_mode, topk, no_auto_train):
     args = SimpleNamespace(
         model=model, corpus=corpus, scan_csv=scan_csv, cache=cache,
-        json=json_mode, topk=topk, translate=False, auto_train=False,
+        query=query, json=json_mode, topk=topk, translate=False, auto_train=not no_auto_train,
         rerank=True, rerank_model="BAAI/bge-reranker-large",
         rerank_depth=50, rerank_batch_size=16, rerank_device=None,
         rerank_min_score=0.35, lexical_weight=0.4,
@@ -95,7 +94,7 @@ def chat(model, corpus, scan_csv, cache, json_mode, topk):
 @click.option("--once", is_flag=True)
 def schedule(agent, policy, output_root, poll_seconds, once):
     args = SimpleNamespace(
-        agent=agent, policy=policy, output_root=output_root, 
+        agent=agent, policy=policy, output_root=output_root,
         poll_seconds=poll_seconds, once=once, translate=False
     )
     _cmd_schedule_impl(args, knowledge_agent=KNOWLEDGE_AGENT)
@@ -114,4 +113,7 @@ def watch(output_root, target, policy, debounce):
     _cmd_watch_impl(args, knowledge_agent=KNOWLEDGE_AGENT)
 
 if __name__ == "__main__":
+    # Legacy compatibility: `infopilot.py run <cmd> ...` -> `infopilot.py <cmd> ...`
+    if len(sys.argv) > 1 and sys.argv[1] == "run":
+        sys.argv = [sys.argv[0], *sys.argv[2:]]
     cli()

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence
 
 
@@ -54,6 +54,7 @@ class TaskGraph:
         completed: Dict[str, bool] = {}
         progress_cb: Optional[Callable[[Dict[str, Any]], None]] = context.extras.get("progress_callback")
         cancel_event = context.extras.get("cancel_event")
+        utc_now = lambda: datetime.now(timezone.utc).isoformat()
 
         def _emit(event_payload: Dict[str, Any]) -> None:
             if not progress_cb:
@@ -79,14 +80,14 @@ class TaskGraph:
             event = {
                 "stage": stage.name,
                 "status": "running",
-                "started_at": datetime.utcnow().isoformat(),
+                "started_at": utc_now(),
             }
             context.record_event(event)
             _emit(event)
 
             if _cancelled():
                 event["status"] = "cancelled"
-                event["finished_at"] = datetime.utcnow().isoformat()
+                event["finished_at"] = utc_now()
                 _emit(event)
                 raise TaskCancelled(f"task '{self.name}' cancelled before '{stage.name}'")
 
@@ -98,12 +99,12 @@ class TaskGraph:
                 else:
                     event["status"] = "failed"
                     event["error"] = str(exc)
-                event["finished_at"] = datetime.utcnow().isoformat()
+                event["finished_at"] = utc_now()
                 _emit(event)
                 raise
             else:
                 event["status"] = "completed"
-                event["finished_at"] = datetime.utcnow().isoformat()
+                event["finished_at"] = utc_now()
                 completed[stage.name] = True
                 _emit(event)
 
